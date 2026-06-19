@@ -1,0 +1,5 @@
+### ADR-0041 — `AUTHOR-DISCRETION`: native PGDG Postgres on the VM
+**Status:** Author-discretion — **RESOLVED 2026-06-16, owner ACCEPTED** (no longer an open DoF) · **Source:** digest DoF "Postgres topology"; e-finding 35 (both viable).
+**Decision.** Run **native PGDG-packaged Postgres 18** on the m3.small VM (pgbackrest, pgaudit, WAL archiving configured natively). The compose file owns app/orchestrator services only; CI uses a `postgres:18` **service container** for migrations-from-zero.
+**Reasons.** (1) The m3.small is the smallest machine in the fleet; native avoids container overhead on the one durability-critical service. (2) pgbackrest + WAL archiving + pgaudit + quarterly restore drills are materially simpler and better-documented native. (3) Restore-image parity (the predecessor's habit) is preserved **in CI**, where it is actually exercised, without paying container cost on prod. (4) Provisioning scripts capture the install (docs-that-cannot-rot).
+**Owner ruling (2026-06-16):** ACCEPTED — native PGDG Postgres on the VM is the decision; this axis is closed.

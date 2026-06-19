@@ -1,0 +1,2 @@
+### ADR-0016 — Hook-vocabulary pinning (condition 5)
+**Status:** Accepted. **Decision.** Lake hook columns carry **registry-canonical** names (the `hook_points` site grammar: `embed.out`, `L{l}.resid.{pre|mid|post}`, `L{l}.attn.{q|k|v|z|scores|pattern}`, `L{l}.mlp.{in|act|out}`, `unembed.logits`), validated at shard close. **Consequences.** Defends against TransformerLens 4.0 / nnsight vocabulary churn (a1). The `hook_points` registry is day-one (resolves d1 open-Q4 toward "registry exists").

@@ -1,0 +1,4 @@
+### ADR-0001 — Adopt the B-chassis hybrid
+**Status:** Accepted · **Source:** phase2 V1, checkpoint "Chassis (B)".
+**Decision.** Thin Postgres is the control plane (identity core + queue + per-run scalars + manifest rows). Bulk lives in a **hive-partitioned parquet lake** (per-token / per-feature scalars) and a **safetensors TTL dense lane** (residual/attention tensors, compute-local). Postgres never holds per-token rows. The export contract is `table_manifests` with partition columns materialized as real FK columns; DuckDB reads the lake directly through the read-only role.
+**Consequences.** The Postgres/parquet seam is the design's central risk surface → addressed wholesale by ADR-0002/0010/0011 and the W1–W8 machinery (capture contract §4). The m3.small is retained (no resize; ADR-0042). Two stores that can disagree means write-ordering is a correctness property, not a convenience.

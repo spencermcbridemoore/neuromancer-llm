@@ -1,0 +1,2 @@
+### ADR-0018 — ARCC relay gating (condition 7)
+**Status:** Reserved-seam. **Decision.** Reserve the `{staged, verified}` enum values in the bundle lifecycle; **gate** the relay registrar branch + its kill-tests behind the Phase 4 ARCC bring-up outcome (outbound-network + Apptainer check). **Consequences.** All three poles were dinged for prebuilding this — so it is designed-but-inert until bring-up confirms no-egress. No relay code ships in Phase 3 beyond the reserved enum.

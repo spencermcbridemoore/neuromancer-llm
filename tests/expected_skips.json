@@ -1,0 +1,8 @@
+{
+  "_comment": "Expected-skips golden: with NO capability present (no env flags, no docker/nvidia on PATH), every capability marker is unavailable and its tests skip VISIBLY. Pins the detection baseline so a broken detector (e.g. one that wrongly reports a capability present) fails CI instead of silently skipping the suite.",
+  "gpu": false,
+  "api": false,
+  "network": false,
+  "pg": false,
+  "seam": false
+}

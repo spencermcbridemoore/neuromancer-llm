@@ -1,0 +1,3 @@
+# Remediation scripts referenced by future probe-before-enforce constraint-tightening migrations
+# (phase3-alembic.md). A migration that adds a CHECK/UNIQUE/NOT-NULL to a populated table probes for
+# violators first and points here for the reviewed fix, rather than enforcing blind.

@@ -1,0 +1,2 @@
+### ADR-0014 — Audit against the desktop mirror (condition 3)
+**Status:** Accepted. **Decision.** The monthly full-hash audit runs against the **desktop NVMe mirror** (free reads) + a quarterly cloud spot-sample. The read-verification residual is restated honestly in docs; an egress line is added to the cost model. **Consequences.** Bounds the ADR-0008/0009 residuals affordably; mirror is load-bearing for both the audit and the pin-at-publication default (ADR-0034).

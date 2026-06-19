@@ -1,0 +1,52 @@
+name: fast
+
+# Fast lane (phase0 Q14): lint + type-check + unit/pg tests on a session-scoped postgres:18, on EVERY
+# push. ~3 min. The W1-W8 `seam` tests are excluded here (they belong to the full lane); gpu/api/network
+# skip visibly via the detection hooks.
+on:
+  push:
+  workflow_dispatch:
+
+concurrency:
+  group: fast-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: neuro
+          POSTGRES_DB: neuro_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      NEURO_TEST_DATABASE_URL: postgresql+psycopg://postgres:neuro@localhost:5432/neuro_ci
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (locked)
+        run: uv sync --locked
+      - name: Lint (ruff)
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+      - name: Type-check (pyright, basic)
+        run: uv run pyright src
+      - name: Docs byte-stable gate
+        run: uv run neuro docs build --check
+      - name: Unit + pg tests (no seam; gpu/api/network skip visibly)
+        run: uv run pytest -m "not seam" -p no:cacheprovider
+      - name: Link check (offline)
+        uses: lycheeverse/lychee-action@v2
+        with:
+          args: --offline --no-progress "README.md" "docs/**/*.md"
+          fail: true

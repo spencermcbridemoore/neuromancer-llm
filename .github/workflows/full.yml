@@ -1,0 +1,68 @@
+name: full
+
+# Full lane (phase0 Q14): the whole suite + migrations-from-zero + W1-W8 seam (Azurite) + wheel
+# build/install/entrypoint smoke + docs gate + Docker build & compose boot, on PRs and main. <=10 min.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: full-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  full:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: neuro
+          POSTGRES_DB: neuro_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      NEURO_TEST_DATABASE_URL: postgresql+psycopg://postgres:neuro@localhost:5432/neuro_ci
+      # Azurite-only (ADR-0040), started as a step below; the well-known devstoreaccount1 is not a secret.
+      NEURO_TEST_AZURITE: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Sync (locked)
+        run: uv sync --locked
+      - name: Start Azurite (skip API-version check; emulator lags the SDK)
+        run: |
+          docker run -d --name azurite -p 10000:10000 mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck
+          for i in $(seq 1 30); do
+            docker logs azurite 2>&1 | grep -q "successfully listening" && break || sleep 1
+          done
+      - name: Migrations-from-zero against real Postgres 18
+        env:
+          NEURO_DATABASE_URL: postgresql+psycopg://postgres:neuro@localhost:5432/neuro_ci
+        run: |
+          uv run neuro db migrate
+          uv run neuro db provision --lane test
+          uv run neuro db verify --lane test
+      - name: Full suite (unit + pg + W1-W8 seam; gpu/api/network skip)
+        run: uv run pytest -p no:cacheprovider
+      - name: Docs byte-stable gate
+        run: uv run neuro docs build --check
+      - name: Wheel build + install + entrypoint smoke
+        run: |
+          uv build
+          python -m venv /tmp/wheelvenv
+          /tmp/wheelvenv/bin/pip install --quiet dist/*.whl
+          /tmp/wheelvenv/bin/neuro --version
+      - name: Docker build + compose boot smoke
+        run: |
+          docker build -t neuromancer-llm:ci .
+          docker compose run --rm app neuro --version

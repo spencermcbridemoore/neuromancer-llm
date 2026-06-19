@@ -1,0 +1,2 @@
+### ADR-0020 — Durability-staleness gate (condition 9)
+**Status:** Accepted. **Decision.** If the DB backup is **>8 days stale** OR WAL-archive lag exceeds threshold, `system_health` flips and the registrar/dispatch **refuse loudly**. **Consequences.** Generalizes A-entropy's critical WAL-rot finding — the system stops accepting new canonical writes when its own durability is unproven, rather than silently accumulating unrecoverable state.

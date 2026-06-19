@@ -1,0 +1,2 @@
+### ADR-0023 — MCQ stimulus family stays in PG (condition 12)
+**Status:** Accepted. **Decision.** The MCQ stimulus family (items, options, permutations, correct letters, difficulty/structure metadata) is **always-on first-class Postgres** per the d1 census; C's D2 (push it to files) is rejected. **Consequences.** Join-critical stimulus identity is relational and DB-enforced. `representation_hierarchy.py` is the prototype for `stimulus_structures` typed metadata, wired when an experiment consumes it (reserve-until-consumed posture, as in ADR-0031).

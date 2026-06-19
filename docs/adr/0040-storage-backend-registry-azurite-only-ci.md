@@ -1,0 +1,4 @@
+### ADR-0040 — Storage backend registry; Azurite-only CI
+**Status:** Accepted · **Source:** phase0 Q7; phase1 e/D1.
+**Decision.** Backend/URI policy is data-driven (`storage_backends` registry + adapters): Azure now, S3/NAS addable without migration, **no Azure-only CHECK constraint**. CI uses **Azurite ONLY** — MinIO community is dead (archived ~Apr 2026). An S3 emulator is deferred behind the backend registry seam (Garage / SeaweedFS / digest-pinned last-good image / moto chosen *then*). Two object-storage lanes only: `artifacts` (canonical, per-prefix fail-closed dollar-calibrated quota) and `scratch` (freely deletable). Quota guard fails **closed**.
+**Consequences.** Fixes the predecessor's fail-OPEN-on-listing-error bug. CI never touches cloud. The "MinIO is a fine default" training prior is explicitly overridden by June-2026 research (D-discipline).

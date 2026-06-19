@@ -1,0 +1,4 @@
+### ADR-0003 — Byte-exact TEXT wire bodies, never JSONB
+**Status:** Accepted (from pole A) · **Source:** checkpoint "From A"; phase0 Q9.
+**Decision.** Captured wire payloads (request/response) are stored as **`TEXT`** holding the verbatim bytes as transmitted, never `JSONB`. JSONB normalizes key order, whitespace, and numeric forms — destroying the "TRUE wire payload" guarantee and the ability to recompute a request hash. The sole place JSON-typed columns + functional JSON indexes are allowed is `external_records.payload_jsonb` (import sidecar only; see also ADR-0025).
+**Consequences.** Querying inside payloads is a lake/DuckDB concern after export, not a PG index concern. Large bodies spill to blob with an artifact FK (capture contract §3); the inline cap is 8 KB (threshold shared with ADR-0017; also governs prompts via ADR-0022).

@@ -1,0 +1,10 @@
+# App/orchestrator services only. PostgreSQL is NATIVE on the VM (ADR-0041) — NOT a compose service;
+# the app connects out via NEURO_DATABASE_URL. CI boots this as a `neuro --version` smoke.
+services:
+  app:
+    build: .
+    image: neuromancer-llm:ci
+    environment:
+      # Supplied by the host/VM; the app fails closed if unset (ADR-0006).
+      NEURO_DATABASE_URL: ${NEURO_DATABASE_URL:-}
+    command: ["neuro", "--help"]

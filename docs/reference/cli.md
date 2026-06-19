@@ -1,0 +1,52 @@
+# CLI reference (generated)
+
+The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neuro docs build`.
+
+- `neuro bundles` — Bundles: seal | register | gc | crawl | verify-golden.
+- `neuro bundles crawl` — STAGE 2 — crawl + quarterly crawl-rebuild drill + golden corpus.
+- `neuro bundles gc` — STAGE 2 — GC unsealed bundles; sealed are exempt (ADR-0010).
+- `neuro bundles register` — STAGE 2 — register a sealed bundle (W1-W8 last step, single transaction).
+- `neuro bundles seal` — STAGE 2 — seal a bundle (manifest_sha256 set, state=sealed; GC-exempt, ADR-0010).
+- `neuro bundles verify-golden` — STAGE 2 — verify against the manifest golden corpus.
+- `neuro capture` — Capture (Stage 2 vertical slice): logprob | replay | show.
+- `neuro capture logprob` — STAGE 2 — the 'logprob capture done right' vertical slice.
+- `neuro capture replay` — STAGE 2 — replicate a captured run for divergence measurement.
+- `neuro capture show` — STAGE 2 — show a capture_events row + its spilled payloads.
+- `neuro db` — Database control plane: migrate, provision, roles, verify.
+- `neuro db migrate` — Run `alembic upgrade head` — materialize the canonical schema (migrations own it, never create_all).
+- `neuro db provision` — Write the singleton lanes-v2 identity row on a provably-empty, just-migrated DB (ADR-0006).
+- `neuro db restore-drill` — Scripted quarterly restore drill (ADR-0007 durability) — Stage 2.
+- `neuro db roles` — Create the four roles (admin/writer/reader/registrar) then apply phase3-grants.sql (ADR-0007).
+- `neuro db verify` — Positively verify the connected DB's identity; fail closed on any mismatch (ADR-0006).
+- `neuro derive` — Derived-satellite promotion: run | reparity.
+- `neuro derive reparity` — STAGE 2 — parity probe comparing a satellite to its lake source.
+- `neuro derive run` — STAGE 2 — re-derive a promoted satellite (each row carries method_version_id).
+- `neuro docs` — Generated docs (schema/CLI/env/governance) — docs cannot rot.
+- `neuro docs build` — Regenerate the docs from the live models/CLI. With --check, fail loudly on any drift (byte-stable).
+- `neuro importer` — Appendix-A importer: scan | promote | status.
+- `neuro importer promote` — STAGE 2 — Layer 2 selective promotion (governance trio per row, ADR-0011).
+- `neuro importer scan` — STAGE 2 — Layer 1 faithful external-records upsert (idempotent on the natural key).
+- `neuro importer status` — STAGE 2 — coverage report (mirrored / promoted / derived-by-predecessor).
+- `neuro probe` — Operator probes: run | report.
+- `neuro probe report` — STAGE 2 — emit the latest probe report (system_health + probe_reports).
+- `neuro probe run` — STAGE 2 — run a probe (backup freshness, WAL lag, desktop heartbeat, mirror age).
+- `neuro runs` — Runs: new | adopt | finalize | show.
+- `neuro runs adopt` — STAGE 2 — retroactively label an adhoc/unlabeled run (ADR-0036).
+- `neuro runs finalize` — STAGE 2 — finalize a run.
+- `neuro runs new` — STAGE 2 — mint a labeled run via the composer.
+- `neuro runs show` — STAGE 2 — show a run + its inputs/metrics.
+- `neuro spend` — Spend governance: report | plan | reconcile.
+- `neuro spend plan` — STAGE 2 — record a run_plan justification artifact (required above budget threshold).
+- `neuro spend reconcile` — STAGE 2 — nightly spend reconciliation.
+- `neuro spend report` — STAGE 2 — per-run SU/$ report (doubles as Jetstream2 renewal evidence).
+- `neuro storage` — Storage: put | mirror-audit | quota | sas-mint | pin.
+- `neuro storage mirror-audit` — STAGE 2 — monthly full-hash audit against the desktop NVMe mirror (ADR-0014).
+- `neuro storage pin` — STAGE 2 — promote bytes to cloud now (ADR-0034).
+- `neuro storage put` — STAGE 2 — put bytes to a registered backend (quota fails closed).
+- `neuro storage quota` — STAGE 2 — per-prefix dollar-calibrated quota report (fails closed, ADR-0040).
+- `neuro storage sas-mint` — STAGE 2 — mint a user-delegation SAS with surfaced expiry (ADR-0013).
+- `neuro workers` — Workers: run | claim | residency | preflight.
+- `neuro workers claim` — STAGE 2 — claim one job (SKIP LOCKED) via the repository.
+- `neuro workers preflight` — STAGE 2 — VRAM preflight: refuse-to-start, not OOM (phase0 Q4).
+- `neuro workers residency` — STAGE 2 — resolve/budget a residency set against VRAM.
+- `neuro workers run` — STAGE 2 — run the worker runtime (lease/heartbeat/reaper owned here; checkpoint-first).

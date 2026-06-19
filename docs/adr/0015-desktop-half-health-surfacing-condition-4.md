@@ -1,0 +1,2 @@
+### ADR-0015 — Desktop-half health surfacing (condition 4)
+**Status:** Accepted. **Decision.** A desktop agent writes a daily heartbeat + reaper/disk/mirror-age rows to PG via `neuro_writer`; the preflight banner shows desktop-probe age; the Windows Scheduler task is named in the runbook. **Consequences.** The Windows desktop is the weakest-observed host (checkpoint watch-list); the agent makes its silence visible. Runs under WSL2 (ADR-0035).

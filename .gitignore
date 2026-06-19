@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# uv / venv
+.venv/
+# NOTE: uv.lock IS committed (reproducible installs, phase3-module-layout.md).
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.pyright/
+
+# Local env / secrets (env surface is infrastructure-only; never behavior flags)
+.env
+.env.*
+connections.toml          # optional connections file (NEURO_DATABASE_URL alternative)
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local scratch / proof artifacts (kept out of the package)
+scratch/
+.proof/

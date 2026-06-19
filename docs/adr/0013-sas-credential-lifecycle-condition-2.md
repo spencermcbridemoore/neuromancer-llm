@@ -1,0 +1,2 @@
+### ADR-0013 — SAS credential lifecycle (condition 2)
+**Status:** Accepted. **Decision.** Per-human **user-delegation SAS** minted by the CLI with a stated TTL; expiry surfaced in the daily probe AND the generated views-file header; `_staging/` lives in its own container. **Consequences.** SAS/credential lifecycle is the #1 cross-pole rot surface (checkpoint watch-list) — surfacing expiry in two places is the mitigation. Topic/secret handling parallels ADR-0019.

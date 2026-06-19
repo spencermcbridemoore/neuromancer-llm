@@ -1,0 +1,244 @@
+# neuromancer-llm — Phase 3 Architecture Decision Records (2026-06-16)
+
+Numbered ADRs synthesizing the approved B-chassis hybrid into binding design decisions. **Source-of-record precedence:** `phase2-answers-of-record.md` > `phase0-answers-of-record.md` > engagement memory binding constraints > Phase 1 research (`phase1-digest.md` + reports). Where an ADR resolves an explicitly-parked degree of freedom rather than restating a banked decision, it is tagged **`AUTHOR-DISCRETION`** and is a one-line owner redirect at the checkpoint.
+
+Status legend: **Accepted** (banked decision, restated as architecture) · **Signed-deviation** (one of the 4 ADRs the owner signed at the checkpoint) · **Author-discretion** (parked DoF resolved by the synthesis author) · **Reserved-seam** (designed but inert until a later trigger).
+
+In Phase 4 these split into `docs/adr/NNNN-*.md` with a generated index (`neuro docs build`); here they are consolidated for checkpoint review. ADR numbers are permanent identity once assigned.
+
+---
+
+## Group 1 — Architecture spine
+
+### ADR-0001 — Adopt the B-chassis hybrid
+**Status:** Accepted · **Source:** phase2 V1, checkpoint "Chassis (B)".
+**Decision.** Thin Postgres is the control plane (identity core + queue + per-run scalars + manifest rows). Bulk lives in a **hive-partitioned parquet lake** (per-token / per-feature scalars) and a **safetensors TTL dense lane** (residual/attention tensors, compute-local). Postgres never holds per-token rows. The export contract is `table_manifests` with partition columns materialized as real FK columns; DuckDB reads the lake directly through the read-only role.
+**Consequences.** The Postgres/parquet seam is the design's central risk surface → addressed wholesale by ADR-0002/0010/0011 and the W1–W8 machinery (capture contract §4). The m3.small is retained (no resize; ADR-0042). Two stores that can disagree means write-ordering is a correctness property, not a convenience.
+
+### ADR-0002 — Cardinality law as schema law
+**Status:** Accepted (from pole A) · **Source:** checkpoint "From A".
+**Decision.** The finest grain Postgres ever stores is `capture_events` (one row per model interaction — API call or GPU forward batch). No table is permitted to grow O(tokens) or O(features). Any per-token/per-feature data is a lake artifact registered by a manifest row. This is enforced socially by review and structurally by the absence of any per-token table in the DDL.
+**Consequences.** `capture_events` is the cardinality ceiling; sizing math (capture contract §7) is bounded by interactions, not tokens. The derived-satellite exception (ADR-0011) is the *only* sanctioned path to per-response PG rows, and only on demand.
+
+### ADR-0003 — Byte-exact TEXT wire bodies, never JSONB
+**Status:** Accepted (from pole A) · **Source:** checkpoint "From A"; phase0 Q9.
+**Decision.** Captured wire payloads (request/response) are stored as **`TEXT`** holding the verbatim bytes as transmitted, never `JSONB`. JSONB normalizes key order, whitespace, and numeric forms — destroying the "TRUE wire payload" guarantee and the ability to recompute a request hash. The sole place JSON-typed columns + functional JSON indexes are allowed is `external_records.payload_jsonb` (import sidecar only; see also ADR-0025).
+**Consequences.** Querying inside payloads is a lake/DuckDB concern after export, not a PG index concern. Large bodies spill to blob with an artifact FK (capture contract §3); the inline cap is 8 KB (threshold shared with ADR-0017; also governs prompts via ADR-0022).
+
+### ADR-0004 — Three-layer determinism model replaces the enum
+**Status:** Accepted · **Source:** phase0 Q10; phase1 d2.
+**Decision.** Determinism is three independent things, never one enum:
+1. **DECLARED mode** — `deterministic_algo | greedy | seeded_sampling | unseeded_sampling`, *derived from the captured wire payload* (what was requested AND what the provider honored), participates in the semantic config and therefore the fingerprint.
+2. **EXPECTED reproducibility level** — `bitwise | tolerance | distributional | none`, a maintained heuristic rule table keyed (declared_mode × substrate); **never touches identity**; overridable per-run via `runs.expected_level_override` (A6).
+3. **MEASURED reproducibility** — replicate runs linked to the original via `replicate_links`, storing divergence metrics (max abs/rel diff, argmax-flip, `answer_letter_flip_rate`, near-tie nat-margin buckets). Answer flips are first-class MCQ-position-bias data.
+**Consequences.** Three DDL homes: `fingerprints` (declared in the hashed semantic config), `expected_reproducibility_rules` (heuristic table), `divergence_measurements` + `replicate_links` (measured). The bitwise-vs-tolerance *default* (E6; detailed in capture contract §6) is a runtime serving-config default, not schema — the schema seats both branches.
+
+### ADR-0005 — Identity & fingerprint semantics
+**Status:** Accepted · **Source:** phase0 Q10; phase1 d1.
+**Decision.** Model identity is 7-component first-class: hf_repo + revision + dtype/quant + tokenizer_hash + serving_stack + serving_version + (architecture family). `model_identities.identity_hash` is the durable key with a `UNIQUE NULLS NOT DISTINCT` backstop over the component columns. **Fingerprints are a separate INSERT-only table** (`runs.fingerprint_id` FK; no-UPDATE grant), raise on mismatch, with an explicit force-new-run path. The fingerprint hashes the **semantic** config section wholesale; scheduling config is excluded. Three hash roles stay distinct and are never conflated in code or schema: **fingerprint** = experiment identity; **sha256** = storage integrity; **replay divergence** = reproducibility. Run identity and cache reuse key on **spec_hash (inputs)**, never output equality; reuse gating follows declared mode (greedy/seeded reusable; unseeded never silently).
+**Consequences.** Composer drift is caught by per-kind partial unique indexes on run-component tuples (materialized in phase3-ddl.sql Group C). `intervention_specs.spec_hash` gives interventions idempotency-by-input with a force flag.
+
+### ADR-0006 — Lanes v2: positive identity, UNKNOWN fails closed
+**Status:** Accepted · **Source:** phase0 Q8; phase1 e.
+**Decision.** A singleton `database_identity` row (lane, instance_uuid, provisioned_at, cloned_from) is written at provisioning and **verified at every DBAPI connect before any write**, via a mandatory `expected_lane` kwarg (NOT an env var). Canonical check = lane AND repo-pinned uuid match. **UNKNOWN fails closed for every intent.** Sole escape is `neuro db provision` on a provably empty DB. Clone/restore tooling rewrites identity atomically-before-success. Destructive ops are a typed-confirmation CLI; canonical is hard-refused. (Postgres-only — the lane-identity mechanism has no SQLite variant; ADR-0039 Reconsidered 2026-06-17.)
+**Consequences.** Closes the predecessor's confirmed bidirectional lane inversion. `NEURO_DATABASE_URL` + optional connections file is the entire env surface. No `allowed_intents` column — policy stays in code (ADR-0040's backend-registry posture mirrors this).
+
+### ADR-0007 — Least-privilege roles
+**Status:** Accepted · **Source:** phase0 Q8; phase1 e.
+**Decision.** Four Postgres roles: `neuro_admin` (DDL, migrations, VM-local only), `neuro_writer` (INSERT on OPERATIONAL tables only — capture_events / bundles / artifacts / table_manifests / run_metrics / work_leases / replicate_links / divergence_measurements / probe_reports / lineage_edges / spend_entries — plus column-scoped UPDATE on lease/heartbeat **and** lifecycle/state-transition columns — job/bundle state, lease renewal, run finalization, adhoc-run adoption, artifact tombstone, health status; **never identity-bearing, wire-payload, or fingerprint-record columns; no registry INSERT; no DELETE, no DDL**), `neuro_registrar` (trusted VM-local orchestrator: INSERT on the registries + control plane — model/tokenizer/method/asset/hook/backend registries, residency_sets, fingerprints, campaigns/runs/jobs, stimulus family, import/promotions, lineage_edges, spend_entries — effectively INSERT on ALL tables, a superset NOT exclusive of the writer's: lineage_edges + spend_entries are SHARED with neuro_writer per B2 — so a compromised remote worker cannot inject fake identity rows; C3), `neuro_reader` (SELECT only — all consumption surfaces). Per-human and per-worker logins; no shared password. pgaudit `'ddl, role'`. Workers connect over Tailscale/SSH as `neuro_writer`-class roles. Workers MUST be able to complete jobs, seal/register bundles, write health, and adopt adhoc runs — those are lifecycle state transitions, not identity mutations.
+**Consequences.** Makes the predecessor's April-wipe class structurally impossible. The writer can advance lifecycle (complete jobs, seal/register bundles, write health, finalize and adopt adhoc runs) but cannot mutate identity-bearing columns or perform destructive ops. One audited edge: `runs.fingerprint_id` is writer-updatable solely for adhoc-run adoption (the NULL→value labeling of ADR-0036) — flagged as identity-adjacent and enforced in-schema by the assign-once trigger (materialized by the initial migration) so it can only go NULL→value, never be repointed (see the GRANT AUDIT in phase3-grants.sql). Grants are not part of the migration target — they live in `phase3-grants.sql`, applied by provisioning after the roles exist (Finding 4).
+**Enforcement.** The assign-once trigger is canonical enforcement on Postgres: a compromised direct-SQL writer cannot re-key or unset a labeled run's identity (`runs.fingerprint_id` has no read-time hash backstop), so the trigger is its only defense. It is verified in the full CI lane against real Postgres. (Postgres is the only backend — ADR-0039 Reconsidered 2026-06-17 — so the earlier not-mirrored-on-SQLite carve-out is moot.)
+
+---
+
+## Group 2 — The four signed deviation ADRs
+
+### ADR-0008 — mmap dense-shard read-verification softening
+**Status:** Signed-deviation (ADR-1) · **Source:** phase2 ADR-1 "Sign as written".
+**Decision.** Dense safetensors shards are verified by **post-transfer hash + first-read-per-host + monthly mirror audit**, NOT hash-on-every-open. Per-open hashing would forfeit mmap random access on the dense lane.
+**Consequences.** Residual = corruption between audits on an already-verified host; bounded by monthly cadence and the lane being TTL/recomputable. This is a sanctioned deviation from the "sha256 verified on read" binding, scoped to the dense mmap lane only. No tightening (e.g. weekly) was taken.
+
+### ADR-0009 — DuckDB direct reads unverifiable in-band; accepted
+**Status:** Signed-deviation (ADR-2) · **Source:** phase2 ADR-2 "Sign".
+**Decision.** Direct DuckDB-over-https ranged reads of lake parquet **cannot** be sha256-verified in-band; this is accepted. Residual is bounded by the mirror audit (ADR-0014) + quarterly cloud spot-sample. Docs state the residual honestly.
+**Consequences.** The direct-DuckDB product surface is preserved. **The offered parquet-page-checksum tightening was NOT taken** (C5) — lake writers are not required to enable page checksums. (If the owner later wants it, it is an additive writer-config change, not a schema change.)
+
+### ADR-0010 — Sealed-bundle GC exemption + venue purge-window
+**Status:** Signed-deviation (ADR-3) · **Source:** phase2 ADR-3 "Sign".
+**Decision.** GC **never** deletes a *sealed* (registered) bundle. Sealed bundles residing on venue scratch carry a `venue_purge_window` column so TTL math respects the venue's own deletion clock. Unsealed (unregistered) bundles remain reaper-collectible.
+**Consequences.** The system's own reaper can never delete registered-but-not-yet-promoted data. **The offered upload-deadline / forced-promotion-alert tightening was NOT taken** (C5). The purge-window keeps TTL honest about what the venue destroys regardless; cluster scratch (Jetstream /tmp, ARCC scratch) is in-scope TTL territory governed by this column (E9 sub-part).
+**Closed decision (2026-06-16) — bundle fields are deliberately NOT trigger-guarded.** Unlike `runs.fingerprint_id` (ADR-0007), the writer-updatable bundle lifecycle fields (`manifest_sha256`, `sealed_at`, `registered_at`) and `bundles.state` get NO assign-once trigger: `manifest_sha256` is hash-verifiable on read, and state transitions are repository-CAS-guarded (ADR-0039), so a trigger would be redundant. Adding non-load-bearing machinery is itself the study-query-llm smell we are greenfielding away from. Decided, not deferred.
+
+### ADR-0011 — Promotion-on-demand satellite doctrine
+**Status:** Signed-deviation (ADR-4) · **Source:** phase2 ADR-4 "Sign".
+**Decision.** Derived Postgres tables (e.g. `mcq_responses`) exist **only** via explicit promotion when a concrete experiment consumes them — never always-on. Each promoted satellite pays the **governance trio**: `method_version_id` on every derived row + a `neuro derive` re-derive CLI + a parity probe comparing the satellite to its lake source. **`mcq_responses` is NOT pre-created in the Phase 3 DDL** (C1); the promotion *machinery* is specified, the first satellite waits for demand.
+**Consequences.** Keeps A's most useful pattern (fast SQL on derived MCQ data) without A's standing silent-wrongness surface. Promotion is a deliberate, audited act. Distinct from the MCQ *stimulus* family, which is always-on first-class PG (ADR-0023).
+
+---
+
+## Group 3 — The thirteen panel conditions
+
+### ADR-0012 — Registration hashing of cloud-bound shards (condition 1)
+**Status:** Accepted. **Decision.** Every cloud-bound shard is sha256-hashed **at registration** (seconds per bundle). Hash deferral is permitted only for local dense shards under ADR-0008. **Consequences.** The registration transaction is the durability boundary for cloud artifacts.
+
+### ADR-0013 — SAS credential lifecycle (condition 2)
+**Status:** Accepted. **Decision.** Per-human **user-delegation SAS** minted by the CLI with a stated TTL; expiry surfaced in the daily probe AND the generated views-file header; `_staging/` lives in its own container. **Consequences.** SAS/credential lifecycle is the #1 cross-pole rot surface (checkpoint watch-list) — surfacing expiry in two places is the mitigation. Topic/secret handling parallels ADR-0019.
+
+### ADR-0014 — Audit against the desktop mirror (condition 3)
+**Status:** Accepted. **Decision.** The monthly full-hash audit runs against the **desktop NVMe mirror** (free reads) + a quarterly cloud spot-sample. The read-verification residual is restated honestly in docs; an egress line is added to the cost model. **Consequences.** Bounds the ADR-0008/0009 residuals affordably; mirror is load-bearing for both the audit and the pin-at-publication default (ADR-0034).
+
+### ADR-0015 — Desktop-half health surfacing (condition 4)
+**Status:** Accepted. **Decision.** A desktop agent writes a daily heartbeat + reaper/disk/mirror-age rows to PG via `neuro_writer`; the preflight banner shows desktop-probe age; the Windows Scheduler task is named in the runbook. **Consequences.** The Windows desktop is the weakest-observed host (checkpoint watch-list); the agent makes its silence visible. Runs under WSL2 (ADR-0035).
+
+### ADR-0016 — Hook-vocabulary pinning (condition 5)
+**Status:** Accepted. **Decision.** Lake hook columns carry **registry-canonical** names (the `hook_points` site grammar: `embed.out`, `L{l}.resid.{pre|mid|post}`, `L{l}.attn.{q|k|v|z|scores|pattern}`, `L{l}.mlp.{in|act|out}`, `unembed.logits`), validated at shard close. **Consequences.** Defends against TransformerLens 4.0 / nnsight vocabulary churn (a1). The `hook_points` registry is day-one (resolves d1 open-Q4 toward "registry exists").
+
+### ADR-0017 — run_metrics valve closure (condition 6)
+**Status:** Accepted. **Decision.** `run_metrics.metric_key` is an FK to a registered `metric_keys` vocabulary; `CHECK (octet_length(value_json) <= 8192)`. **Consequences.** Closes the "metadata_json reborn" valve — run_metrics cannot become an unbounded JSON dumping ground. Per-run scalars only (no per-shard width; B posture).
+
+### ADR-0018 — ARCC relay gating (condition 7)
+**Status:** Reserved-seam. **Decision.** Reserve the `{staged, verified}` enum values in the bundle lifecycle; **gate** the relay registrar branch + its kill-tests behind the Phase 4 ARCC bring-up outcome (outbound-network + Apptainer check). **Consequences.** All three poles were dinged for prebuilding this — so it is designed-but-inert until bring-up confirms no-egress. No relay code ships in Phase 3 beyond the reserved enum.
+
+### ADR-0019 — Probe alert channel is a blocking precondition (condition 8 + E15)
+**Status:** Accepted. **Decision.** The alert channel is **ntfy.sh push** (zero-account topic → phone + desktop); probes `curl` it on `OnFailure`. **The topic name is a secret** — stored like one (not in git, not in generated docs), referenced via env/connections file. The durability-staleness gate (ADR-0020) and desktop agent (ADR-0015) use the same channel. **Consequences.** Probe value collapses if failures are folder-only (checkpoint watch-list); this unblocks the binding. Channel is swappable (msmtp/webhook) behind one `notify` seam.
+
+### ADR-0020 — Durability-staleness gate (condition 9)
+**Status:** Accepted. **Decision.** If the DB backup is **>8 days stale** OR WAL-archive lag exceeds threshold, `system_health` flips and the registrar/dispatch **refuse loudly**. **Consequences.** Generalizes A-entropy's critical WAL-rot finding — the system stops accepting new canonical writes when its own durability is unproven, rather than silently accumulating unrecoverable state.
+
+### ADR-0021 — API-lane incremental registration (condition 10)
+**Status:** Accepted. **Decision.** Online API jobs insert `capture_events` **per shard rotation** (PG is reachable by definition on CPU/API lanes), so the spend ledger stays current and paid wire payloads become durable early — not only at job completion. **Consequences.** Fixes C's critical "paid payloads GC-able mid-sweep / budget ledger stale for the sweep duration" finding as it applies to the API lane. Differs from the GPU bundle lane, which registers at bundle seal.
+
+### ADR-0022 — Prompt spill path (condition 11)
+**Status:** Accepted. **Decision.** Any hand-authored prompt **>8 KB** takes the artifact-FK spill path (blob + artifact row), regardless of origin. **Consequences.** Prompts obey the same 8 KB inline cap as wire bodies (ADR-0003); large stimuli never bloat the canonical row.
+
+### ADR-0023 — MCQ stimulus family stays in PG (condition 12)
+**Status:** Accepted. **Decision.** The MCQ stimulus family (items, options, permutations, correct letters, difficulty/structure metadata) is **always-on first-class Postgres** per the d1 census; C's D2 (push it to files) is rejected. **Consequences.** Join-critical stimulus identity is relational and DB-enforced. `representation_hierarchy.py` is the prototype for `stimulus_structures` typed metadata, wired when an experiment consumes it (reserve-until-consumed posture, as in ADR-0031).
+
+### ADR-0024 — CI / branch-protection precondition (condition 13 + E14)
+**Status:** Accepted. **Decision.** The repository is **public** — satisfying the governance binding's precondition (rulesets + branch protection enforceable, unlimited Actions minutes). Exam data never lives in git by design; the exam-text soft rule is untouched. **Consequences.** A repository ruleset on `main` requires PR + required status checks {fast, tests-full, wheel-smoke, docker}, blocks force-push, restricts deletion; required reviews stay OFF (solo + agents).
+
+---
+
+## Group 4 — Queue, storage, topology
+
+### ADR-0039 — One queue: SKIP LOCKED claim, runtime-owned leases
+**Status:** Accepted · **Source:** NEVER-AGAIN (dual claim systems); phase1 c1.
+**Decision.** Exactly one `jobs` table. Claim = `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING` with **typed routing columns** (queue, gpu_class, vram_needed_mb, capabilities `text[]`, residency_set_id) — JSONB routing rejected (GIN cannot index `vram <= free`). `claim_token uuid` + monotonic `claim_seq` fencing; all mutations CAS-guarded with rowcount checks. `attempt_count` / `expiry_count` / `refusal_count` split. Error taxonomy `permanent | transient | resource_mismatch | lease_expired` with immediate dead-letter for permanent + enqueue-time strict validation. Leases: 120s / renew 40s (runtime-owned thread) / reaper 60s, all server-side `now()`. Checkpoint-first preemption (vast.ai kills with no signal). The repository is **single-backend (Postgres)** — there is no SQLite fallback (see Reconsidered 2026-06-17 below).
+**Consequences.** The golden-snapshot harness is ported with a steal-attempt scenario. No pgqueuer/procrastinate/Hatchet/River (all fail binding requirements). This is the single claim path — SKIP LOCKED on Postgres (single-backend repository; no Python-loop / SQLite fallback). `residency_set_id` is a real FK to `residency_sets` — a hash-addressed SET of model + asset members budgeted against VRAM (phase0 Q5); residency is expressed there alone, and the former `run_inputs.role='residency_member'` is dropped (one home per concept, Finding 1). Dependency gating (C2): `job_state` carries a non-claimable `'blocked'` value; the claim predicate `state = 'queued'` never selects blocked or in-flight jobs, and a job flips `'blocked' -> 'queued'` (CAS-guarded) when its last dependency succeeds — so nothing is claimable before its dependencies have succeeded.
+**Reconsidered 2026-06-17 — SQLite dropped; Postgres-only (owner-approved reversal of the SQLite parts of ADR-0006/0007/0039).** The earlier design kept a SQLite test target behind one repository interface (with Alembic batch mode and `create_all` for unit tests). The re-audit showed this cannot hold: the schema is irreducibly PG-specific — `INTERVAL` / `JSONB` / `ARRAY` types, `NULLS NOT DISTINCT` constraints and indexes, the `assert_assign_once` trigger, and `now()` / `gen_random_uuid()` defaults — so a faithful SQLite mirror is impossible and a lossy one would BE the silent test/prod divergence the golden-snapshot harness exists to prevent. Evidence: 5 independent **PostgreSQL 18.4** builds of `phase3-ddl.sql` PASS, while SQLite `create_all` fails on INTERVAL/JSONB/ARRAY and lacks `now()` / `gen_random_uuid()`. **Resolution:** the repository is single-backend (Postgres); the golden-snapshot harness (Q15 KEEP: plan → claim → checkpoint → steal-attempt → complete/CAS-fail → cascade) and all concurrency tests run against a real-Postgres fixture (session-scoped testcontainers `postgres:18` or a reused CI service container; c1 finding 10 already placed concurrency on PG). Only the zero-infra local unit loop is given up — acceptable: Docker/WSL2 are already in the stack and the canonical store is always Postgres.
+
+### ADR-0040 — Storage backend registry; Azurite-only CI
+**Status:** Accepted · **Source:** phase0 Q7; phase1 e/D1.
+**Decision.** Backend/URI policy is data-driven (`storage_backends` registry + adapters): Azure now, S3/NAS addable without migration, **no Azure-only CHECK constraint**. CI uses **Azurite ONLY** — MinIO community is dead (archived ~Apr 2026). An S3 emulator is deferred behind the backend registry seam (Garage / SeaweedFS / digest-pinned last-good image / moto chosen *then*). Two object-storage lanes only: `artifacts` (canonical, per-prefix fail-closed dollar-calibrated quota) and `scratch` (freely deletable). Quota guard fails **closed**.
+**Consequences.** Fixes the predecessor's fail-OPEN-on-listing-error bug. CI never touches cloud. The "MinIO is a fine default" training prior is explicitly overridden by June-2026 research (D-discipline).
+
+### ADR-0041 — `AUTHOR-DISCRETION`: native PGDG Postgres on the VM
+**Status:** Author-discretion — **RESOLVED 2026-06-16, owner ACCEPTED** (no longer an open DoF) · **Source:** digest DoF "Postgres topology"; e-finding 35 (both viable).
+**Decision.** Run **native PGDG-packaged Postgres 18** on the m3.small VM (pgbackrest, pgaudit, WAL archiving configured natively). The compose file owns app/orchestrator services only; CI uses a `postgres:18` **service container** for migrations-from-zero.
+**Reasons.** (1) The m3.small is the smallest machine in the fleet; native avoids container overhead on the one durability-critical service. (2) pgbackrest + WAL archiving + pgaudit + quarterly restore drills are materially simpler and better-documented native. (3) Restore-image parity (the predecessor's habit) is preserved **in CI**, where it is actually exercised, without paying container cost on prod. (4) Provisioning scripts capture the install (docs-that-cannot-rot).
+**Owner ruling (2026-06-16):** ACCEPTED — native PGDG Postgres on the VM is the decision; this axis is closed.
+
+### ADR-0042 — VM resize deferral; Cinder volume instead
+**Status:** Accepted (from pole A, resize NOT adopted) · **Source:** checkpoint "From A".
+**Decision.** Attach a **zero-SU 150 GB Cinder volume** for PGDATA/WAL (unbinds the 20 GB root disk with no resize, pole-independent win). The VM-resize itself is **NOT adopted** — only a `vm_resize` trigger table is reserved (deferral ADR), so the m3.small stands (ADR-0001). A `capture_events` partitioning trigger is likewise reserved as a deferral ADR, not pre-applied.
+**Consequences.** Avoids A's ~35k-SU resize that scored A down on owner-fit. Partitioning is a documented trigger that fires only if `capture_events` cardinality demands it.
+
+---
+
+## Group 5 — Escalation outcomes & retrofit seams
+
+### ADR-0025 — No restricted-flag day one; taint-query retrofit path
+**Status:** Accepted · **Source:** phase0 Q3.
+**Decision.** No `restricted` flag in the day-one schema; access control is roles/credentials. Because every export/payload/derived artifact carries lineage to its prompt set, restriction is retroactively computable (one migration + one taint query). Soft rule: exam-derived raw text is never posted publicly. Content-hash identity for prompt sets stays regardless.
+**Consequences.** This ADR *is* the recorded retrofit path. Lineage completeness (ADR-0043's `lineage_edges`) is what makes the taint query possible later.
+
+### ADR-0026 — Tracker-emit default OFF; post-finalize emitter seam
+**Status:** Reserved-seam · **Source:** phase0 Q12; checkpoint.
+**Decision.** No MLflow/W&B emission by default. A post-finalize emitter seam is reserved (run summaries can be emitted as a *viewing* layer later). Heavy-tracker/thin-Postgres is ruled out permanently.
+**Consequences.** The Postgres provenance core is the only source of truth; trackers, if ever enabled, are downstream and non-authoritative.
+
+### ADR-0027 — NDIF documented seam only
+**Status:** Reserved-seam · **Source:** phase2 E1.
+**Decision.** No NDIF account; design the remote-execution adapter **slot** (registry row shape) but build no active adapter. The lane stays paper until a concrete 70B/405B experiment is planned; acceptability-for-publishable-work and the retention-policy inquiry are deferred to that moment.
+**Consequences.** The hook-registry adapter pattern (ADR-0016) is the seam NDIF would later fill.
+
+### ADR-0028 — Neuronpedia deferred to workflow 4
+**Status:** Reserved-seam · **Source:** phase2 E2.
+**Decision.** Decide hosted-API-vs-self-host at SAE-browsing (workflow 4) bring-up. Until then: deep-links to **public** model/feature pages only; **no prompt text to the Neuronpedia API at all**, and exam-derived text never to any third-party API.
+**Consequences.** Phase 3 sends nothing to Neuronpedia; the restricted-corpora precedent is parked with the decision.
+
+### ADR-0029 — Modal deferred to Phase 4
+**Status:** Reserved-seam · **Source:** phase2 E3.
+**Decision.** No Modal account today; the `storage_backends` + `rate_cards` registries reserve the row. Decide at Phase 4 bring-up when a real big-VRAM burst is concrete.
+**Consequences.** No new billed provider is approved in Phase 3.
+
+### ADR-0030 — Quantization: no policy bar; fingerprint-recorded
+**Status:** Accepted · **Source:** phase2 E5.
+**Decision.** No publication policy bar on quantization. Any quant level is publishable so long as the fingerprint records it (ADR-0005) and **pooling never crosses quant boundaries silently**. Reviewers judge case by case.
+**Consequences.** Cross-quant comparison is itself an experiment, never an accident — enforced by the fingerprint participating in run identity. Maximizes usable rented-GPU work.
+
+### ADR-0031 — Qwen-Scope deferred to an empty registry row
+**Status:** Reserved-seam · **Source:** phase2 E7.
+**Decision.** Consolidate SAE-era work on Gemma-2/3 + Llama-3.1-8B (fully tooled, permissive). Qwen-Scope is a registry row with `loader_format` recorded; the bespoke `.pt` loader is built when a Qwen experiment is real.
+**Consequences.** `assets.loader_format` is mandatory day-one precisely so this row can exist inert (Qwen-Scope is non-SAELens `.pt`).
+
+### ADR-0032 — SAE training: schema-yes / code-later
+**Status:** Accepted (schema) / Reserved-seam (code) · **Source:** phase2 E8.
+**Decision.** Phase 3 DDL carries `sae_training_runs` provenance (trainer config, dataset identity, token count, library version, resulting local `sae_release`) + the local-release asset case (no HF repo). **Zero trainer code** until a training run is justified.
+**Consequences.** DDL-only reservation — distinct from the code-prebuild pattern the panel dinged (ARCC, ADR-0018). Locally-trained releases have no `hf_repo`; `assets` accommodates the null.
+
+### ADR-0033 — Dense-lane ≤500 GB; single-layer default for 8–9B
+**Status:** Accepted · **Source:** phase2 E9.
+**Decision.** The TTL dense lane consumes **≤500 GB** desktop NVMe. **Single-layer capture is the default for 8–9B models**; all-layer is reserved for explicitly planned sweeps; TTLs are short (days). Cluster scratch is in-scope TTL territory (ADR-0010 purge-window).
+**Consequences.** Sizing constant for the worker's VRAM/disk preflight and the TTL reaper. Drives the capture contract's default `layer_selection`.
+
+### ADR-0034 — Pin = promote-at-publication + manual `pin now`
+**Status:** Accepted · **Source:** phase2 E10.
+**Decision.** Default: promote tensors to cloud at **publication** time; the recompute recipe covers the loss window. Plus an explicit `neuro pin` CLI that uploads immediately when bytes are deemed irreplaceable. Budget stays lazy by default; quota guard sized for the lazy default.
+**Consequences.** A desktop failure before publication/pin loses dense bytes → falls back to the recorded recompute recipe (artifact row survives with checksum+shape+recipe).
+
+### ADR-0035 — 4090 host: WSL2, HF cache on ext4
+**Status:** Accepted · **Source:** phase2 E11.
+**Decision.** The desktop stays Windows; the worker runs under **WSL2** with the HF cache + dense lane on **ext4 inside WSL2** (avoids the 9p I/O penalty). cuda-checkpoint/CRIU stays off the table (acceptable — checkpoint-first design targets vast.ai). The Windows Scheduler hosts the desktop health agent (ADR-0015).
+**Consequences.** Cold-start row of the worker math table assumes ext4-resident cache; the `[research]` benchmark (WSL2-ext4 vs native) is an open implementation item, not a blocker.
+
+### ADR-0036 — Ad-hoc capture: auto-mint + label-later
+**Status:** Accepted · **Source:** phase2 E12.
+**Decision.** `capture_events.run_id` is NOT NULL; every uncontexted call auto-mints into an `adhoc` session run (closes the `repository=None` bypass). Adhoc rows are flagged `unlabeled`; the preflight banner counts them; `neuro runs adopt` retroactively labels them.
+**Consequences.** The engagement's answer to the "interactive inline lane grows via ad-hoc auto-minting" rot-watch — completeness without ceremony, with a visible nag and a cheap fix.
+
+### ADR-0037 — Display keys: hybrid slug + digest
+**Status:** Accepted · **Source:** phase2 E13.
+**Decision.** Run-key grammar `{campaign_key}/{work_slug}/{variant_digest}[/inv-{uuid8}]`, where `work_slug` carries human-readable domain coordinates by convention and `variant_digest` is the short uniqueness suffix. Components are **also stored as real columns** (never parse the string to recover structure — KEEP rule).
+**Consequences.** Greppable in logs/paths, bounded length, uniform across run kinds. Locked into the composer module, blob path templates, and bundle layouts. The optional `[/inv-{uuid8}]` segment maps to the real column `runs.invocation_id` (uuid, NULL for the canonical run); re-invocations ARE allowed (the force-new-run path of ADR-0005) and coexist because `runs_experiment_variant_uq` is `NULLS NOT DISTINCT` over (campaign, slug, digest, invocation_id) — the NULL canonical stays unique while non-NULL re-invocations never collide (C1). The composer sets `invocation_id`; it is never recovered by parsing the key.
+
+### ADR-0038 — CLI name is `neuro`
+**Status:** Accepted · **Source:** phase2 E16.
+**Decision.** `neuro` is the single console entrypoint in `[project.scripts]`, runbooks, systemd/scheduler units, generated docs, and CI smoke commands.
+**Consequences.** Footnote: legacy PyPI `neuro-cli` historically claimed the `neuro` command — PATH collision only if that tool is ever installed alongside.
+
+### ADR-0043 — Lineage as relationship-edges-only
+**Status:** Accepted · **Source:** phase0 Q15 KEEP; phase1 d1.
+**Decision.** `lineage_edges` holds **relationship edges only** (src/dst typed-entity references + edge_kind); identities are evicted to typed tables. Edges survive for curation, annotation, derived-set provenance (paraphrase→source links), and the taint-query reserve (ADR-0025).
+**Consequences.** No identity data hides in a generic graph. Generative-inference derived sets (phase0 Q1) get content-hash identity + lineage edges to source set and generating run.
+
+### ADR-0044 — `AUTHOR-DISCRETION`: no pgvector day-one
+**Status:** Author-discretion — **RESOLVED 2026-06-16, owner ACCEPTED** (no longer an open DoF) · **Source:** digest DoF "pgvector use"; b (no justified day-one use).
+**Decision.** No pgvector extension day-one. Embeddings are **lake artifacts** (parquet derived-feature lane); similarity search is a DuckDB/numpy concern on export, not a PG index. If an in-DB ANN need materializes, it is a later additive migration.
+**Reasons.** Embeddings are bulk → they obey the cardinality law (ADR-0002) and live in the lake, not PG. Adding pgvector now is a speculative registry (NEVER-AGAIN). The predecessor's pgvector use was not load-bearing for the chosen export-discipline surface.
+**Owner ruling (2026-06-16):** ACCEPTED — no pgvector day-one is the decision; embeddings stay lake artifacts; this axis is closed.
+
+---
+
+## Traceability index
+
+| Source | ADRs |
+|---|---|
+| phase2 V1 / checkpoint chassis | 0001, 0002, 0003, 0042 |
+| 4 signed deviation ADRs | 0008, 0009, 0010, 0011 |
+| 13 conditions | 0012–0024 |
+| phase0 bindings | 0004, 0005, 0006, 0007, 0025, 0026, 0039, 0040, 0043 |
+| escalations E1–E16 | 0019(E15), 0024(E14), 0027(E1), 0028(E2), 0029(E3), 0030(E5), 0031(E7), 0032(E8), 0033(E9), 0034(E10), 0035(E11), 0036(E12), 0037(E13), 0038(E16); E4(g3.xl)/E6(determinism default) are Phase-4 runtime items, see capture contract §6 |
+| AUTHOR-DISCRETION → RESOLVED 2026-06-16 | 0041 (native PG — ACCEPTED), 0044 (no pgvector — ACCEPTED) |
+
+**Open `[research]` items carried into Phase 4 implementation (not settled from memory):** vllm-lens↔vllm tested version pair; VLLM_BATCH_INVARIANT logprob-bitwise empirical test (E6 gate); zstd ratios on real captures; WSL2-ext4 vs native cold-start; SAELens-6 ↔ TransformerLens-3.x runtime compat; TransformerBridge MLP hook pre/post; Azure AI Foundry logprob/seed inventory; g3.xl grant state (E4). These are flagged, not resolved.

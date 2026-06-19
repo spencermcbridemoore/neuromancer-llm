@@ -1,0 +1,2 @@
+### ADR-0021 — API-lane incremental registration (condition 10)
+**Status:** Accepted. **Decision.** Online API jobs insert `capture_events` **per shard rotation** (PG is reachable by definition on CPU/API lanes), so the spend ledger stays current and paid wire payloads become durable early — not only at job completion. **Consequences.** Fixes C's critical "paid payloads GC-able mid-sweep / budget ledger stale for the sweep duration" finding as it applies to the API lane. Differs from the GPU bundle lane, which registers at bundle seal.
