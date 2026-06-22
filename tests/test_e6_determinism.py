@@ -22,7 +22,7 @@ import os
 
 import pytest
 
-from neuromancer_llm.capture.adapters.vllm import VLLMClient
+from neuromancer_llm.capture.adapters.vllm import VLLMAdapterError, VLLMClient
 from neuromancer_llm.capture.determinism import (
     MIN_COMPUTE_CAPABILITY,
     E6Config,
@@ -40,6 +40,10 @@ def _reachable_or_skip(url: str) -> VLLMClient:
     client = VLLMClient(url, timeout=120.0)
     if not client.is_ready():
         pytest.skip(f"no reachable vLLM server at {url} (set NEURO_VLLM_BASE_URL); skipped visibly")
+    try:  # /health 200 alone doesn't prove it's vLLM — confirm the OpenAI route serves a model
+        client.served_model()
+    except VLLMAdapterError:
+        pytest.skip(f"server at {url} is not a vLLM OpenAI server (no /v1/models); skipped visibly")
     return client
 
 

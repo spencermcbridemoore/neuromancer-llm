@@ -155,6 +155,94 @@ def compare(reference: LogprobSample, other: LogprobSample) -> Divergence:
     )
 
 
+# --- MEASURED layer: the registered divergence method + the EXPECTED close-the-loop assertion -------
+# The divergence method is REGISTERED before any divergence_measurements row references it (register-first,
+# ADR-0011). Its code_sha is the content hash of the compare() implementation, so changing compare() WITHOUT
+# bumping the semver is caught as registry/runtime drift at register-time.
+DIVERGENCE_METHOD_KEY = "logprob_divergence"
+DIVERGENCE_METHOD_SEMVER = "1.0.0"
+
+# Per-dtype absolute-logprob tolerance for the TOLERANCE branch (nats). HEURISTIC placeholders for substrates
+# whose own E6 has NOT certified bitwise — refined per substrate, never identity (ADR-0004). The owned
+# vllm-bi-on@sm89 lane is BITWISE (E6 2026-06-20), so this branch is not exercised there.
+DEFAULT_TOLERANCE = 5e-2
+TOLERANCE_BY_DTYPE = {"bf16": 5e-2, "fp16": 5e-2, "fp32": 1e-3}
+
+
+class DivergenceVerdictError(RuntimeError):
+    """MEASURED divergence VIOLATES the EXPECTED reproducibility level: the substrate drifted from its E6
+    verdict (e.g. a non-zero divergence on a bitwise lane). Loud, never a silent pass (ADR-0004)."""
+
+
+def divergence_method_code_sha() -> bytes:
+    """Content hash of the divergence implementation (compare's source). The registered method_version's
+    code_sha — a change to compare() without a semver bump raises at register-time (ADR-0011 parity)."""
+    import inspect
+
+    from ..db.identity import sha256_bytes
+
+    return sha256_bytes(inspect.getsource(compare).encode("utf-8"))
+
+
+def near_tie_margin_nats(sample: LogprobSample) -> float | None:
+    """The top-1 vs top-2 logprob gap (nats) of a distribution — how close the argmax is to flipping. A
+    small margin means a tiny perturbation could change the answer (first-class MCQ fragility data, ADR-0004).
+    None when the distribution has fewer than two candidates (no tie to measure)."""
+    lps = sorted((lp for _, lp in sample.top_logprobs), reverse=True)
+    if len(lps) < 2:
+        return None
+    return lps[0] - lps[1]
+
+
+def measure_divergence(reference: LogprobSample, other: LogprobSample) -> dict[str, float | None]:
+    """Map compare() onto the divergence_measurements columns (ADR-0004). A single replicate pair, so the
+    argmax-flip 'rate' is 0/1. answer_letter_flip_rate is NULL here: answer-letter extraction is a separate
+    versioned derivation method, and the many-item MCQ position-bias measure is a later gate."""
+    d = compare(reference, other)
+    return {
+        "max_abs_diff": d.max_abs_diff,
+        "max_rel_diff": d.max_rel_diff,
+        "argmax_flip_rate": 1.0 if d.argmax_flip else 0.0,
+        "answer_letter_flip_rate": None,
+        "near_tie_margin_nats": near_tie_margin_nats(reference),
+    }
+
+
+def tolerance_for(dtype_quant: str) -> float:
+    return TOLERANCE_BY_DTYPE.get(dtype_quant, DEFAULT_TOLERANCE)
+
+
+def assert_meets_expected(
+    expected: ExpectedLevel | None, divergence: Divergence, *, dtype_quant: str
+) -> bool:
+    """Close the loop the E6 gate opened: a run pair's MEASURED divergence MUST satisfy its EXPECTED level
+    or this raises DivergenceVerdictError (ADR-0004; no silent failure). Returns True when it holds.
+
+      * BITWISE      — ANY divergence is a violation (the E6-certified lane must reproduce bit-for-bit).
+      * TOLERANCE    — max_abs_diff must be within the per-dtype tolerance.
+      * DISTRIBUTIONAL / NONE — no point assertion at this grain (out of scope this gate); passes.
+      * None (no rule) — nothing to assert; the caller records the gap (resolve_expected_level returned None).
+    """
+    if expected is None or expected in (ExpectedLevel.DISTRIBUTIONAL, ExpectedLevel.NONE):
+        return True
+    if expected == ExpectedLevel.BITWISE:
+        if not divergence.bitwise_identical:
+            raise DivergenceVerdictError(
+                f"EXPECTED=bitwise but MEASURED diverged (max_abs_diff={divergence.max_abs_diff:.3e} nats, "
+                f"argmax_flip={divergence.argmax_flip}, token_set_changed={divergence.token_set_changed}): the "
+                "substrate drifted from its E6 bitwise verdict — refusing to pass silently (ADR-0004)."
+            )
+        return True
+    # TOLERANCE
+    tol = tolerance_for(dtype_quant)
+    if divergence.max_abs_diff > tol:
+        raise DivergenceVerdictError(
+            f"EXPECTED=tolerance but MEASURED max_abs_diff={divergence.max_abs_diff:.3e} nats exceeds the "
+            f"{dtype_quant} tolerance {tol:.3e} — refusing to pass silently (ADR-0004)."
+        )
+    return True
+
+
 # --- E6 protocol ----------------------------------------------------------------------------------
 # A representative MCQ-shaped target: greedy next token over a peaked distribution (the logprob/MCQ
 # workload). The specific prompt does not affect the verdict — only whether logprobs are batch-stable.

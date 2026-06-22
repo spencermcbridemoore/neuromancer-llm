@@ -134,13 +134,18 @@ def _render_cli() -> str:
 _PRODUCT_ENV = [
     (
         "NEURO_DATABASE_URL",
-        "The canonical DB DSN (`postgresql+psycopg://...`). The ONLY product env var; "
-        "behavior never lives in env (NEVER-AGAIN: SQ_*-style shell flags).",
+        "The canonical write DSN (`postgresql+psycopg://...`). The primary product env var; "
+        "behavior never lives in env (NEVER-AGAIN: SQ_*-style shell flags) — these are infrastructure DSNs.",
     ),
     (
         "NEURO_MIGRATION_EXPECTED_LANE",
         "The lane a migration must positively match once the DB is provisioned "
         "(ADR-0006). Set by provisioning/CI, never baked into code.",
+    ),
+    (
+        "NEURO_READER_DATABASE_URL",
+        "Optional SELECT-only (neuro_reader) DSN for the read/export surface (`neuro capture show`); "
+        "falls back to NEURO_DATABASE_URL. The SELECT-only boundary is the role (phase0 Q12).",
     ),
 ]
 _SECRET_ENV = [

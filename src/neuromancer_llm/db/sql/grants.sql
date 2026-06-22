@@ -51,10 +51,15 @@ GRANT UPDATE (status, detail, measured_at) ON system_health TO neuro_writer;    
 -- NOT touch — model/tokenizer/method/asset/hook/backend registries, residency_sets, fingerprints, campaigns/runs/
 -- run_inputs, jobs/job_dependencies, stimulus family, spend, import/promotions, lineage, sae_training_runs, vocab.
 -- INSERT ON ALL is acceptable here because the orchestrator is trusted + VM-local; the security boundary (C3) is
--- that GPU/remote WORKERS connect as neuro_writer, never neuro_registrar. No UPDATE grants (lifecycle is the worker's).
+-- that GPU/remote WORKERS connect as neuro_writer, never neuro_registrar. The ONLY registrar UPDATE is the method
+-- registry's active-version pointer below (the registrar registers the method + its versions, so it owns that
+-- pointer); operational lifecycle UPDATEs remain the worker's.
 GRANT USAGE ON SCHEMA neuro TO neuro_registrar;
 GRANT INSERT ON ALL TABLES IN SCHEMA neuro TO neuro_registrar;
 GRANT SELECT ON ALL TABLES IN SCHEMA neuro TO neuro_registrar;
+-- Column-scoped to active_version_id ONLY (NOT identity: method_key/semver/code_sha stay insert-immutable);
+-- set by register_method_version after the first version exists (ADR-0011 governance trio).
+GRANT UPDATE (active_version_id) ON methods TO neuro_registrar;
 
 -- admin: everything (DDL, migrations) — VM-local only.
 GRANT ALL ON SCHEMA neuro TO neuro_admin;

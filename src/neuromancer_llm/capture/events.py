@@ -1,24 +1,29 @@
 """capture_events writer + the 'logprob capture done right' slice orchestration (capture contract §2/§4).
 
-This module owns two things:
+This module owns the WRITE + MEASURE orchestration of the slice:
 
   * write_capture_event — the immutable capture_events row writer: the TRUE wire payload stored verbatim
     as TEXT inline up to 8 KB, else each side spilled INDEPENDENTLY to its own blob artifact (A2 dual
     spill; ADR-0003/0022), with the actor/origin stamp on every capture (RULING 1). One transaction.
 
-  * capture_logprob — the Stage-2 vertical slice end to end: capture ONE real next-token logprob pass
-    VERBATIM -> register-first identity (tokenizer/model/fingerprint; ADR-0005) -> seed the E6 expected
-    rule -> label the run -> write the capture_events verbatim row -> write the per-token logprob PARQUET
-    shard through the W1-W8 registrar -> fan out one table_manifests row per queryable parquet artifact ->
-    resolve the EXPECTED reproducibility level.
+  * capture_logprob — capture ONE real next-token logprob pass VERBATIM -> register-first identity
+    (tokenizer/model/fingerprint; ADR-0005) -> seed the E6 expected rule -> label the run (an optional
+    invocation_id makes it an explicit re-invocation/replicate) -> write the capture_events verbatim row ->
+    write the per-token logprob PARQUET shard through the W1-W8 registrar -> fan out one table_manifests row
+    per queryable parquet artifact -> resolve the EXPECTED reproducibility level.
+
+  * replicate_and_measure — the MEASURED determinism loop (ADR-0004) that closes the loop E6 opened:
+    register the divergence method, link the original/replicate run pair, measure divergence with the
+    EXISTING compare(), persist divergence_measurements, and assert MEASURED meets EXPECTED (fail loud).
 
 The fix this slice delivers: the predecessor's logprob runs BYPASSED raw capture (repository=None) and
 stored a RECONSTRUCTED request + a {"text"} response. Here the wire bytes are captured verbatim and the
-parquet logprob array is DERIVED from them — never a substitute for them.
+parquet logprob array is DERIVED from them — never a substitute. The READ side (a SELECT-only consumer
+reconstructs + integrity-verifies the captured logprobs from the lake) lives in capture/reader.py.
 
-DEFERRED (later gates; one-line homes noted): the READ + VERIFY half (DuckDB read via the reader role;
-the replicate/divergence MEASURED loop over replicate_links + divergence_measurements); the first-class
-prompt_set/stimulus registry; adhoc auto-mint (capture/adhoc.py). This slice captures a LABELED run.
+DEFERRED (later gates): the first-class prompt_set/stimulus registry (this slice uses content_hash(prompt)
+inline); adhoc auto-mint (capture/adhoc.py); the many-item MCQ position-bias measure (this gate's MEASURED
+divergence is the single-capture replicate, answer_letter_flip_rate left NULL until that gate).
 """
 
 from __future__ import annotations
@@ -40,8 +45,14 @@ from ..storage.backends import StorageBackend
 from .adapters.vllm import LogprobSample, VLLMClient
 from .determinism import (
     DEFAULT_TARGET_PROMPT,
+    DIVERGENCE_METHOD_KEY,
+    DIVERGENCE_METHOD_SEMVER,
     ExpectedLevel,
+    assert_meets_expected,
+    compare,
     declared_mode_from_request,
+    divergence_method_code_sha,
+    measure_divergence,
     resolve_expected_level,
 )
 
@@ -219,6 +230,7 @@ class LogprobCaptureResult:
     request_bytes: int
     response_bytes: int
     served_model: str
+    sample: LogprobSample  # the parsed distribution this capture observed (for the MEASURED replicate loop)
 
 
 def capture_logprob(
@@ -251,6 +263,7 @@ def capture_logprob(
     expected_uuid: uuid.UUID | str | None = None,
     event_key: str | None = None,
     actor_kind: str = "agent",
+    invocation_id: uuid.UUID | None = None,
 ) -> LogprobCaptureResult:
     """Drive ONE real next-token logprob capture end to end ('logprob capture done right').
 
@@ -312,7 +325,9 @@ def capture_logprob(
     )
 
     # 5. RUN — a LABELED experiment run (fingerprint_id set at insert; expected_level_override stays NULL).
-    run_key = compose_run_key(campaign_key, work_slug, variant_digest)
+    # A non-NULL invocation_id is an explicit re-invocation (the replicate; ADR-0005): the run_key gets the
+    # /inv-{uuid8} suffix and the run coexists under runs_experiment_variant_uq (NULLS NOT DISTINCT, C1).
+    run_key = compose_run_key(campaign_key, work_slug, variant_digest, invocation_id=invocation_id)
     actor_id = repo.get_or_create_actor(actor_key, kind=actor_kind)
     campaign_id = repo.get_or_create_campaign(campaign_key, actor_id)
     run_id = repo.get_or_create_run(
@@ -324,6 +339,7 @@ def capture_logprob(
         origin=origin,
         run_kind="experiment",
         fingerprint_id=fingerprint_id,
+        invocation_id=invocation_id,
     )
     expected = resolve_expected_level(
         repo.engine, declared_mode=declared.value, substrate_key=substrate_key
@@ -396,4 +412,85 @@ def capture_logprob(
         request_bytes=ev.request_bytes,
         response_bytes=ev.response_bytes,
         served_model=served,
+        sample=captured.sample,
+    )
+
+
+@dataclass(frozen=True)
+class ReplicateMeasureResult:
+    """The durable end-state of one MEASURED determinism loop (every id/metric the gate quotes)."""
+
+    replicate_link_id: int
+    method_version_id: int
+    original_run_id: int
+    replicate_run_id: int
+    max_abs_diff: float
+    max_rel_diff: float
+    argmax_flip_rate: float
+    answer_letter_flip_rate: float | None
+    near_tie_margin_nats: float | None
+    bitwise_identical: bool
+    token_set_changed: bool
+    expected_level: str | None
+    meets_expected: bool
+
+
+def replicate_and_measure(
+    *,
+    repo: Repository,
+    original: LogprobCaptureResult,
+    replicate: LogprobCaptureResult,
+    method_semver: str = DIVERGENCE_METHOD_SEMVER,
+    expected_override: str | None = None,
+    dtype_quant: str = "bf16",
+) -> ReplicateMeasureResult:
+    """Close the determinism loop E6 opened (ADR-0004 MEASURED): register the divergence method, link the
+    original/replicate run pair, measure divergence with the EXISTING compare(), persist it, then assert the
+    MEASURED level satisfies the EXPECTED rule — raising DivergenceVerdictError on violation (a non-zero
+    divergence on a bitwise lane is a loud signal, never a silent pass).
+
+    `original` and `replicate` are two REAL captures of the SAME experiment (same fingerprint; the replicate
+    is a distinct re-invocation per ADR-0005), NOT copied rows. MEASURED is an observation linked to the run
+    pair — it NEVER feeds the fingerprint (ADR-0004). The divergence row is recorded BEFORE the assertion, so
+    a violation is persisted (the loud signal is data) AND raised.
+    """
+    # register-first: the divergence method version must exist before any divergence row references it.
+    method_version_id = repo.register_method_version(
+        method_key=DIVERGENCE_METHOD_KEY, semver=method_semver, code_sha=divergence_method_code_sha()
+    )
+    link_id = repo.link_replicate(original_run_id=original.run_id, replicate_run_id=replicate.run_id)
+    divergence = compare(original.sample, replicate.sample)
+    measured = measure_divergence(original.sample, replicate.sample)
+    repo.record_divergence(
+        replicate_link_id=link_id,
+        method_version_id=method_version_id,
+        max_abs_diff=measured["max_abs_diff"],
+        max_rel_diff=measured["max_rel_diff"],
+        argmax_flip_rate=measured["argmax_flip_rate"],
+        answer_letter_flip_rate=measured["answer_letter_flip_rate"],
+        near_tie_margin_nats=measured["near_tie_margin_nats"],
+    )
+
+    expected = resolve_expected_level(
+        repo.engine,
+        declared_mode=original.declared_mode,
+        substrate_key=original.substrate_key,
+        override=expected_override,
+    )
+    # close the loop — raises DivergenceVerdictError if MEASURED violates EXPECTED (no silent pass).
+    meets = assert_meets_expected(expected, divergence, dtype_quant=dtype_quant)
+    return ReplicateMeasureResult(
+        replicate_link_id=link_id,
+        method_version_id=method_version_id,
+        original_run_id=original.run_id,
+        replicate_run_id=replicate.run_id,
+        max_abs_diff=divergence.max_abs_diff,
+        max_rel_diff=divergence.max_rel_diff,
+        argmax_flip_rate=measured["argmax_flip_rate"] or 0.0,
+        answer_letter_flip_rate=measured["answer_letter_flip_rate"],
+        near_tie_margin_nats=measured["near_tie_margin_nats"],
+        bitwise_identical=divergence.bitwise_identical,
+        token_set_changed=divergence.token_set_changed,
+        expected_level=expected.value if expected is not None else None,
+        meets_expected=meets,
     )

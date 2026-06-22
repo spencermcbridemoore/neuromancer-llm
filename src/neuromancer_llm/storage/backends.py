@@ -52,6 +52,12 @@ class LocalFsBackend:
     def get(self, key: str) -> bytes:
         return self._resolve(key).read_bytes()
 
+    def path_for(self, key: str) -> pathlib.Path:
+        """The resolved local filesystem path for a key (containment-checked, R9). Consumers (DuckDB) read
+        the lake file directly by this path; the SELECT-only role + sha256/size verify are the read bindings
+        (capture/reader.py)."""
+        return self._resolve(key)
+
     def exists(self, key: str) -> bool:
         return self._resolve(key).exists()
 

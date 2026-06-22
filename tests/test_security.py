@@ -1,30 +1,24 @@
 """R11: the privilege boundary (ADR-0007 / C3 / B2) and the assign-once trigger, behaviorally on real PG.
 
 * neuro_writer may NOT insert identity/registry rows (fingerprints, model_identities); neuro_registrar may.
+* neuro_reader is SELECT-only — every consumption surface uses it (phase0 Q12); no write grant at all.
 * runs.fingerprint_id is assign-once: NULL->value succeeds once (adhoc adoption); value->different raises.
+
+The role-provisioning fixtures (provisioned_roles / role_url / role_pw) live in conftest.py and are shared
+with the reader read-path tests.
 """
 
 from __future__ import annotations
 
 import pytest
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import URL, make_url
+from sqlalchemy.engine import URL
 
 pytestmark = pytest.mark.pg
 
-# R3: a password containing a single quote (and a double quote) — the old f-string SQL broke on this
-# ('unterminated quoted string'); sql.Literal escaping must round-trip it.
-ROLE_PW = "a'b\"c"
-
-
-def _role_url(base_url: str, role: str) -> URL:
-    # Return a URL OBJECT (not a rendered string) so the password reaches psycopg verbatim, with no
-    # URL percent-encoding/decoding in the middle to muddy what we're testing.
-    return make_url(base_url).set(username=role, password=ROLE_PW)
-
 
 def _exec_as(role_url: URL, sql: str, params: dict | None = None) -> bool:
-    """Run an INSERT as `role`. Return True if it committed, False ONLY on a permission denial; any other
+    """Run a statement as `role`. Return True if it committed, False ONLY on a permission denial; any other
     error (e.g. a constraint/FK problem) re-raises so a mis-set-up test can't masquerade as 'denied'."""
     eng = create_engine(role_url, future=True)
     try:
@@ -37,15 +31,6 @@ def _exec_as(role_url: URL, sql: str, params: dict | None = None) -> bool:
         raise
     finally:
         eng.dispose()
-
-
-@pytest.fixture
-def provisioned_roles(engine, pg_url):
-    from neuromancer_llm.db.provision import provision_roles
-
-    with engine.connect() as conn:
-        provision_roles(conn, password=ROLE_PW)
-    return pg_url
 
 
 def _seed_model(engine) -> int:
@@ -72,11 +57,11 @@ def _seed_model(engine) -> int:
         ).scalar_one()
 
 
-def test_role_boundary(engine, provisioned_roles):
+def test_role_boundary(engine, provisioned_roles, role_url):
     base = provisioned_roles
     mid = _seed_model(engine)
-    writer = _role_url(base, "neuro_writer")
-    registrar = _role_url(base, "neuro_registrar")
+    writer = role_url(base, "neuro_writer")
+    registrar = role_url(base, "neuro_registrar")
     fp_sql = (
         "INSERT INTO neuro.fingerprints (fingerprint_hash, model_id, declared_mode, semantic_config) "
         "VALUES (:h, :m, 'greedy', 'cfg')"
@@ -94,11 +79,42 @@ def test_role_boundary(engine, provisioned_roles):
     assert _exec_as(registrar, fp_sql, {"h": b"\x04", "m": mid}) is True
 
 
-def test_role_password_with_quote_roundtrips(provisioned_roles):
-    """R3: a password containing a single quote was created safely (sql.Literal), and a role can connect
-    with that EXACT password and run a query. The old f-string interpolation broke on the quote."""
-    assert "'" in ROLE_PW  # guard: this test is only meaningful with a quote in the password
-    eng = create_engine(_role_url(provisioned_roles, "neuro_reader"), future=True)
+def test_reader_role_is_select_only(engine, provisioned_roles, role_url):
+    """R11 mirror: neuro_reader may SELECT every table but holds NO write grant — INSERT on a registry table
+    AND UPDATE on an operational table are both DENIED (export discipline; phase0 Q12)."""
+    base = provisioned_roles
+    mid = _seed_model(engine)
+    reader = role_url(base, "neuro_reader")
+
+    # SELECT is allowed (the consumption surface)
+    eng = create_engine(reader, future=True)
+    try:
+        with eng.connect() as conn:
+            assert conn.execute(text("SELECT count(*) FROM neuro.model_identities")).scalar_one() >= 1
+    finally:
+        eng.dispose()
+
+    # INSERT on a registry/identity table is DENIED
+    fp_sql = (
+        "INSERT INTO neuro.fingerprints (fingerprint_hash, model_id, declared_mode, semantic_config) "
+        "VALUES (:h, :m, 'greedy', 'cfg')"
+    )
+    assert _exec_as(reader, fp_sql, {"h": b"\x07", "m": mid}) is False
+    # INSERT on an operational/output table is DENIED (the writer has this; the reader does not)
+    ce_sql = (
+        "INSERT INTO neuro.capture_events (run_id, event_key, model_id, actor_id, origin, request_text) "
+        "VALUES (1, 'k', :m, 1, 'o', 'x')"
+    )
+    assert _exec_as(reader, ce_sql, {"m": mid}) is False
+    # UPDATE on an operational table is DENIED (lifecycle UPDATE is the writer's, never the reader's)
+    assert _exec_as(reader, "UPDATE neuro.jobs SET state = 'queued' WHERE job_id = -1") is False
+
+
+def test_role_password_with_quote_roundtrips(provisioned_roles, role_url, role_pw):
+    """R3: a password containing a single quote was created safely (sql.Literal), and a role can connect with
+    that EXACT password and run a query. The old f-string interpolation broke on the quote."""
+    assert "'" in role_pw  # guard: this test is only meaningful with a quote in the password
+    eng = create_engine(role_url(provisioned_roles, "neuro_reader"), future=True)
     try:
         with eng.connect() as conn:
             assert conn.execute(text("SELECT 1")).scalar_one() == 1

@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from neuromancer_llm.capture.adapters.vllm import LogprobSample
 from neuromancer_llm.capture.events import INLINE_CAP, capture_logprob, logprob_parquet, write_capture_event
+from neuromancer_llm.db.repository import IdentityMismatchError
 from neuromancer_llm.storage.backends import LocalFsBackend
 
 # The pinned Mistral-7B-v0.3 revision (E6 launch recipe, 2026-06-20).
@@ -164,6 +165,51 @@ def test_capture_event_dual_spill(seeded, tmp_path):
     # the spilled blobs are the VERBATIM bytes (round-trip from the lake)
     assert backend.get("logprobs/run=x/part-0000/wire/ev-big.request.json") == big_req
     assert backend.get("logprobs/run=x/part-0000/wire/ev-big.response.json") == big_resp
+
+
+# --- register-first, fail-loud identity: negative (drift) tests (ADR-0005) -------------------------
+@pytest.mark.pg
+def test_register_model_identity_raises_on_drift(repo):
+    """The fail-loud binding has teeth: if a stored model_identity row drifts from what its identity_hash
+    encodes, re-registering the SAME identity detects the mismatch and refuses to adopt it (ADR-0005)."""
+    tok = repo.register_tokenizer_identity(tokenizer_hash=b"tok")
+    components = dict(
+        hf_repo="r",
+        hf_revision="rev1",
+        dtype_quant="bf16",
+        tokenizer_id=tok,
+        tokenizer_hash=b"tok",
+        serving_stack="vllm",
+        serving_version="0.23.0",
+        arch_family="llama",
+    )
+    repo.register_model_identity(**components)
+    # corrupt the recorded hf_revision so the stored row no longer matches its identity_hash
+    with repo.engine.begin() as conn:
+        conn.execute(text("UPDATE neuro.model_identities SET hf_revision = 'TAMPERED'"))
+    with pytest.raises(IdentityMismatchError):
+        repo.register_model_identity(**components)  # same hash, drifted recorded component -> raise
+
+
+@pytest.mark.pg
+def test_register_fingerprint_raises_on_drift(seeded):
+    """Re-registering the SAME fingerprint_hash with a DIFFERENT semantic_config raises (force-new-run is an
+    explicit NEW hash, never a silent overwrite; ADR-0005 insert-only, raise-on-mismatch)."""
+    repo = seeded["repo"]
+    model_id = _seed_model(repo)
+    repo.register_fingerprint(
+        fingerprint_hash=b"H", model_id=model_id, declared_mode="greedy", semantic_config="cfgA"
+    )
+    assert (
+        repo.register_fingerprint(
+            fingerprint_hash=b"H", model_id=model_id, declared_mode="greedy", semantic_config="cfgA"
+        )
+        is not None
+    )  # idempotent for the SAME config
+    with pytest.raises(IdentityMismatchError):
+        repo.register_fingerprint(
+            fingerprint_hash=b"H", model_id=model_id, declared_mode="greedy", semantic_config="cfgB"
+        )
 
 
 # --- registrar: per-queryable-artifact table_manifests fan-out -------------------------------------
@@ -352,3 +398,104 @@ def test_capture_logprob_end_to_end(repo, tmp_path):
     blob = backend.get(m["uri"])
     assert sha256_bytes(blob) == bytes(m["sha256"]) and len(blob) == m["size_bytes"]
     assert pq.read_table(io.BytesIO(blob)).num_rows == 20
+
+
+@pytest.mark.gpu
+@pytest.mark.pg
+def test_capture_replicate_read_end_to_end(repo, provisioned_roles, role_url, tmp_path):
+    """The READ + VERIFY gate, live: capture an experiment + a DISTINCT replicate on the BI-on server, measure
+    divergence with the registered method (MUST be bitwise — EXPECTED=bitwise holds, max_abs_diff==0), and
+    have a SELECT-only neuro_reader round-trip the original's parquet via the manifest (integrity-verified).
+    Skips visibly off-GPU / without a reachable server."""
+    from sqlalchemy import create_engine
+
+    from neuromancer_llm.capture.adapters.vllm import VLLMAdapterError, VLLMClient
+    from neuromancer_llm.capture.determinism import MIN_COMPUTE_CAPABILITY, host_compute_capability
+    from neuromancer_llm.capture.events import replicate_and_measure
+    from neuromancer_llm.capture.reader import read_run_logprobs
+    from neuromancer_llm.composer import new_invocation_id
+    from neuromancer_llm.db.identity import sha256_bytes
+
+    base_url = os.environ.get("NEURO_VLLM_BASE_URL", "http://127.0.0.1:8000")
+    client = VLLMClient(base_url, timeout=120.0)
+    if not client.is_ready():
+        pytest.skip(f"no reachable vLLM server at {base_url} (set NEURO_VLLM_BASE_URL); skipped visibly")
+    try:
+        client.served_model()
+    except VLLMAdapterError:
+        pytest.skip(f"server at {base_url} is not a vLLM OpenAI server (no /v1/models); skipped visibly")
+    if host_compute_capability() < MIN_COMPUTE_CAPABILITY:
+        pytest.skip(f"compute capability < {MIN_COMPUTE_CAPABILITY}; capture-grade gate not applicable here")
+
+    tok_file = os.environ.get("NEURO_VLLM_TOKENIZER_FILE")
+    tok_hash = (
+        sha256_bytes(open(tok_file, "rb").read())  # noqa: SIM115
+        if tok_file
+        else sha256_bytes(f"{HF_REPO}@{HF_REVISION}".encode())
+    )
+    backend = LocalFsBackend(tmp_path)
+    backend_id = repo.get_or_create_storage_backend(
+        "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
+    )
+    common = dict(
+        repo=repo,
+        backend=backend,
+        backend_id=backend_id,
+        client=client,
+        expected_lane="test",
+        hf_repo=HF_REPO,
+        hf_revision=HF_REVISION,
+        tokenizer_hash=tok_hash,
+        campaign_key="phase4-capture",
+        work_slug="mcq-next-token",
+        variant_digest="v1",
+        actor_key="owner",
+        origin="pytest-4090",
+        n_logprobs=20,
+        seed=1234,
+    )
+    original = capture_logprob(**common, invocation_id=None)
+    replicate = capture_logprob(**common, invocation_id=new_invocation_id())
+
+    # the determinism loop closes BITWISE: same fingerprint, distinct re-invocation, divergence == 0.
+    measured = replicate_and_measure(repo=repo, original=original, replicate=replicate)
+    assert measured.original_run_id != measured.replicate_run_id
+    assert measured.expected_level == "bitwise"
+    assert measured.bitwise_identical and measured.meets_expected
+    assert measured.max_abs_diff == 0.0 and measured.argmax_flip_rate == 0.0
+
+    with repo.engine.connect() as conn:
+        link = (
+            conn.execute(
+                text(
+                    "SELECT original_run_id, replicate_run_id FROM neuro.replicate_links "
+                    "WHERE replicate_link_id = :l"
+                ),
+                {"l": measured.replicate_link_id},
+            )
+            .mappings()
+            .one()
+        )
+        assert link["original_run_id"] == original.run_id and link["replicate_run_id"] == replicate.run_id
+        # the replicate run is an explicit re-invocation (non-NULL invocation_id), the original is canonical
+        invs = (
+            conn.execute(
+                text("SELECT run_id, invocation_id FROM neuro.runs WHERE run_id IN (:o, :r)"),
+                {"o": original.run_id, "r": replicate.run_id},
+            )
+            .mappings()
+            .all()
+        )
+    by_run = {row["run_id"]: row["invocation_id"] for row in invs}
+    assert by_run[original.run_id] is None and by_run[replicate.run_id] is not None
+
+    # the read half: a SELECT-only neuro_reader reconstructs the original's logprobs from the lake via the
+    # manifest, integrity-verified (sha256+size), and the generated token matches the live capture bitwise.
+    reader_engine = create_engine(role_url(provisioned_roles, "neuro_reader"), future=True)
+    try:
+        read = read_run_logprobs(reader_engine, backend, run_id=original.run_id, dataset_name="logprobs")
+    finally:
+        reader_engine.dispose()
+    assert read.integrity_verified >= 1
+    assert read.generated_token_id == original.sample.generated_token_id
+    assert read.generated_logprob == original.sample.logprob_map[original.sample.generated_token_id]

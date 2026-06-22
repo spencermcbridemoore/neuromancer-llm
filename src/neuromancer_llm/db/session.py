@@ -64,5 +64,22 @@ def make_writer_engine(
     )
 
 
+def make_reader_engine(
+    url: str | None = None, *, expected_lane: str | None = None, echo: bool = False
+) -> Engine:
+    """A SELECT-only consumer engine (every consumption surface uses the neuro_reader role; phase0 Q12).
+
+    The SELECT-only boundary is the connected ROLE, not this engine — connect with neuro_reader creds. No
+    write guard runs (reads need none, ADR-0006); the read-time binding is integrity verify (sha256+size,
+    capture/reader.py). When expected_lane is given, the lane is positively confirmed first (a SELECT the
+    reader role may run) so a consumer can refuse to read the wrong lane.
+    """
+    engine = make_engine(url, echo=echo)
+    if expected_lane is not None:
+        with engine.connect() as conn:
+            assert_lane(conn, expected_lane=expected_lane)
+    return engine
+
+
 def make_session_factory(engine: Engine | None = None) -> sessionmaker[Session]:
     return sessionmaker(bind=engine or make_engine(), class_=Session, expire_on_commit=False)

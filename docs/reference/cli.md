@@ -10,8 +10,8 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro bundles verify-golden` — STAGE 2 — verify against the manifest golden corpus.
 - `neuro capture` — Capture (Stage 2 vertical slice): logprob | replay | show.
 - `neuro capture logprob` — Capture one real next-token logprob pass end to end (verbatim wire + identity + parquet bundle).
-- `neuro capture replay` — STAGE 2 (later gate) — replicate a captured run for divergence measurement.
-- `neuro capture show` — STAGE 2 (later gate) — show a capture_events row + its spilled payloads.
+- `neuro capture replay` — Replicate a capture for divergence measurement (ADR-0004 MEASURED): capture the experiment, capture a
+- `neuro capture show` — Read a captured run's logprobs from the lake AS A SELECT-ONLY CONSUMER: locate the parquet via
 - `neuro db` — Database control plane: migrate, provision, roles, verify.
 - `neuro db migrate` — Run `alembic upgrade head` — materialize the canonical schema (migrations own it, never create_all).
 - `neuro db provision` — Write the singleton lanes-v2 identity row on a provably-empty, just-migrated DB (ADR-0006).

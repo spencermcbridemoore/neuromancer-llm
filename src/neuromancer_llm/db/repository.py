@@ -358,6 +358,146 @@ class Repository:
                 {"dm": declared_mode, "sk": substrate_key},
             ).scalar_one()
 
+    # --- MEASURED determinism: method registry + replicate links + divergence (ADR-0004/0011) ----
+    def register_method(self, method_key: str) -> int:
+        """Register-first a method by its unique key (ADR-0011 governance trio). INSERT-only; idempotent
+        return on conflict. The active-version pointer is set by register_method_version."""
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.methods (method_key) VALUES (:k) "
+                    "ON CONFLICT (method_key) DO NOTHING RETURNING method_id"
+                ),
+                {"k": method_key},
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            return conn.execute(
+                text("SELECT method_id FROM neuro.methods WHERE method_key = :k"), {"k": method_key}
+            ).scalar_one()
+
+    def register_method_version(
+        self, *, method_key: str, semver: str, code_sha: bytes, set_active: bool = True
+    ) -> int:
+        """Register-first, fail-loud a method version (ADR-0011 registry/runtime parity). The method is
+        ensured first; the version is INSERT-only by (method_id, semver). On conflict the recorded code_sha
+        must MATCH — a same-semver re-register with a DIFFERENT implementation hash raises (bump the semver
+        when the code changes). Optionally points methods.active_version_id at this version."""
+        with self.engine.begin() as conn:
+            method_id = conn.execute(
+                text(
+                    "INSERT INTO neuro.methods (method_key) VALUES (:k) "
+                    "ON CONFLICT (method_key) DO NOTHING RETURNING method_id"
+                ),
+                {"k": method_key},
+            ).scalar_one_or_none()
+            if method_id is None:
+                method_id = conn.execute(
+                    text("SELECT method_id FROM neuro.methods WHERE method_key = :k"), {"k": method_key}
+                ).scalar_one()
+            mv_id = conn.execute(
+                text(
+                    "INSERT INTO neuro.method_versions (method_id, semver, code_sha) "
+                    "VALUES (:m, :s, :c) ON CONFLICT (method_id, semver) DO NOTHING RETURNING method_version_id"
+                ),
+                {"m": method_id, "s": semver, "c": code_sha},
+            ).scalar_one_or_none()
+            if mv_id is None:
+                existing = (
+                    conn.execute(
+                        text(
+                            "SELECT method_version_id, code_sha FROM neuro.method_versions "
+                            "WHERE method_id = :m AND semver = :s"
+                        ),
+                        {"m": method_id, "s": semver},
+                    )
+                    .mappings()
+                    .one()
+                )
+                if existing["code_sha"] is not None and bytes(existing["code_sha"]) != code_sha:
+                    raise IdentityMismatchError(
+                        f"method {method_key}@{semver} already registered with a different code_sha "
+                        f"(ADR-0011 registry/runtime parity) — bump the semver when the implementation changes."
+                    )
+                mv_id = existing["method_version_id"]
+            if set_active:
+                # The registry's active-version pointer (registrar-scoped UPDATE; grants.sql). Set AFTER the
+                # version row exists so the methods_active_version_fk is satisfied.
+                conn.execute(
+                    text("UPDATE neuro.methods SET active_version_id = :v WHERE method_id = :m"),
+                    {"v": mv_id, "m": method_id},
+                )
+            return mv_id
+
+    def link_replicate(self, *, original_run_id: int, replicate_run_id: int) -> int:
+        """Link a replicate run to its original (ADR-0004 MEASURED). Idempotent on the UNIQUE pair; the
+        in-schema replicate_distinct CHECK (original <> replicate) is guarded here for a clear error."""
+        if original_run_id == replicate_run_id:
+            raise ValueError(
+                f"replicate link requires two distinct runs (got {original_run_id} for both); a run cannot "
+                "be its own replicate (replicate_distinct CHECK)."
+            )
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.replicate_links (original_run_id, replicate_run_id) VALUES (:o, :r) "
+                    "ON CONFLICT (original_run_id, replicate_run_id) DO NOTHING RETURNING replicate_link_id"
+                ),
+                {"o": original_run_id, "r": replicate_run_id},
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            return conn.execute(
+                text(
+                    "SELECT replicate_link_id FROM neuro.replicate_links "
+                    "WHERE original_run_id = :o AND replicate_run_id = :r"
+                ),
+                {"o": original_run_id, "r": replicate_run_id},
+            ).scalar_one()
+
+    def record_divergence(
+        self,
+        *,
+        replicate_link_id: int,
+        method_version_id: int,
+        max_abs_diff: float | None,
+        max_rel_diff: float | None,
+        argmax_flip_rate: float | None,
+        answer_letter_flip_rate: float | None,
+        near_tie_margin_nats: float | None,
+    ) -> int:
+        """Persist one MEASURED divergence keyed (replicate_link, method_version) (ADR-0004). Idempotent on
+        the UNIQUE — re-measuring the same pair with the same registered method is a no-op (compare() is
+        deterministic over the two immutable captures, so the recorded measurement does not drift)."""
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.divergence_measurements "
+                    "(replicate_link_id, method_version_id, max_abs_diff, max_rel_diff, argmax_flip_rate, "
+                    "answer_letter_flip_rate, near_tie_margin_nats) "
+                    "VALUES (:l, :mv, :ma, :mr, :af, :al, :nt) "
+                    "ON CONFLICT (replicate_link_id, method_version_id) DO NOTHING RETURNING divergence_id"
+                ),
+                {
+                    "l": replicate_link_id,
+                    "mv": method_version_id,
+                    "ma": max_abs_diff,
+                    "mr": max_rel_diff,
+                    "af": argmax_flip_rate,
+                    "al": answer_letter_flip_rate,
+                    "nt": near_tie_margin_nats,
+                },
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            return conn.execute(
+                text(
+                    "SELECT divergence_id FROM neuro.divergence_measurements "
+                    "WHERE replicate_link_id = :l AND method_version_id = :mv"
+                ),
+                {"l": replicate_link_id, "mv": method_version_id},
+            ).scalar_one()
+
     # --- enqueue (composer sets the component columns; deps -> 'blocked' at enqueue) -------------
     def enqueue(
         self,

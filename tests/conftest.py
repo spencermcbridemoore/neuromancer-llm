@@ -176,6 +176,40 @@ def repo(engine):
     return Repository(engine, expected_lane="test")
 
 
+# --- shared role provisioning (the SELECT-only reader + the registry/writer boundary) --------------
+# R3: a password containing a single quote (and a double quote) — the old f-string SQL broke on this
+# ('unterminated quoted string'); sql.Literal escaping must round-trip it. Kept so the regression stays live.
+_ROLE_PW = "a'b\"c"
+
+
+@pytest.fixture
+def role_pw():
+    return _ROLE_PW
+
+
+@pytest.fixture
+def provisioned_roles(engine, pg_url):
+    """Create the four roles + apply grants.sql, idempotently. Roles are cluster-level and persist across
+    the session; returns the base pg_url so a test can build a role-scoped connection URL."""
+    from neuromancer_llm.db.provision import provision_roles
+
+    with engine.connect() as conn:
+        provision_roles(conn, password=_ROLE_PW)
+    return pg_url
+
+
+@pytest.fixture
+def role_url():
+    """A helper to build a role-scoped URL OBJECT (not a rendered string) so the password reaches psycopg
+    verbatim with no URL percent-encoding in the middle to muddy a boundary test."""
+    from sqlalchemy.engine import make_url
+
+    def _make(base_url, role):
+        return make_url(base_url).set(username=role, password=_ROLE_PW)
+
+    return _make
+
+
 @pytest.fixture
 def seeded(repo):
     """Minimal actor + campaign + run so jobs can be enqueued (jobs.run_id is NOT NULL)."""
