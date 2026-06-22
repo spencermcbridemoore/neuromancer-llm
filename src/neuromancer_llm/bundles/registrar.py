@@ -22,12 +22,29 @@ overwritten); the final state transition is CAS-guarded so a tombstoned bundle c
 from __future__ import annotations
 
 import uuid as _uuid
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 
 from sqlalchemy import Engine, text
 
 from ..storage.backends import StorageBackend
 from .bundlespec import Shard, bundle_uuid_for, sha256_bytes
 from .manifest import build_manifest, manifest_bytes
+
+
+@dataclass(frozen=True)
+class TableManifestSpec:
+    """One QUERYABLE parquet artifact -> one table_manifests row (resolves the Stage-1 per-artifact
+    fan-out DEFER). `shard_name` selects which registered shard the manifest points at; the partition
+    columns (run_id/model_id/hook_point_id) are real FK columns, never parsed (ADR-0001)."""
+
+    shard_name: str
+    dataset_name: str
+    row_count: int | None = None
+    model_id: int | None = None
+    hook_point_id: int | None = None
+    schema_major: int = 1
+
 
 # Injectable crash points (the kill-test windows). None = run to completion.
 CRASH_POINTS = (
@@ -127,9 +144,16 @@ class BundleRegistrar:
         partition_path: str,
         shards: dict[str, bytes],
         schema_major: int = 1,
+        artifact_kinds: Mapping[str, str] | None = None,
+        table_manifests: Sequence[TableManifestSpec] | None = None,
         crash_at: str | None = None,
     ) -> int:
-        """Run the W1-W8 ordering. Returns the bundle_id. Idempotent on resume for IDENTICAL bytes."""
+        """Run the W1-W8 ordering. Returns the bundle_id. Idempotent on resume for IDENTICAL bytes.
+
+        `artifact_kinds` maps shard name -> artifact_kind (default 'other'; the logprob lane passes
+        'token_table' for the parquet). `table_manifests` declares ONE table_manifests row per QUERYABLE
+        parquet artifact (the fan-out); when omitted, a single legacy manifest points at the first shard
+        (Stage-1 behaviour preserved for the generic seam tests)."""
         if crash_at is not None and crash_at not in CRASH_POINTS:
             raise ValueError(f"unknown crash point {crash_at!r}")
 
@@ -176,43 +200,66 @@ class BundleRegistrar:
                 raise SeamStateError(
                     f"cannot register bundle {bundle_id} in state {state!r} (expected 'sealed')."
                 )
-            artifact_ids: list[int] = []
+            kinds = artifact_kinds or {}
+            artifact_id_by_name: dict[str, int] = {}
             for shard, key in zip(shard_objs, keys, strict=True):
                 new_sha = sha256_bytes(shard.data)
                 row = conn.execute(
                     text(
                         "INSERT INTO neuro.artifacts (bundle_id, kind, backend_id, uri, sha256, size_bytes, retention) "
-                        "VALUES (:b, 'other', :be, :uri, :sha, :sz, 'ttl') "
+                        "VALUES (:b, :kind, :be, :uri, :sha, :sz, 'ttl') "
                         # self-assign no-op on conflict so RETURNING yields the EXISTING sha256 (not overwritten)
                         "ON CONFLICT (backend_id, uri) DO UPDATE SET size_bytes = neuro.artifacts.size_bytes "
                         "RETURNING artifact_id, sha256"
                     ),
-                    {"b": bundle_id, "be": backend_id, "uri": key, "sha": new_sha, "sz": shard.size_bytes},
+                    {
+                        "b": bundle_id,
+                        "kind": kinds.get(shard.name, "other"),
+                        "be": backend_id,
+                        "uri": key,
+                        "sha": new_sha,
+                        "sz": shard.size_bytes,
+                    },
                 ).one()
                 if bytes(row.sha256) != new_sha:  # R2: idempotent for same bytes, fail-loud for different
                     raise SeamIntegrityError(
                         f"artifact {key} already registered with a different sha256 — blob bytes diverged."
                     )
-                artifact_ids.append(row.artifact_id)
+                artifact_id_by_name[shard.name] = row.artifact_id
             if crash_at == "mid_register":
                 raise CrashInjected("W7: mid-register txn — must roll back atomically")
-            # DEFER (Stage 2): the logprob parquet lane (same callsite) must register ONE table_manifests
-            # row per QUERYABLE artifact; here a single synthetic dataset points at the first artifact.
-            # Decide the per-artifact fan-out when that lane lands.
-            conn.execute(
-                text(
-                    "INSERT INTO neuro.table_manifests (dataset_name, run_id, schema_major, partition_path, artifact_id) "
-                    "VALUES (:ds, :r, :sm, :pp, :aid) "
-                    "ON CONFLICT (dataset_name, partition_path, artifact_id) DO NOTHING"
-                ),
-                {
-                    "ds": dataset_name,
-                    "r": run_id,
-                    "sm": schema_major,
-                    "pp": partition_path,
-                    "aid": artifact_ids[0],
-                },
+            # ONE table_manifests row per QUERYABLE parquet artifact (Stage-1 DEFER resolved). When no
+            # explicit specs are given, fall back to a single manifest at the first shard (the generic
+            # seam tests' Stage-1 behaviour); the logprob lane passes a spec per queryable parquet file.
+            specs = (
+                list(table_manifests)
+                if table_manifests is not None
+                else [
+                    TableManifestSpec(
+                        shard_name=shard_objs[0].name, dataset_name=dataset_name, schema_major=schema_major
+                    )
+                ]
             )
+            for spec in specs:
+                conn.execute(
+                    text(
+                        "INSERT INTO neuro.table_manifests "
+                        "(dataset_name, run_id, model_id, hook_point_id, schema_major, partition_path, "
+                        "row_count, artifact_id) "
+                        "VALUES (:ds, :r, :mid, :hp, :sm, :pp, :rc, :aid) "
+                        "ON CONFLICT (dataset_name, partition_path, artifact_id) DO NOTHING"
+                    ),
+                    {
+                        "ds": spec.dataset_name,
+                        "r": run_id,
+                        "mid": spec.model_id,
+                        "hp": spec.hook_point_id,
+                        "sm": spec.schema_major,
+                        "pp": partition_path,
+                        "rc": spec.row_count,
+                        "aid": artifact_id_by_name[spec.shard_name],
+                    },
+                )
             res = conn.execute(
                 text(
                     "UPDATE neuro.bundles SET state = 'registered', registered_at = now() "

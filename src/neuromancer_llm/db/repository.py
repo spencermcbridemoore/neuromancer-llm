@@ -18,6 +18,14 @@ from dataclasses import dataclass
 
 from sqlalchemy import Engine, text
 
+from .identity import model_identity_hash
+
+
+class IdentityMismatchError(RuntimeError):
+    """Register-first, fail-loud: an identity/fingerprint already exists with the SAME hash but DIFFERENT
+    recorded components (ADR-0005 raise-on-mismatch). Never silently adopt a divergent identity."""
+
+
 # Lease timing (ADR-0039): 120s lease / 40s renew / 60s reaper, all server-side now(). The renewal
 # thread + reaper loop (the *policy*) are owned by workers/runtime.py; the lease INTERVAL is applied
 # here because this is where the lease SQL lives.
@@ -94,6 +102,260 @@ class Repository:
                     "a": actor_id,
                     "o": origin,
                 },
+            ).scalar_one()
+
+    # --- idempotent seeds (get-or-create; the capture lane is re-runnable) -----------------------
+    def get_or_create_actor(
+        self, actor_key: str, *, kind: str = "agent", display_name: str | None = None
+    ) -> int:
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                text("SELECT actor_id FROM neuro.actors WHERE actor_key = :k"), {"k": actor_key}
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
+            return conn.execute(
+                text(
+                    "INSERT INTO neuro.actors (actor_key, kind, display_name) "
+                    "VALUES (:k, :kind, :dn) RETURNING actor_id"
+                ),
+                {"k": actor_key, "kind": kind, "dn": display_name or actor_key},
+            ).scalar_one()
+
+    def get_or_create_campaign(self, campaign_key: str, actor_id: int) -> int:
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                text("SELECT campaign_id FROM neuro.campaigns WHERE campaign_key = :k"), {"k": campaign_key}
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
+            return conn.execute(
+                text(
+                    "INSERT INTO neuro.campaigns (campaign_key, actor_id) VALUES (:k, :a) RETURNING campaign_id"
+                ),
+                {"k": campaign_key, "a": actor_id},
+            ).scalar_one()
+
+    def get_or_create_run(
+        self,
+        run_key: str,
+        *,
+        campaign_id: int,
+        work_slug: str,
+        variant_digest: str,
+        actor_id: int,
+        origin: str,
+        run_kind: str = "experiment",
+        fingerprint_id: int | None = None,
+        invocation_id: uuid.UUID | None = None,
+        spec_hash: bytes | None = None,
+        is_unlabeled: bool = False,
+    ) -> int:
+        """Get-or-create a run by run_key. fingerprint_id is set at INSERT for a LABELED run (the
+        assign-once trigger guards only the UPDATE path, so an at-insert value is fine)."""
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                text("SELECT run_id FROM neuro.runs WHERE run_key = :rk"), {"rk": run_key}
+            ).scalar_one_or_none()
+            if existing is not None:
+                return existing
+            return conn.execute(
+                text(
+                    "INSERT INTO neuro.runs (run_key, campaign_id, work_slug, variant_digest, run_kind, "
+                    "fingerprint_id, actor_id, origin, is_unlabeled, spec_hash, invocation_id) "
+                    "VALUES (:rk, :c, :ws, :vd, :kind, :fp, :a, :o, :ul, :sh, :inv) RETURNING run_id"
+                ),
+                {
+                    "rk": run_key,
+                    "c": campaign_id,
+                    "ws": work_slug,
+                    "vd": variant_digest,
+                    "kind": run_kind,
+                    "fp": fingerprint_id,
+                    "a": actor_id,
+                    "o": origin,
+                    "ul": is_unlabeled,
+                    "sh": spec_hash,
+                    "inv": invocation_id,
+                },
+            ).scalar_one()
+
+    def get_or_create_storage_backend(
+        self,
+        backend_key: str,
+        *,
+        driver: str,
+        lane: str,
+        base_uri: str,
+        is_cloud: bool,
+    ) -> int:
+        with self.engine.begin() as conn:
+            return conn.execute(
+                text(
+                    "INSERT INTO neuro.storage_backends (backend_key, driver, lane, base_uri, is_cloud) "
+                    "VALUES (:k, :d, :l, :u, :c) "
+                    "ON CONFLICT (backend_key) DO UPDATE SET driver = EXCLUDED.driver RETURNING backend_id"
+                ),
+                {"k": backend_key, "d": driver, "l": lane, "u": base_uri, "c": is_cloud},
+            ).scalar_one()
+
+    # --- register-first, fail-loud identity (ADR-0005; registrar role) --------------------------
+    def register_tokenizer_identity(
+        self,
+        *,
+        tokenizer_hash: bytes,
+        hf_repo: str | None = None,
+        hf_revision: str | None = None,
+        note: str | None = None,
+    ) -> int:
+        """INSERT-only by tokenizer_hash (the durable identity); idempotent return on conflict."""
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.tokenizer_identities (tokenizer_hash, hf_repo, hf_revision, note) "
+                    "VALUES (:h, :r, :rev, :n) ON CONFLICT (tokenizer_hash) DO NOTHING RETURNING tokenizer_id"
+                ),
+                {"h": tokenizer_hash, "r": hf_repo, "rev": hf_revision, "n": note},
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            return conn.execute(
+                text("SELECT tokenizer_id FROM neuro.tokenizer_identities WHERE tokenizer_hash = :h"),
+                {"h": tokenizer_hash},
+            ).scalar_one()
+
+    def register_model_identity(
+        self,
+        *,
+        hf_repo: str | None,
+        hf_revision: str | None,
+        dtype_quant: str,
+        tokenizer_id: int,
+        tokenizer_hash: bytes,
+        serving_stack: str,
+        serving_version: str,
+        arch_family: str,
+    ) -> int:
+        """INSERT-only by the 7-component identity_hash (ADR-0005). On conflict, verify the recorded
+        components MATCH and raise IdentityMismatchError on any drift (never silently adopt)."""
+        identity_hash = model_identity_hash(
+            hf_repo=hf_repo,
+            hf_revision=hf_revision,
+            dtype_quant=dtype_quant,
+            tokenizer_hash=tokenizer_hash,
+            serving_stack=serving_stack,
+            serving_version=serving_version,
+            arch_family=arch_family,
+        )
+        components = {
+            "hf_repo": hf_repo,
+            "hf_revision": hf_revision,
+            "dtype_quant": dtype_quant,
+            "tokenizer_id": tokenizer_id,
+            "serving_stack": serving_stack,
+            "serving_version": serving_version,
+            "arch_family": arch_family,
+        }
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.model_identities "
+                    "(identity_hash, hf_repo, hf_revision, dtype_quant, tokenizer_id, serving_stack, "
+                    "serving_version, arch_family) "
+                    "VALUES (:ih, :hr, :rev, :dq, :tid, :ss, :sv, :af) "
+                    "ON CONFLICT (identity_hash) DO NOTHING RETURNING model_id"
+                ),
+                {
+                    "ih": identity_hash,
+                    "hr": hf_repo,
+                    "rev": hf_revision,
+                    "dq": dtype_quant,
+                    "tid": tokenizer_id,
+                    "ss": serving_stack,
+                    "sv": serving_version,
+                    "af": arch_family,
+                },
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            existing = (
+                conn.execute(
+                    text(
+                        "SELECT model_id, hf_repo, hf_revision, dtype_quant, tokenizer_id, serving_stack, "
+                        "serving_version, arch_family FROM neuro.model_identities WHERE identity_hash = :ih"
+                    ),
+                    {"ih": identity_hash},
+                )
+                .mappings()
+                .one()
+            )
+            for key, want in components.items():
+                if existing[key] != want:
+                    raise IdentityMismatchError(
+                        f"model_identity {identity_hash.hex()[:12]} already exists with {key}="
+                        f"{existing[key]!r}, not {want!r} (ADR-0005 register-first, raise-on-mismatch)."
+                    )
+            return existing["model_id"]
+
+    def register_fingerprint(
+        self, *, fingerprint_hash: bytes, model_id: int, declared_mode: str, semantic_config: str
+    ) -> int:
+        """INSERT-only (the grant REVOKES UPDATE/DELETE; ADR-0005/0007). On conflict, verify the recorded
+        semantic_config / model / mode MATCH and raise on drift (force-new-run is an explicit new hash)."""
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.fingerprints (fingerprint_hash, model_id, declared_mode, semantic_config) "
+                    "VALUES (:fh, :mid, :dm, :cfg) ON CONFLICT (fingerprint_hash) DO NOTHING RETURNING fingerprint_id"
+                ),
+                {"fh": fingerprint_hash, "mid": model_id, "dm": declared_mode, "cfg": semantic_config},
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            existing = (
+                conn.execute(
+                    text(
+                        "SELECT fingerprint_id, model_id, declared_mode, semantic_config "
+                        "FROM neuro.fingerprints WHERE fingerprint_hash = :fh"
+                    ),
+                    {"fh": fingerprint_hash},
+                )
+                .mappings()
+                .one()
+            )
+            if (
+                existing["semantic_config"] != semantic_config
+                or existing["model_id"] != model_id
+                or existing["declared_mode"] != declared_mode
+            ):
+                raise IdentityMismatchError(
+                    f"fingerprint {fingerprint_hash.hex()[:12]} already exists with a different "
+                    "semantic_config / model / declared_mode (ADR-0005 insert-only, raise-on-mismatch)."
+                )
+            return existing["fingerprint_id"]
+
+    def seed_expected_rule(
+        self, *, declared_mode: str, substrate_key: str, expected: str, note: str | None = None
+    ) -> int:
+        """Idempotent one-time config seed of the EXPECTED heuristic table (ADR-0004; never identity).
+        ON CONFLICT (declared_mode, substrate_key) DO NOTHING — re-seeding is a no-op."""
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.expected_reproducibility_rules (declared_mode, substrate_key, expected, note) "
+                    "VALUES (:dm, :sk, :e, :n) "
+                    "ON CONFLICT (declared_mode, substrate_key) DO NOTHING RETURNING rule_id"
+                ),
+                {"dm": declared_mode, "sk": substrate_key, "e": expected, "n": note},
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            return conn.execute(
+                text(
+                    "SELECT rule_id FROM neuro.expected_reproducibility_rules "
+                    "WHERE declared_mode = :dm AND substrate_key = :sk"
+                ),
+                {"dm": declared_mode, "sk": substrate_key},
             ).scalar_one()
 
     # --- enqueue (composer sets the component columns; deps -> 'blocked' at enqueue) -------------

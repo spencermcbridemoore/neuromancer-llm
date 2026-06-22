@@ -17,6 +17,7 @@ dependencies = [
     "psycopg[binary]>=3.1", # PG driver for SQLAlchemy 2.0 (postgresql+psycopg://)
     "typer>=0.12",          # the one `neuro` CLI (ADR-0038), thin delegates
     "azure-storage-blob>=12.19",  # storage backend + W1-W8 seam tests against Azurite (ADR-0040)
+    "pyarrow>=14",          # per-token logprob/feature PARQUET shards in the lake (DuckDB-friendly); Stage-2 dep
 ]
 
 [project.scripts]
