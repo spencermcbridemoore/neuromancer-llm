@@ -39,7 +39,7 @@ from sqlalchemy.engine import Connection
 from ..bundles.registrar import BundleRegistrar, SeamIntegrityError, TableManifestSpec
 from ..composer import compose_run_key
 from ..config.semantic import build_semantic_config
-from ..db.identity import content_hash, fingerprint_hash, sha256_bytes
+from ..db.identity import content_hash, fingerprint_hash, model_identity_hash, sha256_bytes
 from ..db.repository import Repository
 from ..storage.backends import StorageBackend
 from .adapters.vllm import LogprobSample, VLLMClient
@@ -55,6 +55,7 @@ from .determinism import (
     measure_divergence,
     resolve_expected_level,
 )
+from .determinism import substrate_key as derive_substrate_key
 
 # capture_events.{request,response}_text octet cap (mirrors the capture_inline_cap CHECK; ADR-0003/0022).
 INLINE_CAP = 8192
@@ -75,24 +76,73 @@ class CaptureEventResult:
 
 def _spill(conn: Connection, backend: StorageBackend, *, backend_id: int, key: str, data: bytes) -> int:
     """Spill one verbatim wire body to a blob artifact (kind='wire_payload'). Fail-loud, never overwrite:
-    re-spilling the same key with DIFFERENT bytes raises (verbatim integrity, R2 discipline)."""
-    backend.put(key, data)
+    if an artifact already exists at (backend_id, key), verify its sha256/size FIRST and raise on any drift
+    BEFORE touching the blob (mirror the registrar's _assert_resume_consistent; R2 discipline). Identical
+    bytes are idempotent (no re-write); only genuinely new bytes are written to the lake."""
     digest = sha256_bytes(data)
-    row = conn.execute(
+    existing = conn.execute(
+        text(
+            "SELECT artifact_id, sha256, size_bytes FROM neuro.artifacts "
+            "WHERE backend_id = :be AND uri = :uri"
+        ),
+        {"be": backend_id, "uri": key},
+    ).one_or_none()
+    if existing is not None:
+        if bytes(existing.sha256) != digest or existing.size_bytes != len(data):
+            raise SeamIntegrityError(
+                f"wire spill {key} already exists with a different sha256/size — refusing to overwrite a "
+                "divergent verbatim payload (R2; fail loud BEFORE clobbering the blob)."
+            )
+        return existing.artifact_id  # idempotent: identical bytes already spilled
+    backend.put(key, data)  # only write the blob once we know it is new (or proven identical above)
+    return conn.execute(
         text(
             "INSERT INTO neuro.artifacts (bundle_id, kind, backend_id, uri, sha256, size_bytes, retention) "
-            "VALUES (NULL, 'wire_payload', :be, :uri, :sha, :sz, 'ttl') "
-            # self-assign no-op on conflict so RETURNING yields the EXISTING sha256 (not overwritten)
-            "ON CONFLICT (backend_id, uri) DO UPDATE SET size_bytes = neuro.artifacts.size_bytes "
-            "RETURNING artifact_id, sha256"
+            "VALUES (NULL, 'wire_payload', :be, :uri, :sha, :sz, 'ttl') RETURNING artifact_id"
         ),
         {"be": backend_id, "uri": key, "sha": digest, "sz": len(data)},
-    ).one()
-    if bytes(row.sha256) != digest:
-        raise SeamIntegrityError(
-            f"wire spill {key} already exists with a different sha256 — verbatim payload diverged."
-        )
-    return row.artifact_id
+    ).scalar_one()
+
+
+def _assert_capture_consistent(
+    conn: Connection,
+    existing,
+    *,
+    request_body: bytes,
+    response_body: bytes,
+    req_inline: bool,
+    resp_inline: bool,
+) -> None:
+    """An EXISTING (run_id, event_key) capture row is IMMUTABLE: verify it holds the SAME verbatim wire
+    bytes as this re-capture and raise on ANY drift (R2). Each side is checked at its storage tier — inline
+    re-encode equality, or the spilled artifact's sha256+size — and the inline/spill decision must match."""
+    for side, body, inline, text_col, spill_col in (
+        ("request", request_body, req_inline, "request_text", "request_spill_artifact_id"),
+        ("response", response_body, resp_inline, "response_text", "response_spill_artifact_id"),
+    ):
+        stored_text = existing[text_col]
+        stored_spill = existing[spill_col]
+        if inline:
+            if stored_text is None or stored_text.encode("utf-8") != body:
+                raise SeamIntegrityError(
+                    f"capture {existing['capture_event_id']} {side} differs from the stored verbatim bytes "
+                    "— refusing to resume a divergent capture (R2)."
+                )
+        else:
+            if stored_spill is None:
+                raise SeamIntegrityError(
+                    f"capture {existing['capture_event_id']} {side} is stored inline but the re-capture "
+                    "would spill — capture row drift (R2)."
+                )
+            art = conn.execute(
+                text("SELECT sha256, size_bytes FROM neuro.artifacts WHERE artifact_id = :a"),
+                {"a": stored_spill},
+            ).one()
+            if bytes(art.sha256) != sha256_bytes(body) or art.size_bytes != len(body):
+                raise SeamIntegrityError(
+                    f"capture {existing['capture_event_id']} {side} spill diverges from the stored "
+                    "sha256/size — refusing to resume a divergent capture (R2)."
+                )
 
 
 def write_capture_event(
@@ -115,31 +165,56 @@ def write_capture_event(
 
     Each side is stored inline as TEXT when its UTF-8 byte length is <= 8 KB, else spilled INDEPENDENTLY
     to its own blob artifact (A2 dual spill) with the spill FK set. Honors the capture_inline_cap CHECK.
-    Spills + the row are one transaction, so the capture is atomic. Idempotent on (run_id, event_key)."""
+    Spills + the row are one transaction, so the capture is atomic.
+
+    Resume is fail-loud (R2): on a (run_id, event_key) conflict the EXISTING row is verified byte-for-byte
+    against this re-capture (inline re-encode AND spilled sha256/size) and a drift raises — never a blind
+    return of the old id while reporting new byte counts. Idempotent ONLY for identical bytes."""
     req_inline = len(request_body) <= INLINE_CAP
     resp_inline = len(response_body) <= INLINE_CAP
+    request_key = f"{partition_path}/wire/{event_key}.request.json"
+    response_key = f"{partition_path}/wire/{event_key}.response.json"
+    cols = (
+        "capture_event_id, request_text, response_text, request_spill_artifact_id, response_spill_artifact_id"
+    )
     with engine.begin() as conn:
+        existing = (
+            conn.execute(
+                text(f"SELECT {cols} FROM neuro.capture_events WHERE run_id = :run AND event_key = :ek"),
+                {"run": run_id, "ek": event_key},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if existing is not None:  # idempotent resume — verify byte-identity, raise on drift (R2)
+            _assert_capture_consistent(
+                conn,
+                existing,
+                request_body=request_body,
+                response_body=response_body,
+                req_inline=req_inline,
+                resp_inline=resp_inline,
+            )
+            return CaptureEventResult(
+                capture_event_id=existing["capture_event_id"],
+                request_inlined=req_inline,
+                response_inlined=resp_inline,
+                request_spill_artifact_id=existing["request_spill_artifact_id"],
+                response_spill_artifact_id=existing["response_spill_artifact_id"],
+                request_bytes=len(request_body),
+                response_bytes=len(response_body),
+            )
+
+        # NEW capture: spill (idempotent / fail-loud) then INSERT.
         req_spill = (
             None
             if req_inline
-            else _spill(
-                conn,
-                backend,
-                backend_id=backend_id,
-                key=f"{partition_path}/wire/{event_key}.request.json",
-                data=request_body,
-            )
+            else _spill(conn, backend, backend_id=backend_id, key=request_key, data=request_body)
         )
         resp_spill = (
             None
             if resp_inline
-            else _spill(
-                conn,
-                backend,
-                backend_id=backend_id,
-                key=f"{partition_path}/wire/{event_key}.response.json",
-                data=response_body,
-            )
+            else _spill(conn, backend, backend_id=backend_id, key=response_key, data=response_body)
         )
         # Inline path: decode the verbatim UTF-8 wire bytes to TEXT (round-trips exactly; the JSON wire is
         # UTF-8, so octet_length(text) == len(bytes) <= 8192, satisfying the CHECK).
@@ -167,14 +242,26 @@ def write_capture_event(
                 "ph": provenance_header,
             },
         ).scalar_one_or_none()
-        if eid is None:  # idempotent resume: the (run, event_key) row already exists
-            eid = conn.execute(
-                text(
-                    "SELECT capture_event_id FROM neuro.capture_events "
-                    "WHERE run_id = :run AND event_key = :ek"
-                ),
-                {"run": run_id, "ek": event_key},
-            ).scalar_one()
+        if eid is None:  # rare race: a concurrent insert landed after our SELECT — verify + adopt it
+            raced = (
+                conn.execute(
+                    text(f"SELECT {cols} FROM neuro.capture_events WHERE run_id = :run AND event_key = :ek"),
+                    {"run": run_id, "ek": event_key},
+                )
+                .mappings()
+                .one()
+            )
+            _assert_capture_consistent(
+                conn,
+                raced,
+                request_body=request_body,
+                response_body=response_body,
+                req_inline=req_inline,
+                resp_inline=resp_inline,
+            )
+            eid = raced["capture_event_id"]
+            req_spill = raced["request_spill_artifact_id"]
+            resp_spill = raced["response_spill_artifact_id"]
     return CaptureEventResult(
         capture_event_id=eid,
         request_inlined=req_inline,
@@ -258,7 +345,7 @@ def capture_logprob(
     batch_invariant: bool = True,
     runner: str = "V1",
     serving_version_tag: str = "vllm-0.23.0",
-    substrate_key: str = "vllm-bi-on@sm89",
+    compute_capability: float = 8.9,
     dataset_name: str = "logprobs",
     expected_uuid: uuid.UUID | str | None = None,
     event_key: str | None = None,
@@ -268,10 +355,21 @@ def capture_logprob(
     """Drive ONE real next-token logprob capture end to end ('logprob capture done right').
 
     Every DB write goes through the identity-verified engine the Repository was constructed with. The
-    fingerprint's semantic_config carries the three numerics-affecting BI facts (batch_invariant=on,
-    serving_version='vllm-0.23.0', runner='V1') so substrates never silently pool (E6 banking 2026-06-20).
+    fingerprint's semantic_config carries the model identity AND the three numerics-affecting BI facts
+    (batch_invariant=on, serving_version='vllm-0.23.0', runner='V1') so two captures differing only by model
+    or substrate never collide or silently pool (E6 banking 2026-06-20; BLOCK 2). The substrate_key is
+    DERIVED from batch_invariant + compute_capability (C5) so the key can never contradict the flag.
+
+    CONTROL-PLANE op: this spans neuro_registrar registry INSERTs (tokenizer/model/fingerprint/run) AND
+    neuro_writer bundle-lifecycle UPDATEs (seal/register), so it runs under an admin DSN — neither single
+    role suffices. The Postgres grants enforce this; this path only succeeds for a role holding both.
+    DEFER (BLOCK 4): the worker(writer)/control-plane(registrar) SPLIT of the lane — capture wire on the
+    worker, identity/bundle registration on the control plane — belongs with the distributed worker runtime
+    (workers/runtime.py); not built now.
     """
     prompt = prompt if prompt is not None else DEFAULT_TARGET_PROMPT
+    # C5: the substrate_key is a FUNCTION of the flag + hardware, never a free string that could disagree.
+    substrate_key = derive_substrate_key(compute_capability, batch_invariant=batch_invariant)
 
     # 1. CAPTURE the true wire payload verbatim (request + response bytes), with the derived distribution.
     served = client.served_model()
@@ -292,8 +390,19 @@ def capture_logprob(
         arch_family=arch_family,
     )
 
-    # 3. FINGERPRINT — the semantic section (hashed wholesale) carries the 3 BI facts (E6 banking).
+    # 3. FINGERPRINT — the semantic section (hashed wholesale) carries the MODEL identity + the 3 BI facts.
+    # BLOCK 2: folding model_identity INTO the hashed material means two captures that differ only by model
+    # produce DISTINCT fingerprint_hashes (no collision on the global UNIQUE); model_id stays the loud backstop.
     declared = declared_mode_from_request(temperature=0, seed=seed)  # E6 / this lane is greedy
+    model_identity_hex = model_identity_hash(
+        hf_repo=hf_repo,
+        hf_revision=hf_revision,
+        dtype_quant=dtype_quant,
+        tokenizer_hash=tokenizer_hash,
+        serving_stack=serving_stack,
+        serving_version=serving_version,
+        arch_family=arch_family,
+    ).hex()
     semantic_config = build_semantic_config(
         declared_mode=declared.value,
         decoding={
@@ -307,6 +416,7 @@ def capture_logprob(
         serving_version=serving_version_tag,
         runner=runner,
         prompt_identity=content_hash(prompt).hex(),
+        model_identity=model_identity_hex,
     )
     fp_hash = fingerprint_hash(semantic_config)
     fingerprint_id = repo.register_fingerprint(

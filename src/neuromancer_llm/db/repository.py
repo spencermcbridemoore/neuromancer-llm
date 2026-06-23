@@ -26,6 +26,11 @@ class IdentityMismatchError(RuntimeError):
     recorded components (ADR-0005 raise-on-mismatch). Never silently adopt a divergent identity."""
 
 
+class ReplicateMismatchError(RuntimeError):
+    """Two runs linked as replicates must be the SAME experiment (one shared, non-NULL fingerprint_id):
+    MEASURED divergence is only meaningful within a single experiment identity (ADR-0004)."""
+
+
 # Lease timing (ADR-0039): 120s lease / 40s renew / 60s reaper, all server-side now(). The renewal
 # thread + reaper loop (the *policy*) are owned by workers/runtime.py; the lease INTERVAL is applied
 # here because this is where the lease SQL lives.
@@ -152,13 +157,46 @@ class Repository:
         is_unlabeled: bool = False,
     ) -> int:
         """Get-or-create a run by run_key. fingerprint_id is set at INSERT for a LABELED run (the
-        assign-once trigger guards only the UPDATE path, so an at-insert value is fine)."""
+        assign-once trigger guards only the UPDATE path, so an at-insert value is fine).
+
+        Register-first, fail-loud (composer note D1): a run_key conflict is idempotent ONLY when the
+        immutable identity fields match. A changed fingerprint / campaign / slug / digest / kind /
+        invocation under the SAME run_key raises IdentityMismatchError — a changed semantic config (new
+        fingerprint) must NOT silently reuse the old run. (actor/origin/spec_hash/is_unlabeled are stamps,
+        not identity, and are not compared.)"""
         with self.engine.begin() as conn:
-            existing = conn.execute(
-                text("SELECT run_id FROM neuro.runs WHERE run_key = :rk"), {"rk": run_key}
-            ).scalar_one_or_none()
+            existing = (
+                conn.execute(
+                    text(
+                        "SELECT run_id, campaign_id, work_slug, variant_digest, run_kind, fingerprint_id, "
+                        "invocation_id FROM neuro.runs WHERE run_key = :rk"
+                    ),
+                    {"rk": run_key},
+                )
+                .mappings()
+                .one_or_none()
+            )
             if existing is not None:
-                return existing
+                requested = {
+                    "campaign_id": campaign_id,
+                    "work_slug": work_slug,
+                    "variant_digest": variant_digest,
+                    "run_kind": run_kind,
+                    "fingerprint_id": fingerprint_id,
+                    "invocation_id": invocation_id,
+                }
+                for key, want in requested.items():
+                    got = existing[key]
+                    if key == "invocation_id":  # uuid column round-trips as uuid.UUID; compare as text
+                        got = str(got) if got is not None else None
+                        want = str(want) if want is not None else None
+                    if got != want:
+                        raise IdentityMismatchError(
+                            f"run_key {run_key!r} already exists with {key}={existing[key]!r}, not "
+                            f"{requested[key]!r} (register-first, fail-loud; composer note D1 — a changed "
+                            "experiment under the same run_key must not silently reuse the old run)."
+                        )
+                return existing["run_id"]
             return conn.execute(
                 text(
                     "INSERT INTO neuro.runs (run_key, campaign_id, work_slug, variant_digest, run_kind, "
@@ -208,7 +246,10 @@ class Repository:
         hf_revision: str | None = None,
         note: str | None = None,
     ) -> int:
-        """INSERT-only by tokenizer_hash (the durable identity); idempotent return on conflict."""
+        """INSERT-only by tokenizer_hash (the durable identity); idempotent return on conflict. On a
+        tokenizer_hash conflict the recorded hf_repo/hf_revision must MATCH when both sides specify them —
+        a same-hash re-register with conflicting (non-NULL) provenance raises (consistency with the model/
+        fingerprint conflict path; ADR-0005). A NULL on either side is 'unspecified', not a conflict."""
         with self.engine.begin() as conn:
             inserted = conn.execute(
                 text(
@@ -219,10 +260,24 @@ class Repository:
             ).scalar_one_or_none()
             if inserted is not None:
                 return inserted
-            return conn.execute(
-                text("SELECT tokenizer_id FROM neuro.tokenizer_identities WHERE tokenizer_hash = :h"),
-                {"h": tokenizer_hash},
-            ).scalar_one()
+            existing = (
+                conn.execute(
+                    text(
+                        "SELECT tokenizer_id, hf_repo, hf_revision FROM neuro.tokenizer_identities "
+                        "WHERE tokenizer_hash = :h"
+                    ),
+                    {"h": tokenizer_hash},
+                )
+                .mappings()
+                .one()
+            )
+            for field, want in (("hf_repo", hf_repo), ("hf_revision", hf_revision)):
+                if want is not None and existing[field] is not None and existing[field] != want:
+                    raise IdentityMismatchError(
+                        f"tokenizer {tokenizer_hash.hex()[:12]} already exists with {field}="
+                        f"{existing[field]!r}, not {want!r} (ADR-0005 register-first, raise-on-mismatch)."
+                    )
+            return existing["tokenizer_id"]
 
     def register_model_identity(
         self,
@@ -359,23 +414,6 @@ class Repository:
             ).scalar_one()
 
     # --- MEASURED determinism: method registry + replicate links + divergence (ADR-0004/0011) ----
-    def register_method(self, method_key: str) -> int:
-        """Register-first a method by its unique key (ADR-0011 governance trio). INSERT-only; idempotent
-        return on conflict. The active-version pointer is set by register_method_version."""
-        with self.engine.begin() as conn:
-            inserted = conn.execute(
-                text(
-                    "INSERT INTO neuro.methods (method_key) VALUES (:k) "
-                    "ON CONFLICT (method_key) DO NOTHING RETURNING method_id"
-                ),
-                {"k": method_key},
-            ).scalar_one_or_none()
-            if inserted is not None:
-                return inserted
-            return conn.execute(
-                text("SELECT method_id FROM neuro.methods WHERE method_key = :k"), {"k": method_key}
-            ).scalar_one()
-
     def register_method_version(
         self, *, method_key: str, semver: str, code_sha: bytes, set_active: bool = True
     ) -> int:
@@ -431,13 +469,33 @@ class Repository:
 
     def link_replicate(self, *, original_run_id: int, replicate_run_id: int) -> int:
         """Link a replicate run to its original (ADR-0004 MEASURED). Idempotent on the UNIQUE pair; the
-        in-schema replicate_distinct CHECK (original <> replicate) is guarded here for a clear error."""
+        in-schema replicate_distinct CHECK (original <> replicate) is guarded here for a clear error.
+
+        BLOCK 3: both runs must share ONE non-NULL fingerprint_id (the SAME experiment) — a mismatched or
+        unlabeled pair raises ReplicateMismatchError BEFORE any replicate_links row is written (MEASURED
+        divergence is meaningless across different experiments)."""
         if original_run_id == replicate_run_id:
             raise ValueError(
                 f"replicate link requires two distinct runs (got {original_run_id} for both); a run cannot "
                 "be its own replicate (replicate_distinct CHECK)."
             )
         with self.engine.begin() as conn:
+            fps = (
+                conn.execute(
+                    text("SELECT run_id, fingerprint_id FROM neuro.runs WHERE run_id IN (:o, :r)"),
+                    {"o": original_run_id, "r": replicate_run_id},
+                )
+                .mappings()
+                .all()
+            )
+            by_run = {row["run_id"]: row["fingerprint_id"] for row in fps}
+            o_fp, r_fp = by_run.get(original_run_id), by_run.get(replicate_run_id)
+            if o_fp is None or r_fp is None or o_fp != r_fp:
+                raise ReplicateMismatchError(
+                    f"replicate link requires both runs to share one non-NULL fingerprint (original "
+                    f"fingerprint_id={o_fp}, replicate fingerprint_id={r_fp}); MEASURED divergence is only "
+                    "meaningful for two runs of the SAME experiment (ADR-0004)."
+                )
             inserted = conn.execute(
                 text(
                     "INSERT INTO neuro.replicate_links (original_run_id, replicate_run_id) VALUES (:o, :r) "

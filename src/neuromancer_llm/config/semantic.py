@@ -28,18 +28,22 @@ def build_semantic_config(
     serving_version: str,
     runner: str,
     prompt_identity: str,
+    model_identity: str,
     extra: dict[str, Any] | None = None,
 ) -> str:
     """Assemble + canonically serialize the semantic section the fingerprint hashes wholesale.
 
     `decoding` is the requested decoding params (temperature/max_tokens/seed/logprobs); `prompt_identity`
     is the content hash of the stimulus (the same decode over a different prompt is a different
-    experiment); `batch_invariant` / `serving_version` / `runner` are the numerics-affecting substrate
+    experiment); `model_identity` is the model's 7-component identity hash — the model lives INSIDE the
+    hashed material (BLOCK 2) so two captures differing only by model never collide on the global-UNIQUE
+    fingerprint_hash; `batch_invariant` / `serving_version` / `runner` are the numerics-affecting substrate
     facts the E6 gate proved matter — they live inside the fingerprint so substrates never silently pool.
     """
     section: dict[str, Any] = {
         "version": 1,
         "declared_mode": declared_mode,
+        "model_identity": model_identity,  # the model is INSIDE the fingerprint hash (BLOCK 2)
         "decoding": decoding,
         "prompt_identity": prompt_identity,
         # numerics-affecting substrate facts — INSIDE the fingerprint (E6 banking 2026-06-20)

@@ -212,6 +212,123 @@ def test_register_fingerprint_raises_on_drift(seeded):
         )
 
 
+@pytest.mark.pg
+def test_register_tokenizer_identity_raises_on_drift(repo):
+    """C10: a tokenizer_hash re-register with conflicting (non-NULL) hf_repo/hf_revision raises, mirroring
+    the model/fingerprint conflict path; a NULL on the incoming side is 'unspecified', not a conflict."""
+    repo.register_tokenizer_identity(tokenizer_hash=b"TK", hf_repo="repoA", hf_revision="r1")
+    with pytest.raises(IdentityMismatchError):  # same hash, different non-NULL hf_repo -> drift
+        repo.register_tokenizer_identity(tokenizer_hash=b"TK", hf_repo="repoB", hf_revision="r1")
+    assert repo.register_tokenizer_identity(tokenizer_hash=b"TK") is not None  # NULL incoming -> idempotent
+
+
+# --- BLOCK 1: capture resume paths fail loud (mirror the registrar's R2) ----------------------------
+@pytest.mark.pg
+def test_get_or_create_run_drift_raises(seeded):
+    """BLOCK 1a: a run_key conflict is idempotent ONLY when the immutable identity matches; a changed
+    fingerprint (= changed semantic config) under the SAME run_key fails loud (composer note D1)."""
+    repo, cid, aid = seeded["repo"], seeded["campaign_id"], seeded["actor_id"]
+    model_id = _seed_model(repo)
+    fp1 = repo.register_fingerprint(
+        fingerprint_hash=b"FPA", model_id=model_id, declared_mode="greedy", semantic_config="cfgA"
+    )
+    fp2 = repo.register_fingerprint(
+        fingerprint_hash=b"FPB", model_id=model_id, declared_mode="greedy", semantic_config="cfgB"
+    )
+    rid = repo.get_or_create_run(
+        "c-test/exp/v1",
+        campaign_id=cid,
+        work_slug="exp",
+        variant_digest="v1",
+        actor_id=aid,
+        origin="o",
+        fingerprint_id=fp1,
+    )
+    # idempotent when the identity matches
+    assert (
+        repo.get_or_create_run(
+            "c-test/exp/v1",
+            campaign_id=cid,
+            work_slug="exp",
+            variant_digest="v1",
+            actor_id=aid,
+            origin="o",
+            fingerprint_id=fp1,
+        )
+        == rid
+    )
+    # changed fingerprint under the SAME run_key -> raises (no silent reuse of the old run)
+    with pytest.raises(IdentityMismatchError):
+        repo.get_or_create_run(
+            "c-test/exp/v1",
+            campaign_id=cid,
+            work_slug="exp",
+            variant_digest="v1",
+            actor_id=aid,
+            origin="o",
+            fingerprint_id=fp2,
+        )
+
+
+@pytest.mark.pg
+def test_capture_event_resume_drift_raises(seeded, tmp_path):
+    """BLOCK 1b: re-writing the SAME (run_id, event_key) with DIFFERENT wire bytes raises; the stored bytes
+    are unchanged. Identical re-capture is idempotent (same id)."""
+    from neuromancer_llm.bundles.registrar import SeamIntegrityError
+
+    repo = seeded["repo"]
+    model_id = _seed_model(repo)
+    backend_id = repo.get_or_create_storage_backend(
+        "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
+    )
+    backend = LocalFsBackend(tmp_path)
+    req, resp = b'{"a":1}', b'{"b":2}'
+    common = dict(
+        run_id=seeded["run_id"],
+        event_key="ev",
+        model_id=model_id,
+        actor_id=seeded["actor_id"],
+        origin="h",
+        backend_id=backend_id,
+        partition_path="logprobs/run=x/part-0000",
+    )
+    first = write_capture_event(repo.engine, backend, request_body=req, response_body=resp, **common)
+    again = write_capture_event(repo.engine, backend, request_body=req, response_body=resp, **common)
+    assert again.capture_event_id == first.capture_event_id  # idempotent for identical bytes
+    with pytest.raises(SeamIntegrityError):  # different request bytes, same (run, event_key) -> raises
+        write_capture_event(repo.engine, backend, request_body=b'{"a":999}', response_body=resp, **common)
+    with repo.engine.connect() as conn:
+        stored = conn.execute(
+            text("SELECT request_text FROM neuro.capture_events WHERE capture_event_id = :i"),
+            {"i": first.capture_event_id},
+        ).scalar_one()
+    assert stored.encode("utf-8") == req  # the stored verbatim bytes are UNCHANGED
+
+
+@pytest.mark.pg
+def test_spill_divergent_raises_before_overwrite(seeded, tmp_path):
+    """BLOCK 1c: a divergent re-spill (same key, different >8KB bytes) raises BEFORE the blob is overwritten;
+    an identical re-spill is idempotent."""
+    from neuromancer_llm.bundles.registrar import SeamIntegrityError
+    from neuromancer_llm.capture.events import _spill
+
+    repo = seeded["repo"]
+    backend_id = repo.get_or_create_storage_backend(
+        "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
+    )
+    backend = LocalFsBackend(tmp_path)
+    key = "logprobs/run=x/part-0000/wire/ev.request.json"
+    big1, big2 = b"A" * (INLINE_CAP + 100), b"B" * (INLINE_CAP + 100)
+    with repo.engine.begin() as conn:
+        aid = _spill(conn, backend, backend_id=backend_id, key=key, data=big1)
+    assert backend.get(key) == big1
+    with pytest.raises(SeamIntegrityError), repo.engine.begin() as conn:
+        _spill(conn, backend, backend_id=backend_id, key=key, data=big2)
+    assert backend.get(key) == big1  # the blob was NOT overwritten (raised before put)
+    with repo.engine.begin() as conn:
+        assert _spill(conn, backend, backend_id=backend_id, key=key, data=big1) == aid  # idempotent
+
+
 # --- registrar: per-queryable-artifact table_manifests fan-out -------------------------------------
 @pytest.mark.pg
 def test_table_manifest_fanout_one_row_per_queryable_artifact(seeded, tmp_path):

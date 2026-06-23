@@ -178,3 +178,65 @@ def test_assign_once_trigger(seeded):
             text("UPDATE neuro.runs SET fingerprint_id = :f WHERE run_id = :r"), {"f": fp2, "r": run_id}
         )
     assert "assign-once" in str(excinfo.value).lower()
+
+
+def test_registrar_active_version_grant_is_column_scoped(engine, provisioned_roles, role_url):
+    """C8: the deviation grant is exactly as narrow as claimed. As neuro_registrar, UPDATE methods SET
+    active_version_id SUCCEEDS, but UPDATE of any identity column (methods.method_key, method_versions.semver
+    /code_sha) is permission-denied; the reader is denied UPDATE on divergence_measurements."""
+    base = provisioned_roles
+    with engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO neuro.methods (method_key) VALUES ('c8_probe') ON CONFLICT DO NOTHING")
+        )
+        mid = conn.execute(
+            text("SELECT method_id FROM neuro.methods WHERE method_key = 'c8_probe'")
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO neuro.method_versions (method_id, semver, code_sha) VALUES (:m, '1.0.0', :c) "
+                "ON CONFLICT DO NOTHING"
+            ),
+            {"m": mid, "c": b"\x01"},
+        )
+        mvid = conn.execute(
+            text("SELECT method_version_id FROM neuro.method_versions WHERE method_id = :m"), {"m": mid}
+        ).scalar_one()
+    registrar = role_url(base, "neuro_registrar")
+    reader = role_url(base, "neuro_reader")
+
+    # registrar CAN set the active-version pointer (the column-scoped deviation grant)
+    assert (
+        _exec_as(
+            registrar,
+            "UPDATE neuro.methods SET active_version_id = :v WHERE method_id = :m",
+            {"v": mvid, "m": mid},
+        )
+        is True
+    )
+    # registrar CANNOT touch identity columns (column-scoped: not method_key / semver / code_sha)
+    assert (
+        _exec_as(registrar, "UPDATE neuro.methods SET method_key = 'x' WHERE method_id = :m", {"m": mid})
+        is False
+    )
+    assert (
+        _exec_as(
+            registrar,
+            "UPDATE neuro.method_versions SET semver = '9' WHERE method_version_id = :v",
+            {"v": mvid},
+        )
+        is False
+    )
+    assert (
+        _exec_as(
+            registrar,
+            "UPDATE neuro.method_versions SET code_sha = :c WHERE method_version_id = :v",
+            {"v": mvid, "c": b"\x02"},
+        )
+        is False
+    )
+    # reader is denied UPDATE on a derived/operational table (SELECT-only consumption surface)
+    assert (
+        _exec_as(reader, "UPDATE neuro.divergence_measurements SET max_abs_diff = 1 WHERE divergence_id = -1")
+        is False
+    )

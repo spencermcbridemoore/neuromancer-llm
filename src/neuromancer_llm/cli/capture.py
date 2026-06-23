@@ -42,7 +42,10 @@ def logprob(
     seed: int = typer.Option(1234, help="greedy seed (recorded in the fingerprint)"),
     dataset_name: str = typer.Option("logprobs", help="lake dataset name for the parquet shard"),
 ) -> None:
-    """Capture one real next-token logprob pass end to end (verbatim wire + identity + parquet bundle)."""
+    """Capture one real next-token logprob pass end to end (verbatim wire + identity + parquet bundle).
+
+    CONTROL-PLANE op: NEURO_DATABASE_URL must be an admin DSN — the path spans neuro_registrar registry
+    INSERTs and neuro_writer bundle-lifecycle UPDATEs, so neither single role suffices (BLOCK 4)."""
     import socket
 
     from ..capture.adapters.vllm import VLLMAdapterError, VLLMClient
@@ -50,7 +53,7 @@ def logprob(
     from ..db.identity import sha256_bytes
     from ..db.lanes import ConfigurationError, LaneAssertionError
     from ..db.repository import IdentityMismatchError, Repository
-    from ..db.session import make_writer_engine
+    from ..db.session import make_verified_engine
     from ..storage.backends import LocalFsBackend
 
     try:
@@ -63,7 +66,7 @@ def logprob(
                 "tokenizer identity required: pass --tokenizer-file <tokenizer.json> or --tokenizer-hash <hex> "
                 "(register-first identity; ADR-0005)."
             )
-        engine = make_writer_engine(expected_lane=lane)
+        engine = make_verified_engine(expected_lane=lane)
         repo = Repository(engine, expected_lane=lane)
         backend_id = repo.get_or_create_storage_backend(
             "local-lake",
@@ -149,7 +152,9 @@ def replay(
 ) -> None:
     """Replicate a capture for divergence measurement (ADR-0004 MEASURED): capture the experiment, capture a
     DISTINCT re-invocation, measure divergence with the registered method, and assert MEASURED meets the
-    EXPECTED reproducibility rule (a divergence on a bitwise lane fails loud, never passes silently)."""
+    EXPECTED reproducibility rule (a divergence on a bitwise lane fails loud, never passes silently).
+
+    CONTROL-PLANE op: NEURO_DATABASE_URL must be an admin DSN (spans registrar INSERTs + writer UPDATEs)."""
     import socket
 
     from ..capture.adapters.vllm import VLLMAdapterError, VLLMClient
@@ -159,7 +164,7 @@ def replay(
     from ..db.identity import sha256_bytes
     from ..db.lanes import ConfigurationError, LaneAssertionError
     from ..db.repository import IdentityMismatchError, Repository
-    from ..db.session import make_writer_engine
+    from ..db.session import make_verified_engine
     from ..storage.backends import LocalFsBackend
 
     try:
@@ -172,7 +177,7 @@ def replay(
                 "tokenizer identity required: pass --tokenizer-file <tokenizer.json> or --tokenizer-hash <hex> "
                 "(register-first identity; ADR-0005)."
             )
-        engine = make_writer_engine(expected_lane=lane)
+        engine = make_verified_engine(expected_lane=lane)
         repo = Repository(engine, expected_lane=lane)
         backend_id = repo.get_or_create_storage_backend(
             "local-lake",
@@ -257,6 +262,17 @@ def show(
     from ..db.lanes import ConfigurationError, LaneAssertionError
     from ..db.session import make_reader_engine
     from ..storage.backends import LocalFsBackend
+
+    # C7: a consumption surface should use the SELECT-only role. Warn LOUDLY if neither --reader-url nor
+    # NEURO_READER_DATABASE_URL is set, so a reader can't silently fall back to a privileged DSN.
+    if reader_url is None:
+        typer.secho(
+            "warning: no reader DSN (--reader-url / NEURO_READER_DATABASE_URL unset) — falling back to "
+            "NEURO_DATABASE_URL, which may connect as a PRIVILEGED role. Set NEURO_READER_DATABASE_URL to a "
+            "neuro_reader (SELECT-only) DSN for a least-privilege read (phase0 Q12).",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
 
     try:
         engine = make_reader_engine(reader_url, expected_lane=lane)

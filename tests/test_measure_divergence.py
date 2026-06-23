@@ -104,6 +104,44 @@ def _capture(repo, tmp_path, client, **over):
     return capture_logprob(**kw)
 
 
+def _two_runs_same_fp(seeded) -> tuple[int, int]:
+    """Two DISTINCT runs sharing ONE non-NULL fingerprint — a valid replicate pair under BLOCK 3."""
+    repo, cid, aid = seeded["repo"], seeded["campaign_id"], seeded["actor_id"]
+    tok = repo.register_tokenizer_identity(tokenizer_hash=b"Tlink")
+    mid = repo.register_model_identity(
+        hf_repo="r",
+        hf_revision="rev",
+        dtype_quant="bf16",
+        tokenizer_id=tok,
+        tokenizer_hash=b"Tlink",
+        serving_stack="vllm",
+        serving_version="0.23.0",
+        arch_family="llama",
+    )
+    fp = repo.register_fingerprint(
+        fingerprint_hash=b"Flink", model_id=mid, declared_mode="greedy", semantic_config="clink"
+    )
+    r1 = repo.get_or_create_run(
+        "c-test/lk/v1",
+        campaign_id=cid,
+        work_slug="lk",
+        variant_digest="v1",
+        actor_id=aid,
+        origin="o",
+        fingerprint_id=fp,
+    )
+    r2 = repo.get_or_create_run(
+        "c-test/lk/v2",
+        campaign_id=cid,
+        work_slug="lk",
+        variant_digest="v2",
+        actor_id=aid,
+        origin="o",
+        fingerprint_id=fp,
+    )
+    return r1, r2
+
+
 # --- pure determinism math (no DB) -----------------------------------------------------------------
 def test_measure_divergence_mapping_identical_and_perturbed():
     s = _sample(20)
@@ -165,30 +203,67 @@ def test_register_method_version_sets_active_and_detects_drift(repo):
 @pytest.mark.pg
 def test_link_replicate_distinct_and_idempotent(seeded):
     repo = seeded["repo"]
-    r2 = repo.create_run(
-        "c-test/slug/dig2",
-        campaign_id=seeded["campaign_id"],
-        work_slug="slug",
-        variant_digest="dig2",
-        actor_id=seeded["actor_id"],
-    )
-    link = repo.link_replicate(original_run_id=seeded["run_id"], replicate_run_id=r2)
-    assert repo.link_replicate(original_run_id=seeded["run_id"], replicate_run_id=r2) == link  # idempotent
+    r1, r2 = _two_runs_same_fp(seeded)  # a valid replicate pair (one shared fingerprint)
+    link = repo.link_replicate(original_run_id=r1, replicate_run_id=r2)
+    assert repo.link_replicate(original_run_id=r1, replicate_run_id=r2) == link  # idempotent
     with pytest.raises(ValueError):  # the replicate_distinct CHECK, guarded for a clear error
-        repo.link_replicate(original_run_id=seeded["run_id"], replicate_run_id=seeded["run_id"])
+        repo.link_replicate(original_run_id=r1, replicate_run_id=r1)
+
+
+@pytest.mark.pg
+def test_link_replicate_requires_same_fingerprint(seeded):
+    """BLOCK 3: a replicate pair must be the SAME experiment — two runs with DIFFERENT fingerprints raise
+    ReplicateMismatchError BEFORE any replicate_links row is written (MEASURED divergence is meaningless
+    across experiments)."""
+    from neuromancer_llm.db.repository import ReplicateMismatchError
+
+    repo, cid, aid = seeded["repo"], seeded["campaign_id"], seeded["actor_id"]
+    tok = repo.register_tokenizer_identity(tokenizer_hash=b"Tmm")
+    mid = repo.register_model_identity(
+        hf_repo="r",
+        hf_revision="rev",
+        dtype_quant="bf16",
+        tokenizer_id=tok,
+        tokenizer_hash=b"Tmm",
+        serving_stack="vllm",
+        serving_version="0.23.0",
+        arch_family="llama",
+    )
+    fp1 = repo.register_fingerprint(
+        fingerprint_hash=b"M1", model_id=mid, declared_mode="greedy", semantic_config="a"
+    )
+    fp2 = repo.register_fingerprint(
+        fingerprint_hash=b"M2", model_id=mid, declared_mode="greedy", semantic_config="b"
+    )
+    r1 = repo.get_or_create_run(
+        "c-test/mm/v1",
+        campaign_id=cid,
+        work_slug="mm",
+        variant_digest="v1",
+        actor_id=aid,
+        origin="o",
+        fingerprint_id=fp1,
+    )
+    r2 = repo.get_or_create_run(
+        "c-test/mm/v2",
+        campaign_id=cid,
+        work_slug="mm",
+        variant_digest="v2",
+        actor_id=aid,
+        origin="o",
+        fingerprint_id=fp2,
+    )
+    with pytest.raises(ReplicateMismatchError):
+        repo.link_replicate(original_run_id=r1, replicate_run_id=r2)
+    with repo.engine.connect() as conn:  # no link row written
+        assert conn.execute(text("SELECT count(*) FROM neuro.replicate_links")).scalar_one() == 0
 
 
 @pytest.mark.pg
 def test_record_divergence_idempotent(seeded):
     repo = seeded["repo"]
-    r2 = repo.create_run(
-        "c-test/slug/dig2",
-        campaign_id=seeded["campaign_id"],
-        work_slug="slug",
-        variant_digest="dig2",
-        actor_id=seeded["actor_id"],
-    )
-    link = repo.link_replicate(original_run_id=seeded["run_id"], replicate_run_id=r2)
+    r1, r2 = _two_runs_same_fp(seeded)
+    link = repo.link_replicate(original_run_id=r1, replicate_run_id=r2)
     mv = repo.register_method_version(method_key="logprob_divergence", semver="1.0.0", code_sha=b"\x01" * 32)
     common = dict(
         replicate_link_id=link,
@@ -264,3 +339,114 @@ def test_replicate_and_measure_divergent_fails_loud_on_bitwise_lane(repo, tmp_pa
             .one()
         )
     assert dm["max_abs_diff"] == pytest.approx(0.1) and dm["argmax_flip_rate"] == 0.0
+
+
+# --- BLOCK 2: the model is INSIDE the fingerprint hash ---------------------------------------------
+def test_semantic_config_carries_model_identity():
+    """Pure: the model_identity is part of the hashed material, so two models with identical decode/prompt/
+    substrate produce DISTINCT fingerprint hashes (and the same model is idempotent)."""
+    from neuromancer_llm.config.semantic import build_semantic_config
+    from neuromancer_llm.db.identity import fingerprint_hash
+
+    base = dict(
+        declared_mode="greedy",
+        decoding={"seed": 1234},
+        batch_invariant=True,
+        serving_version="vllm-0.23.0",
+        runner="V1",
+        prompt_identity="ph",
+    )
+    cfg_a = build_semantic_config(**base, model_identity="AAAA")
+    cfg_b = build_semantic_config(**base, model_identity="BBBB")
+    assert '"model_identity":"AAAA"' in cfg_a
+    assert fingerprint_hash(cfg_a) != fingerprint_hash(cfg_b)  # the model is inside the hash
+    assert fingerprint_hash(cfg_a) == fingerprint_hash(build_semantic_config(**base, model_identity="AAAA"))
+
+
+@pytest.mark.pg
+def test_fingerprint_distinguishes_models(repo, tmp_path):
+    """BLOCK 2: two captures differing only by model (dtype) get DISTINCT fingerprints (no collision, no
+    misleading reject); same model+config is idempotent (one fingerprint). Distinct run coords keep the
+    runs from colliding so the fingerprint comparison is the only thing under test."""
+    s = _sample(20)
+    a = _capture(repo, tmp_path, _FakeClient([s]), variant_digest="va", dtype_quant="bf16")
+    b = _capture(repo, tmp_path, _FakeClient([s]), variant_digest="vb", dtype_quant="bf16")
+    assert a.fingerprint_id == b.fingerprint_id  # same model+config -> same experiment identity
+    c = _capture(repo, tmp_path, _FakeClient([s]), variant_digest="vc", dtype_quant="fp16")
+    assert c.fingerprint_id != a.fingerprint_id  # different model -> DISTINCT fingerprint, no reject
+
+
+# --- BLOCK 4: the capture lane's role posture is honest (admin-only path) ---------------------------
+@pytest.mark.pg
+def test_capture_path_role_boundary(repo, provisioned_roles, role_url, tmp_path):
+    """BLOCK 4: on the REAL capture path, neuro_writer is DENIED at the first registry INSERT (it cannot mint
+    identities); the control-plane path succeeds only under an admin DSN (it also needs the writer-side bundle
+    UPDATEs, so neither single role suffices)."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.exc import ProgrammingError
+
+    from neuromancer_llm.db.repository import Repository
+
+    backend = LocalFsBackend(tmp_path)
+    # pre-seed the storage backend as superuser so the role test begins exactly at the first REGISTRY insert
+    backend_id = repo.get_or_create_storage_backend(
+        "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
+    )
+    s = _sample(20)
+
+    def _run_as(role: str):
+        eng = create_engine(role_url(provisioned_roles, role), future=True)
+        try:
+            r = Repository(eng, expected_lane="test")
+            return capture_logprob(
+                repo=r,
+                backend=backend,
+                backend_id=backend_id,
+                client=_FakeClient([s]),
+                expected_lane="test",
+                hf_repo="r",
+                hf_revision="rev",
+                tokenizer_hash=b"Trole",
+                campaign_key="rc",
+                work_slug="rs",
+                variant_digest="v1",
+                actor_key="owner",
+                origin="t",
+                n_logprobs=20,
+                seed=1234,
+            )
+        finally:
+            eng.dispose()
+
+    with pytest.raises(ProgrammingError) as exc:  # writer: denied at register_tokenizer_identity
+        _run_as("neuro_writer")
+    assert "permission denied" in str(exc.value).lower()
+
+    result = _run_as("neuro_admin")  # admin: the full control-plane path succeeds
+    assert result.run_id is not None and result.fingerprint_id is not None
+
+
+# --- C11: runtime -> registry parity binding -------------------------------------------------------
+@pytest.mark.pg
+def test_registered_divergence_method_code_sha_parity(repo, tmp_path):
+    """C11: the registered divergence method_version's code_sha equals divergence_method_code_sha() at
+    runtime (the registry/runtime parity binding, ADR-0011)."""
+    from neuromancer_llm.capture.determinism import (
+        DIVERGENCE_METHOD_KEY,
+        DIVERGENCE_METHOD_SEMVER,
+        divergence_method_code_sha,
+    )
+
+    s = _sample(20)
+    original = _capture(repo, tmp_path, _FakeClient([s]), invocation_id=None)
+    replicate = _capture(repo, tmp_path, _FakeClient([s]), invocation_id=new_invocation_id())
+    replicate_and_measure(repo=repo, original=original, replicate=replicate)
+    with repo.engine.connect() as conn:
+        code_sha = conn.execute(
+            text(
+                "SELECT mv.code_sha FROM neuro.method_versions mv JOIN neuro.methods m "
+                "ON m.method_id = mv.method_id WHERE m.method_key = :k AND mv.semver = :s"
+            ),
+            {"k": DIVERGENCE_METHOD_KEY, "s": DIVERGENCE_METHOD_SEMVER},
+        ).scalar_one()
+    assert bytes(code_sha) == divergence_method_code_sha()

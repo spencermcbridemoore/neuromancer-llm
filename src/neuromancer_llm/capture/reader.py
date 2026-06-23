@@ -9,13 +9,14 @@ of capture/events.py: nothing here writes, and the reader role cannot (tests/tes
 
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 
 from sqlalchemy import Engine, text
 
 from ..db.identity import sha256_bytes
 from ..db.lanes import ConfigurationError
-from ..storage.backends import LocalFsBackend, StorageBackend
+from ..storage.backends import StorageBackend
 
 
 class IntegrityError(RuntimeError):
@@ -98,31 +99,26 @@ def verify_artifact(backend: StorageBackend, artifact: ManifestArtifact) -> byte
     return blob
 
 
-def _local_path(backend: StorageBackend, uri: str) -> str:
-    if isinstance(backend, LocalFsBackend):
-        return str(backend.path_for(uri))
-    raise ConfigurationError(
-        "DuckDB lake read currently supports the local_fs lake; reading parquet from an Azure backend is via "
-        "the duckdb azure/httpfs extension (deferred). Integrity verify (sha256+size) is backend-agnostic."
-    )
-
-
-def _duckdb_generated_row(local_path: str) -> tuple[int, float, int]:
-    """DuckDB-read the parquet from the lake by path: the generated token's (token_id, logprob) + row count.
-    Proves a DuckDB consumer reconstructs the captured distribution from the lake file itself."""
+def _duckdb_generated_row(blob: bytes) -> tuple[int, float, int]:
+    """DuckDB-query the ALREADY-VERIFIED in-memory parquet bytes — NOT a re-read from disk (C6: closes the
+    TOCTOU, the bytes queried are provably the bytes whose sha256+size were verified). Backend-agnostic:
+    the blob came from backend.get(uri), so any lake (local_fs or Azure) works. Returns the generated
+    token's (token_id, logprob) + the candidate row count."""
     import duckdb
+    import pyarrow.parquet as pq
 
+    table = pq.read_table(io.BytesIO(blob))
     con = duckdb.connect()
     try:
+        con.register("shard", table)
         row = con.execute(
-            "SELECT token_id, logprob FROM read_parquet(?) WHERE is_generated ORDER BY rank LIMIT 1",
-            [local_path],
+            "SELECT token_id, logprob FROM shard WHERE is_generated ORDER BY rank LIMIT 1"
         ).fetchone()
-        total = con.execute("SELECT count(*) FROM read_parquet(?)", [local_path]).fetchone()
+        total = con.execute("SELECT count(*) FROM shard").fetchone()
     finally:
         con.close()
     if row is None:
-        raise IntegrityError(f"parquet {local_path} has no is_generated row (expected exactly one).")
+        raise IntegrityError("parquet shard has no is_generated row (expected exactly one).")
     return int(row[0]), float(row[1]), int(total[0] if total is not None else 0)
 
 
@@ -141,11 +137,14 @@ def read_run_logprobs(
         raise ConfigurationError(
             f"no table_manifests row for run {run_id} dataset {dataset_name!r} — nothing to read."
         )
-    for artifact in artifacts:
-        verify_artifact(backend, artifact)  # the binding on EVERY artifact, fail loud
     token_tables = [a for a in artifacts if a.kind == "token_table"]
     target = token_tables[0] if token_tables else artifacts[0]
-    tid, lp, total = _duckdb_generated_row(_local_path(backend, target.uri))
+    target_blob = b""
+    for artifact in artifacts:
+        blob = verify_artifact(backend, artifact)  # the binding on EVERY artifact, fail loud
+        if artifact is target:
+            target_blob = blob  # query the VERIFIED bytes (C6), not a second disk read
+    tid, lp, total = _duckdb_generated_row(target_blob)
     return LogprobReadResult(
         run_id=run_id,
         dataset_name=dataset_name,

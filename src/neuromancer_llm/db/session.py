@@ -3,8 +3,9 @@
 Postgres-only (ADR-0039 Reconsidered 2026-06-17): the URL is expected to be a
 `postgresql+psycopg://` DSN. Behavior never lives in env vars (NEVER-AGAIN: SQ_*-style shell flags).
 
-R1 (fail-closed write choke point): `make_writer_engine` / `verify_engine` run the lanes-v2 identity
-guard ONCE before exposing a writable engine, so no write path exists on an unverified target (ADR-0006).
+R1 (fail-closed write choke point): `make_verified_engine` / `verify_engine` run the lanes-v2 identity
+guard ONCE before exposing the engine, so no write path exists on an unverified target (ADR-0006). The
+engine verifies the DB IDENTITY (lane/uuid), not the connected ROLE — Postgres grants enforce the role.
 The repository and the bundle registrar are constructed FROM a verified engine — they cannot be built
 against an unprovisioned or wrong-lane DB.
 """
@@ -34,7 +35,7 @@ def database_url(url: str | None = None) -> str:
 
 def make_engine(url: str | None = None, *, echo: bool = False) -> Engine:
     """A RAW engine with NO identity guard — only for pre-identity tooling (migrations, `db provision`).
-    Application/worker writes must go through make_writer_engine / a verified Repository instead."""
+    Application/worker writes must go through make_verified_engine / a verified Repository instead."""
     return create_engine(database_url(url), echo=echo, future=True, pool_pre_ping=True)
 
 
@@ -51,17 +52,25 @@ def verify_engine(
     return engine
 
 
-def make_writer_engine(
+def make_verified_engine(
     url: str | None = None,
     *,
     expected_lane: str,
     expected_uuid: _uuid.UUID | str | None = None,
     echo: bool = False,
 ) -> Engine:
-    """A write-capable engine whose target identity is positively verified before it is exposed (R1)."""
+    """An engine whose target DB IDENTITY (lane / repo-pinned uuid) is positively verified before it is
+    exposed (R1). It connects as whatever NEURO_DATABASE_URL's ROLE is — it does NOT confer or verify the
+    role. The capture/control-plane path needs a role holding BOTH neuro_registrar registry INSERT AND
+    neuro_writer bundle-lifecycle UPDATE grants (i.e. an admin DSN; see capture.events.capture_logprob);
+    the role boundary is enforced by Postgres grants, not by this function (BLOCK 4 — honest name)."""
     return verify_engine(
         make_engine(url, echo=echo), expected_lane=expected_lane, expected_uuid=expected_uuid
     )
+
+
+# Back-compat alias: the old name overstated the role (it verifies identity, not write privilege).
+make_writer_engine = make_verified_engine
 
 
 def make_reader_engine(
