@@ -163,7 +163,14 @@ class BundleRegistrar:
         # Build the manifest (from in-memory shard hashes) BEFORE writing any blob, so the resume-
         # consistency check can fail loud before clobbering existing bytes (R2).
         shard_objs = [Shard(name=name, data=shards[name]) for name in sorted(shards)]
-        keys = [f"{partition_path}/{shard.name}" for shard in shard_objs]
+        # FIX #7 (seam concurrent divergent-bytes clobber): content-address the shard storage keys (a sha256
+        # directory segment), mirroring FIX #1. The shard put runs BEFORE _seal and the keys were coordinate-
+        # derived ({partition}/{name}), so two concurrent registers on one bundle_uuid with DIVERGENT bytes
+        # both put the SAME key — the loser's put clobbered the committed winner's blob (artifacts.sha256 !=
+        # blob on disk). Content-addressing makes divergent bytes land at a DIFFERENT key, so a committed
+        # artifact's blob always matches its sha256. The run/partition prefix is kept (browsable) and the
+        # capture<->artifact linkage stays on the FK, never the path (ADR docs/adr/0045).
+        keys = [f"{partition_path}/{shard.sha256_hex}/{shard.name}" for shard in shard_objs]
         manifest = build_manifest(
             producer="bundle-registrar", run_id=run_id, dataset_name=dataset_name, shards=shard_objs
         )

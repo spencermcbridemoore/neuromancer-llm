@@ -40,7 +40,7 @@ from ..bundles.registrar import BundleRegistrar, SeamIntegrityError, TableManife
 from ..composer import compose_run_key
 from ..config.semantic import build_semantic_config
 from ..db.identity import content_hash, fingerprint_hash, model_identity_hash, sha256_bytes
-from ..db.repository import Repository
+from ..db.repository import IdentityMismatchError, Repository
 from ..storage.backends import StorageBackend
 from .adapters.vllm import LogprobSample, VLLMClient
 from .determinism import (
@@ -74,12 +74,18 @@ class CaptureEventResult:
     response_bytes: int
 
 
-def _spill(conn: Connection, backend: StorageBackend, *, backend_id: int, key: str, data: bytes) -> int:
-    """Spill one verbatim wire body to a blob artifact (kind='wire_payload'). Fail-loud, never overwrite:
-    if an artifact already exists at (backend_id, key), verify its sha256/size FIRST and raise on any drift
-    BEFORE touching the blob (mirror the registrar's _assert_resume_consistent; R2 discipline). Identical
-    bytes are idempotent (no re-write); only genuinely new bytes are written to the lake."""
+def _spill(conn: Connection, backend: StorageBackend, *, backend_id: int, prefix: str, data: bytes) -> int:
+    """Spill one verbatim wire body to a CONTENT-ADDRESSED blob artifact (kind='wire_payload').
+
+    FIX #1 (the orphan-blob / divergent-overwrite window): the storage key is a FUNCTION of the content
+    sha256 (`{prefix}/{sha256}.json`), so a divergent overwrite AT THE SAME KEY is unrepresentable —
+    different bytes land at a DIFFERENT key, so the non-atomic put-before-insert orphan (a blob whose
+    artifact INSERT never committed) can never be silently clobbered by a later divergent spill, and an
+    identical re-spill is idempotent (one artifact, no re-write). The capture_events->artifact linkage is
+    the FK, never the path (ADR docs/adr/0045: content-addressed wire-spill URI scheme). The queryable
+    parquet keeps its run/partition paths — only the verbatim wire-payload spill is content-addressed."""
     digest = sha256_bytes(data)
+    key = f"{prefix}/{digest.hex()}.json"
     existing = conn.execute(
         text(
             "SELECT artifact_id, sha256, size_bytes FROM neuro.artifacts "
@@ -88,10 +94,12 @@ def _spill(conn: Connection, backend: StorageBackend, *, backend_id: int, key: s
         {"be": backend_id, "uri": key},
     ).one_or_none()
     if existing is not None:
+        # By construction (key = f(sha256)) the bytes match; verify defensively before the idempotent return
+        # so a corrupted row / impossible sha-collision is still loud, never a silent adopt.
         if bytes(existing.sha256) != digest or existing.size_bytes != len(data):
             raise SeamIntegrityError(
-                f"wire spill {key} already exists with a different sha256/size — refusing to overwrite a "
-                "divergent verbatim payload (R2; fail loud BEFORE clobbering the blob)."
+                f"wire spill {key} already exists with a sha256/size that disagrees with its content-addressed "
+                "key — refusing to adopt a corrupted/colliding artifact (R2; fail loud)."
             )
         return existing.artifact_id  # idempotent: identical bytes already spilled
     backend.put(key, data)  # only write the blob once we know it is new (or proven identical above)
@@ -112,10 +120,32 @@ def _assert_capture_consistent(
     response_body: bytes,
     req_inline: bool,
     resp_inline: bool,
+    model_id: int,
+    actor_id: int,
+    origin: str,
+    provenance_header: str | None,
 ) -> None:
     """An EXISTING (run_id, event_key) capture row is IMMUTABLE: verify it holds the SAME verbatim wire
-    bytes as this re-capture and raise on ANY drift (R2). Each side is checked at its storage tier — inline
-    re-encode equality, or the spilled artifact's sha256+size — and the inline/spill decision must match."""
+    bytes AND the SAME immutable attribution stamps as this re-capture and raise on ANY drift (R2). Each
+    side's bytes are checked at its storage tier — inline re-encode equality, or the spilled artifact's
+    sha256+size — and the inline/spill decision must match.
+
+    C10(a) (attribution stamp drift): the bytes were verified but model_id/actor_id/origin/provenance_header
+    were NOT — a same-bytes resume with a different model_id returned the old id with the OLD stamp (a silent
+    attribution lie). The stamps are now part of the immutability check; a drift raises SeamIntegrityError.
+    We keep ONE capture per (run_id, event_key) — the stamps are NOT folded into the event identity."""
+    for stamp, want in (
+        ("model_id", model_id),
+        ("actor_id", actor_id),
+        ("origin", origin),
+        ("provenance_header", provenance_header),
+    ):
+        if existing[stamp] != want:
+            raise SeamIntegrityError(
+                f"capture {existing['capture_event_id']} {stamp}={existing[stamp]!r} differs from the "
+                f"re-capture's {want!r} — refusing to resume a capture whose immutable attribution stamp "
+                "drifted (C10a; one capture per (run_id, event_key), stamps immutable)."
+            )
     for side, body, inline, text_col, spill_col in (
         ("request", request_body, req_inline, "request_text", "request_spill_artifact_id"),
         ("response", response_body, resp_inline, "response_text", "response_spill_artifact_id"),
@@ -172,12 +202,31 @@ def write_capture_event(
     return of the old id while reporting new byte counts. Idempotent ONLY for identical bytes."""
     req_inline = len(request_body) <= INLINE_CAP
     resp_inline = len(response_body) <= INLINE_CAP
-    request_key = f"{partition_path}/wire/{event_key}.request.json"
-    response_key = f"{partition_path}/wire/{event_key}.response.json"
+    # FIX #1: the verbatim wire spill is content-addressed under the run/partition `wire/` prefix (the key is
+    # f(sha256), so a divergent overwrite at the same key is unrepresentable — see _spill).
+    wire_prefix = f"{partition_path}/wire"
     cols = (
-        "capture_event_id, request_text, response_text, request_spill_artifact_id, response_spill_artifact_id"
+        "capture_event_id, request_text, response_text, request_spill_artifact_id, response_spill_artifact_id, "
+        "model_id, actor_id, origin, provenance_header"
     )
     with engine.begin() as conn:
+        # C10(b): bind capture_events.model_id to the run's fingerprint model (a write-path guard mirroring
+        # assert_assign_once; the in-schema trigger is the role-split-time hardening — see the Deferred-
+        # Obligation Register). A run with a labeled fingerprint pins its model; a capture claiming a
+        # DIFFERENT model_id is refused (closes the model_id<->run hole). NULL fingerprint (adhoc) = no bind.
+        bound_model = conn.execute(
+            text(
+                "SELECT f.model_id FROM neuro.runs r JOIN neuro.fingerprints f "
+                "ON f.fingerprint_id = r.fingerprint_id WHERE r.run_id = :run"
+            ),
+            {"run": run_id},
+        ).scalar_one_or_none()
+        if bound_model is not None and bound_model != model_id:
+            raise IdentityMismatchError(
+                f"capture model_id={model_id} does not match run {run_id}'s fingerprint model "
+                f"{bound_model} — refusing to attribute a capture to a model the run is not fingerprinted "
+                "for (C10b: capture_events.model_id is bound to the run's fingerprint model)."
+            )
         existing = (
             conn.execute(
                 text(f"SELECT {cols} FROM neuro.capture_events WHERE run_id = :run AND event_key = :ek"),
@@ -186,7 +235,9 @@ def write_capture_event(
             .mappings()
             .one_or_none()
         )
-        if existing is not None:  # idempotent resume — verify byte-identity, raise on drift (R2)
+        if (
+            existing is not None
+        ):  # idempotent resume — verify byte-identity + stamps, raise on drift (R2/C10a)
             _assert_capture_consistent(
                 conn,
                 existing,
@@ -194,6 +245,10 @@ def write_capture_event(
                 response_body=response_body,
                 req_inline=req_inline,
                 resp_inline=resp_inline,
+                model_id=model_id,
+                actor_id=actor_id,
+                origin=origin,
+                provenance_header=provenance_header,
             )
             return CaptureEventResult(
                 capture_event_id=existing["capture_event_id"],
@@ -205,16 +260,16 @@ def write_capture_event(
                 response_bytes=len(response_body),
             )
 
-        # NEW capture: spill (idempotent / fail-loud) then INSERT.
+        # NEW capture: spill (content-addressed / idempotent) then INSERT.
         req_spill = (
             None
             if req_inline
-            else _spill(conn, backend, backend_id=backend_id, key=request_key, data=request_body)
+            else _spill(conn, backend, backend_id=backend_id, prefix=wire_prefix, data=request_body)
         )
         resp_spill = (
             None
             if resp_inline
-            else _spill(conn, backend, backend_id=backend_id, key=response_key, data=response_body)
+            else _spill(conn, backend, backend_id=backend_id, prefix=wire_prefix, data=response_body)
         )
         # Inline path: decode the verbatim UTF-8 wire bytes to TEXT (round-trips exactly; the JSON wire is
         # UTF-8, so octet_length(text) == len(bytes) <= 8192, satisfying the CHECK).
@@ -258,6 +313,10 @@ def write_capture_event(
                 response_body=response_body,
                 req_inline=req_inline,
                 resp_inline=resp_inline,
+                model_id=model_id,
+                actor_id=actor_id,
+                origin=origin,
+                provenance_header=provenance_header,
             )
             eid = raced["capture_event_id"]
             req_spill = raced["request_spill_artifact_id"]
@@ -383,8 +442,7 @@ def capture_logprob(
         hf_repo=hf_repo,
         hf_revision=hf_revision,
         dtype_quant=dtype_quant,
-        tokenizer_id=tokenizer_id,
-        tokenizer_hash=tokenizer_hash,
+        tokenizer_hash=tokenizer_hash,  # FIX #9: tokenizer_id is derived from this hash inside (register-first)
         serving_stack=serving_stack,
         serving_version=serving_version,
         arch_family=arch_family,

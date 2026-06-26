@@ -275,11 +275,13 @@ class VLLMClient:
             raise VLLMAdapterError(f"completion returned no choices: {data!r}")
         choice = data["choices"][0]
         lp = choice.get("logprobs")
-        if not lp or not lp.get("top_logprobs"):
-            # Requested-but-missing logprobs are a recorded failure, never a silent gap (capture
-            # contract §2). For E6 this is a hard error: the gate cannot be evaluated without them.
+        if not lp or not lp.get("top_logprobs") or not lp.get("tokens"):
+            # Requested-but-missing logprobs/tokens are a recorded failure, never a silent gap (capture
+            # contract §2). For E6 this is a hard error: the gate cannot be evaluated without them. An EMPTY
+            # tokens/top_logprobs list is included here so it raises VLLMAdapterError rather than a bare
+            # IndexError on lp["tokens"][0] (Section-C: a typed loud error, not an opaque IndexError).
             raise VLLMAdapterError(
-                "server returned no logprobs; launch with --logprobs-mode raw_logprobs and pass a "
+                "server returned no logprobs/tokens; launch with --logprobs-mode raw_logprobs and pass a "
                 "logprobs count (and --max-logprobs high enough)."
             )
         generated = _parse_token_id(lp["tokens"][0])

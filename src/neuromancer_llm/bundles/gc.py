@@ -25,18 +25,22 @@ def collect_unsealed(engine: Engine, *, grace: _dt.timedelta = DEFAULT_GRACE) ->
     safe — but only once past the grace window, so an in-flight registration is never reaped out from
     under itself (R-GC). Returns the number of bundles collected.
     """
+    # FIX #10 (select->delete TOCTOU): ONE statement — the collectible predicate is the DELETE's own WHERE,
+    # so the state/age are RE-CHECKED at delete time (EvalPlanQual under READ COMMITTED). The old form
+    # SELECTed ids then DELETEd by id with no recheck, so a bundle SEALED+registered between the two was
+    # deleted by stale id (or, with artifacts, the FK RESTRICT aborted the whole sweep). Now a bundle that
+    # is no longer 'unsealed' (or no longer past grace) when the delete runs is never collected.
     with engine.begin() as conn:
-        ids = [
-            r[0]
-            for r in conn.execute(
+        collected = (
+            conn.execute(
                 text(
-                    "SELECT bundle_id FROM neuro.bundles "
-                    "WHERE state = ANY(:states) AND created_at < now() - :grace"
+                    "DELETE FROM neuro.bundles "
+                    "WHERE state = ANY(:states) AND created_at < now() - :grace "
+                    "RETURNING bundle_id"
                 ),
                 {"states": list(COLLECTIBLE_STATES), "grace": grace},
-            ).all()
-        ]
-        if not ids:
-            return 0
-        conn.execute(text("DELETE FROM neuro.bundles WHERE bundle_id = ANY(:ids)"), {"ids": ids})
-        return len(ids)
+            )
+            .scalars()
+            .all()
+        )
+        return len(collected)

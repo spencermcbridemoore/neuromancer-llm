@@ -48,3 +48,7 @@ Split from `docs/adr/_source/phase3-adrs.md` by `neuro docs build`. ADR numbers 
 | [ADR-0042](0042-vm-resize-deferral-cinder-volume-instead.md) | VM resize deferral; Cinder volume instead | Accepted (from pole A, resize NOT adopted) |
 | [ADR-0043](0043-lineage-as-relationship-edges-only.md) | Lineage as relationship-edges-only | Accepted |
 | [ADR-0044](0044-author-discretion-no-pgvector-day-one.md) | `AUTHOR-DISCRETION`: no pgvector day-one | Author-discretion — **RESOLVED 2026-06-16, owner ACCEPTED** (no longer an open DoF) |
+| [ADR-0045](0045-content-addressed-wire-spill-seam-shard-storage-keys.md) | Content-addressed wire-spill + seam shard storage keys | Accepted — Phase 5 red-team correction (FIX #1 + #7) |
+| [ADR-0046](0046-read-committed-isolation-targeted-row-locking-for-contended-paths.md) | `READ COMMITTED` isolation + targeted row-locking for contended paths | OPEN — direction recorded; point-fixes are the regression net |
+| [ADR-0047](0047-record-divergence-is-keep-first-on-conflict.md) | `record_divergence` is keep-first on conflict | Accepted — no code change (ADR-accept #3) |
+| [ADR-0048](0048-actor-campaign-key-drift-accepted-now-owner-scoped-keys-deferred.md) | `actor`/`campaign` key-drift accepted now; owner-scoped keys deferred | Accepted now (single-user) — two-layer obligation deferred (ADR-accept #5) |

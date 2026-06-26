@@ -138,6 +138,14 @@ def read_run_logprobs(
             f"no table_manifests row for run {run_id} dataset {dataset_name!r} — nothing to read."
         )
     token_tables = [a for a in artifacts if a.kind == "token_table"]
+    if len(token_tables) > 1:
+        # Section-C FIX: the fan-out can register >1 token_table shard for a run; reading only the first
+        # would silently drop the rest. Multi-shard aggregation is not supported here — fail closed rather
+        # than return a partial view (the consumer can read shards explicitly via manifest_artifacts).
+        raise ConfigurationError(
+            f"run {run_id} dataset {dataset_name!r} has {len(token_tables)} token_table shards; this reader "
+            "expects exactly one — refusing to silently return a partial (first-shard-only) view."
+        )
     target = token_tables[0] if token_tables else artifacts[0]
     target_blob = b""
     for artifact in artifacts:

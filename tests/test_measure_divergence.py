@@ -17,6 +17,7 @@ from neuromancer_llm.capture.adapters.vllm import CapturedLogprobs, LogprobSampl
 from neuromancer_llm.capture.determinism import (
     DivergenceVerdictError,
     ExpectedLevel,
+    UnassessedExpectationError,
     assert_meets_expected,
     compare,
     measure_divergence,
@@ -24,6 +25,7 @@ from neuromancer_llm.capture.determinism import (
 )
 from neuromancer_llm.capture.events import capture_logprob, replicate_and_measure
 from neuromancer_llm.composer import new_invocation_id
+from neuromancer_llm.db.identity import fingerprint_hash
 from neuromancer_llm.db.repository import IdentityMismatchError
 from neuromancer_llm.storage.backends import LocalFsBackend
 
@@ -107,19 +109,21 @@ def _capture(repo, tmp_path, client, **over):
 def _two_runs_same_fp(seeded) -> tuple[int, int]:
     """Two DISTINCT runs sharing ONE non-NULL fingerprint — a valid replicate pair under BLOCK 3."""
     repo, cid, aid = seeded["repo"], seeded["campaign_id"], seeded["actor_id"]
-    tok = repo.register_tokenizer_identity(tokenizer_hash=b"Tlink")
+    repo.register_tokenizer_identity(tokenizer_hash=b"Tlink")  # register-first (FIX #9)
     mid = repo.register_model_identity(
         hf_repo="r",
         hf_revision="rev",
         dtype_quant="bf16",
-        tokenizer_id=tok,
         tokenizer_hash=b"Tlink",
         serving_stack="vllm",
         serving_version="0.23.0",
         arch_family="llama",
     )
     fp = repo.register_fingerprint(
-        fingerprint_hash=b"Flink", model_id=mid, declared_mode="greedy", semantic_config="clink"
+        fingerprint_hash=fingerprint_hash("clink"),
+        model_id=mid,
+        declared_mode="greedy",
+        semantic_config="clink",
     )
     r1 = repo.get_or_create_run(
         "c-test/lk/v1",
@@ -173,8 +177,9 @@ def test_assert_meets_expected_bitwise_and_tolerance():
     with pytest.raises(DivergenceVerdictError):  # exceeds the bf16 tolerance
         assert_meets_expected(ExpectedLevel.TOLERANCE, big, dtype_quant="bf16")
 
-    # no rule / distributional / none -> nothing to assert at this grain
-    assert assert_meets_expected(None, big, dtype_quant="bf16") is True
+    # FIX #2: no APPLICABLE rule is a TYPED refusal (split from the deliberate NONE, which still passes)
+    with pytest.raises(UnassessedExpectationError):
+        assert_meets_expected(None, big, dtype_quant="bf16")
     assert assert_meets_expected(ExpectedLevel.NONE, big, dtype_quant="bf16") is True
 
 
@@ -218,22 +223,21 @@ def test_link_replicate_requires_same_fingerprint(seeded):
     from neuromancer_llm.db.repository import ReplicateMismatchError
 
     repo, cid, aid = seeded["repo"], seeded["campaign_id"], seeded["actor_id"]
-    tok = repo.register_tokenizer_identity(tokenizer_hash=b"Tmm")
+    repo.register_tokenizer_identity(tokenizer_hash=b"Tmm")  # register-first (FIX #9)
     mid = repo.register_model_identity(
         hf_repo="r",
         hf_revision="rev",
         dtype_quant="bf16",
-        tokenizer_id=tok,
         tokenizer_hash=b"Tmm",
         serving_stack="vllm",
         serving_version="0.23.0",
         arch_family="llama",
     )
     fp1 = repo.register_fingerprint(
-        fingerprint_hash=b"M1", model_id=mid, declared_mode="greedy", semantic_config="a"
+        fingerprint_hash=fingerprint_hash("a"), model_id=mid, declared_mode="greedy", semantic_config="a"
     )
     fp2 = repo.register_fingerprint(
-        fingerprint_hash=b"M2", model_id=mid, declared_mode="greedy", semantic_config="b"
+        fingerprint_hash=fingerprint_hash("b"), model_id=mid, declared_mode="greedy", semantic_config="b"
     )
     r1 = repo.get_or_create_run(
         "c-test/mm/v1",

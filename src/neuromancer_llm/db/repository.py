@@ -18,6 +18,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import Engine, text
 
+from .identity import fingerprint_hash as _fingerprint_hash
 from .identity import model_identity_hash
 
 
@@ -227,15 +228,42 @@ class Repository:
         base_uri: str,
         is_cloud: bool,
     ) -> int:
+        """Register-first / IMMUTABLE storage-backend identity (FIX #8 + binding row L-SB). This was the ONLY
+        registry that MUTATED on conflict (`DO UPDATE SET driver`, ignoring lane/base_uri/is_cloud) — a silent
+        repoint of the lake driver/URI under a stable backend_key = split-brain blob storage. It now matches
+        the sibling registries: INSERT-only, raise IdentityMismatchError on ANY drift of
+        (driver, lane, base_uri, is_cloud); identical re-register is idempotent."""
         with self.engine.begin() as conn:
-            return conn.execute(
+            inserted = conn.execute(
                 text(
                     "INSERT INTO neuro.storage_backends (backend_key, driver, lane, base_uri, is_cloud) "
                     "VALUES (:k, :d, :l, :u, :c) "
-                    "ON CONFLICT (backend_key) DO UPDATE SET driver = EXCLUDED.driver RETURNING backend_id"
+                    "ON CONFLICT (backend_key) DO NOTHING RETURNING backend_id"
                 ),
                 {"k": backend_key, "d": driver, "l": lane, "u": base_uri, "c": is_cloud},
-            ).scalar_one()
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            existing = (
+                conn.execute(
+                    text(
+                        "SELECT backend_id, driver, lane, base_uri, is_cloud FROM neuro.storage_backends "
+                        "WHERE backend_key = :k"
+                    ),
+                    {"k": backend_key},
+                )
+                .mappings()
+                .one()
+            )
+            want = {"driver": driver, "lane": lane, "base_uri": base_uri, "is_cloud": is_cloud}
+            for field, value in want.items():
+                if existing[field] != value:
+                    raise IdentityMismatchError(
+                        f"storage_backend {backend_key!r} already registered with {field}="
+                        f"{existing[field]!r}, not {value!r} — refusing to repoint the lake under a stable "
+                        "backend_key (FIX #8 / L-SB: register-first, raise-on-drift)."
+                    )
+            return existing["backend_id"]
 
     # --- register-first, fail-loud identity (ADR-0005; registrar role) --------------------------
     def register_tokenizer_identity(
@@ -285,14 +313,19 @@ class Repository:
         hf_repo: str | None,
         hf_revision: str | None,
         dtype_quant: str,
-        tokenizer_id: int,
         tokenizer_hash: bytes,
         serving_stack: str,
         serving_version: str,
         arch_family: str,
     ) -> int:
         """INSERT-only by the 7-component identity_hash (ADR-0005). On conflict, verify the recorded
-        components MATCH and raise IdentityMismatchError on any drift (never silently adopt)."""
+        components MATCH and raise IdentityMismatchError on any drift (never silently adopt).
+
+        FIX #9 (register-first / no identity-split): the identity_hash is computed over tokenizer_HASH, so
+        tokenizer_id is DERIVED from tokenizer_hash here (one source of truth) rather than trusted from the
+        caller — a caller can no longer bind a model to tokenizer row B while the identity embeds tokenizer
+        A's hash (the FK only proves B exists). Register-first: the tokenizer must already be registered, or
+        this raises IdentityMismatchError (mirrors the model/tokenizer/method/fingerprint raise-on-drift)."""
         identity_hash = model_identity_hash(
             hf_repo=hf_repo,
             hf_revision=hf_revision,
@@ -302,16 +335,26 @@ class Repository:
             serving_version=serving_version,
             arch_family=arch_family,
         )
-        components = {
-            "hf_repo": hf_repo,
-            "hf_revision": hf_revision,
-            "dtype_quant": dtype_quant,
-            "tokenizer_id": tokenizer_id,
-            "serving_stack": serving_stack,
-            "serving_version": serving_version,
-            "arch_family": arch_family,
-        }
         with self.engine.begin() as conn:
+            # FIX #9: resolve tokenizer_id FROM the hash the identity embeds (register-first, fail-loud).
+            tokenizer_id = conn.execute(
+                text("SELECT tokenizer_id FROM neuro.tokenizer_identities WHERE tokenizer_hash = :h"),
+                {"h": tokenizer_hash},
+            ).scalar_one_or_none()
+            if tokenizer_id is None:
+                raise IdentityMismatchError(
+                    f"tokenizer {tokenizer_hash.hex()[:12]} is not registered — register the tokenizer "
+                    "identity first (FIX #9 derives tokenizer_id FROM tokenizer_hash; register-first)."
+                )
+            components = {
+                "hf_repo": hf_repo,
+                "hf_revision": hf_revision,
+                "dtype_quant": dtype_quant,
+                "tokenizer_id": tokenizer_id,
+                "serving_stack": serving_stack,
+                "serving_version": serving_version,
+                "arch_family": arch_family,
+            }
             inserted = conn.execute(
                 text(
                     "INSERT INTO neuro.model_identities "
@@ -356,7 +399,19 @@ class Repository:
         self, *, fingerprint_hash: bytes, model_id: int, declared_mode: str, semantic_config: str
     ) -> int:
         """INSERT-only (the grant REVOKES UPDATE/DELETE; ADR-0005/0007). On conflict, verify the recorded
-        semantic_config / model / mode MATCH and raise on drift (force-new-run is an explicit new hash)."""
+        semantic_config / model / mode MATCH and raise on drift (force-new-run is an explicit new hash).
+
+        FIX #4 (no trust-the-caller): the fingerprint_hash is RECOMPUTED from semantic_config with the ONE
+        canonical hash fn and a mismatch raises IdentityMismatchError BEFORE any write — closing the lone
+        trust-the-caller asymmetry (model/tokenizer/method identity already raise-on-drift). The caller can
+        no longer bind an arbitrary hash to a config (a fingerprint that does not match its own config)."""
+        recomputed = _fingerprint_hash(semantic_config)
+        if recomputed != fingerprint_hash:
+            raise IdentityMismatchError(
+                f"fingerprint_hash {fingerprint_hash.hex()[:12]} does not match "
+                f"fingerprint_hash(semantic_config)={recomputed.hex()[:12]} — refusing a caller-supplied hash "
+                "that does not match its own config (FIX #4: recompute-and-compare, reuse the one canonical fn)."
+            )
         with self.engine.begin() as conn:
             inserted = conn.execute(
                 text(
@@ -569,9 +624,29 @@ class Repository:
         vram_needed_mb: int | None = None,
         depends_on: Sequence[int] = (),
     ) -> int:
-        # A job with unmet deps is enqueued 'blocked' (composer/dispatch invariant, NOT a trigger; note D2).
-        state = "blocked" if depends_on else "queued"
+        # C20: compute the initial state from the deps' REAL state, never "has deps => blocked forever".
+        # A job enqueued AFTER all its deps already SUCCEEDED is immediately 'queued' (the unblock fires
+        # inside complete(), which already ran). A dep that is TERMINAL-FAILED (dead_letter / cancelled)
+        # can never become 'succeeded', so the dependent can never run -> it is enqueued 'cancelled'
+        # ('failed' is transient/retryable, so it is NOT terminal -> the dependent waits, 'blocked').
         with self.engine.begin() as conn:
+            if not depends_on:
+                state = "queued"
+            else:
+                dep_states = (
+                    conn.execute(
+                        text("SELECT state FROM neuro.jobs WHERE job_id = ANY(:ids)"),
+                        {"ids": list(depends_on)},
+                    )
+                    .scalars()
+                    .all()
+                )
+                if any(s in ("dead_letter", "cancelled") for s in dep_states):
+                    state = "cancelled"
+                elif len(dep_states) == len(set(depends_on)) and all(s == "succeeded" for s in dep_states):
+                    state = "queued"
+                else:
+                    state = "blocked"
             job_id = conn.execute(
                 text(
                     "INSERT INTO neuro.jobs (job_key, run_id, job_role, shard_key, queue, gpu_class, vram_needed_mb, state) "
@@ -652,6 +727,12 @@ class Repository:
         # R4: the join on jobs requires the job to still be in-flight, so a CANCELLED job's heartbeat
         # returns False (the worker learns it has been preempted). UPDATE..FROM locks only work_leases
         # (jobs is read, not locked) — no jobs/leases lock-order conflict with the reaper.
+        #
+        # FIX #6 (a): `l.expires_at >= now()` — a worker can NEVER renew an ALREADY-EXPIRED lease. An
+        # expired lease belongs to the reaper; renewing it was the wedge trigger (a heartbeat landing
+        # during the reaper's sweep renewed the lease while the job was requeued -> queued job + active
+        # lease -> next claim hits work_leases_active_uq -> un-claimable). Now an expired lease's heartbeat
+        # returns False and the reaper alone requeues it.
         with self.engine.begin() as conn:
             res = conn.execute(
                 text(
@@ -659,6 +740,7 @@ class Repository:
                     "expires_at = now() + make_interval(secs => :lease) "
                     "FROM neuro.jobs j "
                     "WHERE l.job_id = :job AND l.claim_token = :tok AND l.released_at IS NULL "
+                    "AND l.expires_at >= now() "
                     "AND j.job_id = l.job_id AND j.state IN ('claimed', 'running')"
                 ),
                 {"job": job_id, "tok": claim_token, "lease": LEASE_SECONDS},
@@ -783,32 +865,36 @@ class Repository:
         """Requeue jobs whose lease expired. Clearing claim_token + bumping claim_seq fences the
         original (now-dead) claimant: its stale token no longer matches, so its complete() CAS fails.
 
-        R5 (deadlock-free): jobs-before-leases lock order — drive the requeue off a `jobs` UPDATE whose
-        EXISTS subquery finds the expired, unreleased lease, THEN release those leases. complete() /
-        fail_permanent() / _cascade_cancel() all lock jobs before leases too, so there is no lock cycle."""
+        FIX #6 (b): the requeue AND the lease-release are ONE atomic statement (a data-modifying CTE chain),
+        so the two halves can never straddle a concurrent heartbeat. Combined with the heartbeat's
+        `expires_at >= now()` guard, the wedge (queued job + renewed active lease) is structurally closed.
+
+        R5 (deadlock-free): jobs-before-leases lock order is preserved — the `requeued` CTE updates `jobs`
+        first (and the `released` CTE consumes its output, so it runs after), then releases the leases.
+        complete() / fail_permanent() / _cascade_cancel() all lock jobs before leases too: no lock cycle."""
         with self.engine.begin() as conn:
             requeued = (
                 conn.execute(
                     text(
-                        "UPDATE neuro.jobs j SET state = 'queued', claim_token = NULL, claimed_by = NULL, "
-                        "claim_seq = claim_seq + 1, expiry_count = expiry_count + 1, updated_at = now() "
-                        "WHERE j.state IN ('claimed', 'running') AND EXISTS ("
-                        "  SELECT 1 FROM neuro.work_leases l "
-                        "  WHERE l.job_id = j.job_id AND l.released_at IS NULL AND l.expires_at < now()) "
-                        "RETURNING j.job_id"
+                        "WITH requeued AS ("
+                        "  UPDATE neuro.jobs j SET state = 'queued', claim_token = NULL, claimed_by = NULL, "
+                        "    claim_seq = claim_seq + 1, expiry_count = expiry_count + 1, updated_at = now() "
+                        "  WHERE j.state IN ('claimed', 'running') AND EXISTS ("
+                        "    SELECT 1 FROM neuro.work_leases l "
+                        "    WHERE l.job_id = j.job_id AND l.released_at IS NULL AND l.expires_at < now()) "
+                        "  RETURNING j.job_id"
+                        "), released AS ("
+                        "  UPDATE neuro.work_leases l SET released_at = now() "
+                        "  WHERE l.job_id IN (SELECT job_id FROM requeued) "
+                        "    AND l.released_at IS NULL AND l.expires_at < now() "
+                        "  RETURNING l.job_id"
+                        ") "
+                        "SELECT job_id FROM requeued"
                     )
                 )
                 .scalars()
                 .all()
             )
-            if requeued:
-                conn.execute(
-                    text(
-                        "UPDATE neuro.work_leases SET released_at = now() "
-                        "WHERE job_id = ANY(:ids) AND released_at IS NULL AND expires_at < now()"
-                    ),
-                    {"ids": list(requeued)},
-                )
             return len(requeued)
 
     def expire_lease_now(self, job_id: int) -> None:

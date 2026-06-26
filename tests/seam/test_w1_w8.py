@@ -65,8 +65,16 @@ def test_happy_path_registers(seam_env):
     assert reg.bundle_state(bid) == "registered"
     assert reg.artifact_count(bid) == len(SHARDS)
     assert seam_env["backend"].exists("seam_happy/p0/manifest.json")
-    for name in SHARDS:
-        assert seam_env["backend"].exists(f"seam_happy/p0/{name}")
+    # FIX #7: shard keys are content-addressed (run/partition prefix preserved); resolve via the FK, not path
+    with seam_env["engine"].connect() as conn:
+        uris = (
+            conn.execute(text("SELECT uri FROM neuro.artifacts WHERE bundle_id = :b"), {"b": bid})
+            .scalars()
+            .all()
+        )
+    assert len(uris) == len(SHARDS)
+    for uri in uris:
+        assert uri.startswith("seam_happy/p0/") and seam_env["backend"].exists(uri)
 
 
 @pytest.mark.parametrize("crash_at", ["after_first_shard", "after_shards", "before_seal"])
@@ -181,8 +189,12 @@ def test_reregister_divergent_bytes_raises(seam_env):
             partition_path=pp,
             shards=divergent,
         )
-    # the original blob bytes were NOT clobbered (the check fails loud BEFORE any overwrite)
-    assert seam_env["backend"].get("seam_divergent/p0/shard-0000.bin") == SHARDS["shard-0000.bin"]
+    # the original blob bytes were NOT clobbered (the check fails loud BEFORE any overwrite). FIX #7: the
+    # shard key is content-addressed, so the original blob lives under its own sha256 directory.
+    from neuromancer_llm.bundles.bundlespec import sha256_hex
+
+    orig_key = f"seam_divergent/p0/{sha256_hex(SHARDS['shard-0000.bin'])}/shard-0000.bin"
+    assert seam_env["backend"].get(orig_key) == SHARDS["shard-0000.bin"]
 
 
 def test_after_register_is_durable(seam_env):

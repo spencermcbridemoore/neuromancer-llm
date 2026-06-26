@@ -137,20 +137,28 @@ class Divergence:
 def compare(reference: LogprobSample, other: LogprobSample) -> Divergence:
     ref = reference.logprob_map
     oth = other.logprob_map
-    shared = ref.keys() & oth.keys()
-    max_abs = 0.0
-    max_rel = 0.0
-    for tid in shared:
-        diff = abs(ref[tid] - oth[tid])
-        max_abs = max(max_abs, diff)
-        denom = abs(ref[tid])
-        if denom > 0.0:
-            max_rel = max(max_rel, diff / denom)
+    token_set_changed = reference.token_ids != other.token_ids
+    if token_set_changed:
+        # C7: a changed / disjoint top-k membership means at least one candidate's logprob is INCOMPARABLE
+        # (present in one distribution, absent in the other) — that is MAXIMUM divergence, not 0.0 over the
+        # (possibly empty) shared overlap. The fail-open this closes: a fully-disjoint top-k scored
+        # max_abs_diff=0.0 and slipped through the TOLERANCE band.
+        max_abs = float("inf")
+        max_rel = float("inf")
+    else:
+        max_abs = 0.0
+        max_rel = 0.0
+        for tid in ref.keys() & oth.keys():
+            diff = abs(ref[tid] - oth[tid])
+            max_abs = max(max_abs, diff)
+            denom = abs(ref[tid])
+            if denom > 0.0:
+                max_rel = max(max_rel, diff / denom)
     return Divergence(
         max_abs_diff=max_abs,
         max_rel_diff=max_rel,
         argmax_flip=reference.generated_token_id != other.generated_token_id,
-        token_set_changed=reference.token_ids != other.token_ids,
+        token_set_changed=token_set_changed,
         bitwise_identical=reference.signature() == other.signature(),
     )
 
@@ -172,6 +180,14 @@ TOLERANCE_BY_DTYPE = {"bf16": 5e-2, "fp16": 5e-2, "fp32": 1e-3}
 class DivergenceVerdictError(RuntimeError):
     """MEASURED divergence VIOLATES the EXPECTED reproducibility level: the substrate drifted from its E6
     verdict (e.g. a non-zero divergence on a bitwise lane). Loud, never a silent pass (ADR-0004)."""
+
+
+class UnassessedExpectationError(RuntimeError):
+    """FIX #2: there is NO applicable EXPECTED reproducibility rule for this (declared_mode, substrate_key)
+    — `resolve_expected_level` returned Python None (no rule), which is DISTINCT from the deliberate
+    ExpectedLevel.NONE. A measure must NOT silently pass when its lane was never assessed; this is a typed
+    refusal (the divergence row is persisted first, so the unassessed gap is visible data). Seed an
+    expected_reproducibility_rule for the substrate, or set it deliberately to ExpectedLevel.NONE."""
 
 
 def divergence_method_code_sha() -> bytes:
@@ -219,11 +235,20 @@ def assert_meets_expected(
     or this raises DivergenceVerdictError (ADR-0004; no silent failure). Returns True when it holds.
 
       * BITWISE      — ANY divergence is a violation (the E6-certified lane must reproduce bit-for-bit).
-      * TOLERANCE    — max_abs_diff must be within the per-dtype tolerance.
+      * TOLERANCE    — max_abs_diff within the per-dtype tolerance AND no argmax/top-k-set change (C7).
       * DISTRIBUTIONAL / NONE — no point assertion at this grain (out of scope this gate); passes.
-      * None (no rule) — nothing to assert; the caller records the gap (resolve_expected_level returned None).
+      * None (no rule) — FIX #2: a typed refusal (UnassessedExpectationError), NOT a silent pass — split
+        from the deliberate ExpectedLevel.NONE above.
     """
-    if expected is None or expected in (ExpectedLevel.DISTRIBUTIONAL, ExpectedLevel.NONE):
+    if expected is None:
+        # FIX #2: no APPLICABLE rule for this (declared_mode, substrate_key). This is DISTINCT from the
+        # deliberate ExpectedLevel.NONE — refuse loud rather than silently pass an unassessed lane.
+        raise UnassessedExpectationError(
+            "no applicable EXPECTED reproducibility rule for this (declared_mode, substrate_key) — refusing "
+            "to pass an UNASSESSED lane silently (FIX #2). Seed an expected_reproducibility_rule, or set the "
+            "rule deliberately to ExpectedLevel.NONE."
+        )
+    if expected in (ExpectedLevel.DISTRIBUTIONAL, ExpectedLevel.NONE):
         return True
     if expected == ExpectedLevel.BITWISE:
         if not divergence.bitwise_identical:
@@ -234,6 +259,14 @@ def assert_meets_expected(
             )
         return True
     # TOLERANCE
+    if divergence.argmax_flip or divergence.token_set_changed:
+        # C7: the argmax flipping or the top-k membership changing is the exact "answer changed" signal the
+        # system exists to catch — the tolerance band must NEVER swallow it, regardless of the logprob delta.
+        raise DivergenceVerdictError(
+            f"EXPECTED=tolerance but the answer changed (argmax_flip={divergence.argmax_flip}, "
+            f"token_set_changed={divergence.token_set_changed}) — a flipped argmax / changed top-k is a "
+            "real divergence the tolerance band must not swallow; refusing to pass silently (C7)."
+        )
     tol = tolerance_for(dtype_quant)
     if divergence.max_abs_diff > tol:
         raise DivergenceVerdictError(

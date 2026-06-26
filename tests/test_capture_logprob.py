@@ -18,6 +18,7 @@ from sqlalchemy import text
 
 from neuromancer_llm.capture.adapters.vllm import LogprobSample
 from neuromancer_llm.capture.events import INLINE_CAP, capture_logprob, logprob_parquet, write_capture_event
+from neuromancer_llm.db.identity import fingerprint_hash
 from neuromancer_llm.db.repository import IdentityMismatchError
 from neuromancer_llm.storage.backends import LocalFsBackend
 
@@ -28,12 +29,11 @@ HF_REVISION = "caa1feb0e54d415e2df31207e5f4e273e33509b1"
 
 def _seed_model(repo) -> int:
     """Register a tokenizer + model identity through the register-first path; return model_id."""
-    tok = repo.register_tokenizer_identity(tokenizer_hash=b"tok-hash-fixture", hf_repo=HF_REPO)
+    repo.register_tokenizer_identity(tokenizer_hash=b"tok-hash-fixture", hf_repo=HF_REPO)  # register-first
     return repo.register_model_identity(
         hf_repo=HF_REPO,
         hf_revision=HF_REVISION,
         dtype_quant="bf16",
-        tokenizer_id=tok,
         tokenizer_hash=b"tok-hash-fixture",
         serving_stack="vllm",
         serving_version="0.23.0",
@@ -153,18 +153,21 @@ def test_capture_event_dual_spill(seeded, tmp_path):
         )
         # inline columns NULL (honors the <=8KB CHECK); spill FKs set
         assert row["request_text"] is None and row["response_text"] is None
-        uris = (
+        arts = (
             conn.execute(
-                text("SELECT uri, kind FROM neuro.artifacts WHERE artifact_id IN (:a, :b)"),
+                text("SELECT artifact_id, uri, kind FROM neuro.artifacts WHERE artifact_id IN (:a, :b)"),
                 {"a": result.request_spill_artifact_id, "b": result.response_spill_artifact_id},
             )
             .mappings()
             .all()
         )
-    assert {u["kind"] for u in uris} == {"wire_payload"}
-    # the spilled blobs are the VERBATIM bytes (round-trip from the lake)
-    assert backend.get("logprobs/run=x/part-0000/wire/ev-big.request.json") == big_req
-    assert backend.get("logprobs/run=x/part-0000/wire/ev-big.response.json") == big_resp
+    assert {a["kind"] for a in arts} == {"wire_payload"}
+    by_id = {a["artifact_id"]: a["uri"] for a in arts}
+    # the spilled blobs are the VERBATIM bytes (round-trip from the lake, content-addressed keys; FIX #1 —
+    # the linkage is the FK, never the path).
+    assert by_id[result.request_spill_artifact_id].startswith("logprobs/run=x/part-0000/wire/")
+    assert backend.get(by_id[result.request_spill_artifact_id]) == big_req
+    assert backend.get(by_id[result.response_spill_artifact_id]) == big_resp
 
 
 # --- register-first, fail-loud identity: negative (drift) tests (ADR-0005) -------------------------
@@ -172,12 +175,11 @@ def test_capture_event_dual_spill(seeded, tmp_path):
 def test_register_model_identity_raises_on_drift(repo):
     """The fail-loud binding has teeth: if a stored model_identity row drifts from what its identity_hash
     encodes, re-registering the SAME identity detects the mismatch and refuses to adopt it (ADR-0005)."""
-    tok = repo.register_tokenizer_identity(tokenizer_hash=b"tok")
+    repo.register_tokenizer_identity(tokenizer_hash=b"tok")  # register-first (FIX #9)
     components = dict(
         hf_repo="r",
         hf_revision="rev1",
         dtype_quant="bf16",
-        tokenizer_id=tok,
         tokenizer_hash=b"tok",
         serving_stack="vllm",
         serving_version="0.23.0",
@@ -197,18 +199,21 @@ def test_register_fingerprint_raises_on_drift(seeded):
     explicit NEW hash, never a silent overwrite; ADR-0005 insert-only, raise-on-mismatch)."""
     repo = seeded["repo"]
     model_id = _seed_model(repo)
+    hA = fingerprint_hash("cfgA")
     repo.register_fingerprint(
-        fingerprint_hash=b"H", model_id=model_id, declared_mode="greedy", semantic_config="cfgA"
+        fingerprint_hash=hA, model_id=model_id, declared_mode="greedy", semantic_config="cfgA"
     )
     assert (
         repo.register_fingerprint(
-            fingerprint_hash=b"H", model_id=model_id, declared_mode="greedy", semantic_config="cfgA"
+            fingerprint_hash=hA, model_id=model_id, declared_mode="greedy", semantic_config="cfgA"
         )
         is not None
     )  # idempotent for the SAME config
-    with pytest.raises(IdentityMismatchError):
+    with pytest.raises(
+        IdentityMismatchError
+    ):  # SAME hash, DIFFERENT config -> raises (now via FIX #4 recompute)
         repo.register_fingerprint(
-            fingerprint_hash=b"H", model_id=model_id, declared_mode="greedy", semantic_config="cfgB"
+            fingerprint_hash=hA, model_id=model_id, declared_mode="greedy", semantic_config="cfgB"
         )
 
 
@@ -230,10 +235,16 @@ def test_get_or_create_run_drift_raises(seeded):
     repo, cid, aid = seeded["repo"], seeded["campaign_id"], seeded["actor_id"]
     model_id = _seed_model(repo)
     fp1 = repo.register_fingerprint(
-        fingerprint_hash=b"FPA", model_id=model_id, declared_mode="greedy", semantic_config="cfgA"
+        fingerprint_hash=fingerprint_hash("cfgA"),
+        model_id=model_id,
+        declared_mode="greedy",
+        semantic_config="cfgA",
     )
     fp2 = repo.register_fingerprint(
-        fingerprint_hash=b"FPB", model_id=model_id, declared_mode="greedy", semantic_config="cfgB"
+        fingerprint_hash=fingerprint_hash("cfgB"),
+        model_id=model_id,
+        declared_mode="greedy",
+        semantic_config="cfgB",
     )
     rid = repo.get_or_create_run(
         "c-test/exp/v1",
@@ -306,10 +317,12 @@ def test_capture_event_resume_drift_raises(seeded, tmp_path):
 
 
 @pytest.mark.pg
-def test_spill_divergent_raises_before_overwrite(seeded, tmp_path):
-    """BLOCK 1c: a divergent re-spill (same key, different >8KB bytes) raises BEFORE the blob is overwritten;
-    an identical re-spill is idempotent."""
-    from neuromancer_llm.bundles.registrar import SeamIntegrityError
+def test_spill_is_content_addressed_no_clobber(seeded, tmp_path):
+    """BLOCK 1c / FIX #1: the wire spill is content-addressed — divergent bytes for the same logical event
+    land at DIFFERENT keys (no overwrite, both blobs intact), and an identical re-spill is idempotent (same
+    artifact). A divergent overwrite at the same key is now structurally unrepresentable."""
+    from sqlalchemy import text as _text
+
     from neuromancer_llm.capture.events import _spill
 
     repo = seeded["repo"]
@@ -317,16 +330,24 @@ def test_spill_divergent_raises_before_overwrite(seeded, tmp_path):
         "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
     )
     backend = LocalFsBackend(tmp_path)
-    key = "logprobs/run=x/part-0000/wire/ev.request.json"
+    prefix = "logprobs/run=x/part-0000/wire"
     big1, big2 = b"A" * (INLINE_CAP + 100), b"B" * (INLINE_CAP + 100)
     with repo.engine.begin() as conn:
-        aid = _spill(conn, backend, backend_id=backend_id, key=key, data=big1)
-    assert backend.get(key) == big1
-    with pytest.raises(SeamIntegrityError), repo.engine.begin() as conn:
-        _spill(conn, backend, backend_id=backend_id, key=key, data=big2)
-    assert backend.get(key) == big1  # the blob was NOT overwritten (raised before put)
+        a1 = _spill(conn, backend, backend_id=backend_id, prefix=prefix, data=big1)
     with repo.engine.begin() as conn:
-        assert _spill(conn, backend, backend_id=backend_id, key=key, data=big1) == aid  # idempotent
+        a2 = _spill(conn, backend, backend_id=backend_id, prefix=prefix, data=big2)
+    assert a1 != a2  # divergent bytes -> distinct content-addressed artifact
+    with repo.engine.connect() as conn:
+        uris = dict(
+            conn.execute(
+                _text("SELECT artifact_id, uri FROM neuro.artifacts WHERE artifact_id IN (:a, :b)"),
+                {"a": a1, "b": a2},
+            ).all()
+        )
+    assert uris[a1] != uris[a2]  # DIFFERENT keys
+    assert backend.get(uris[a1]) == big1 and backend.get(uris[a2]) == big2  # both blobs intact (no clobber)
+    with repo.engine.begin() as conn:
+        assert _spill(conn, backend, backend_id=backend_id, prefix=prefix, data=big1) == a1  # idempotent
 
 
 # --- registrar: per-queryable-artifact table_manifests fan-out -------------------------------------

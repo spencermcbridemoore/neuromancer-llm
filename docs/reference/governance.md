@@ -24,12 +24,15 @@ Boundary (C3): GPU/remote workers connect as `neuro_writer` (operational INSERT 
 
 ## ADR status inventory
 
-_44 ADRs._
+_48 ADRs._
 
 - Accepted: 16
 - Accepted (from pole A): 2
 - Accepted (from pole A, resize NOT adopted): 1
 - Accepted (schema) / Reserved-seam (code): 1
+- Accepted now (single-user) — two-layer obligation deferred (ADR-accept #5): 1
+- Accepted — Phase 5 red-team correction (FIX #1 + #7): 1
+- Accepted — no code change (ADR-accept #3): 1
 - Accepted. **Decision.** A desktop agent writes a daily heartbeat + reaper/disk/mirror-age rows to PG via `neuro_writer`; the preflight banner shows desktop-probe age; the Windows Scheduler task is named in the runbook. **Consequences.** The Windows desktop is the weakest-observed host (checkpoint watch-list); the agent makes its silence visible. Runs under WSL2 (ADR-0035).: 1
 - Accepted. **Decision.** Any hand-authored prompt **>8 KB** takes the artifact-FK spill path (blob + artifact row), regardless of origin. **Consequences.** Prompts obey the same 8 KB inline cap as wire bodies (ADR-0003); large stimuli never bloat the canonical row.: 1
 - Accepted. **Decision.** Every cloud-bound shard is sha256-hashed **at registration** (seconds per bundle). Hash deferral is permitted only for local dense shards under ADR-0008. **Consequences.** The registration transaction is the durability boundary for cloud artifacts.: 1
@@ -43,6 +46,7 @@ _44 ADRs._
 - Accepted. **Decision.** The repository is **public** — satisfying the governance binding's precondition (rulesets + branch protection enforceable, unlimited Actions minutes). Exam data never lives in git by design; the exam-text soft rule is untouched. **Consequences.** A repository ruleset on `main` requires PR + required status checks {fast, tests-full, wheel-smoke, docker}, blocks force-push, restricts deletion; required reviews stay OFF (solo + agents).: 1
 - Accepted. **Decision.** `run_metrics.metric_key` is an FK to a registered `metric_keys` vocabulary; `CHECK (octet_length(value_json) <= 8192)`. **Consequences.** Closes the "metadata_json reborn" valve — run_metrics cannot become an unbounded JSON dumping ground. Per-run scalars only (no per-shard width; B posture).: 1
 - Author-discretion — **RESOLVED 2026-06-16, owner ACCEPTED** (no longer an open DoF): 2
+- OPEN — direction recorded; point-fixes are the regression net: 1
 - Reserved-seam: 5
 - Reserved-seam. **Decision.** Reserve the `{staged, verified}` enum values in the bundle lifecycle; **gate** the relay registrar branch + its kill-tests behind the Phase 4 ARCC bring-up outcome (outbound-network + Apptainer check). **Consequences.** All three poles were dinged for prebuilding this — so it is designed-but-inert until bring-up confirms no-egress. No relay code ships in Phase 3 beyond the reserved enum.: 1
 - Signed-deviation (ADR-1): 1

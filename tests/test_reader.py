@@ -81,9 +81,14 @@ def test_read_integrity_fails_loud_on_tampered_blob(seeded, tmp_path):
     )
     _write_logprob_bundle(repo, backend, backend_id, run_id, _sample(8))
 
-    # tamper the lake file so its bytes no longer match the manifest's sha256/size
+    # tamper the lake file with a SAME-LENGTH, different-bytes overwrite so the size check passes and the
+    # sha256 clause is the one that actually fires (Panel #1 C5: the old test changed size and never
+    # exercised the sha256 half — a refactor dropping it would have passed).
     arts = manifest_artifacts(repo.engine, run_id=run_id)
-    backend.put(arts[0].uri, b"corrupted-not-a-parquet")
+    original = backend.get(arts[0].uri)
+    tampered = bytes((b ^ 0xFF) for b in original)  # identical length, every byte flipped
+    assert len(tampered) == len(original) and tampered != original
+    backend.put(arts[0].uri, tampered)
 
     with pytest.raises(IntegrityError):
         read_run_logprobs(repo.engine, backend, run_id=run_id)
