@@ -28,12 +28,28 @@ from neuromancer_llm.bundles.gc import collect_unsealed
 from neuromancer_llm.bundles.registrar import BundleRegistrar, SeamIntegrityError, SeamStateError
 from neuromancer_llm.capture.events import write_capture_event
 from neuromancer_llm.db.identity import sha256_bytes
+from neuromancer_llm.db.repository import IdentityMismatchError
 from neuromancer_llm.storage.backends import LocalFsBackend
 from neuromancer_llm.workers.runtime import reap
 
 pytestmark = pytest.mark.pg
 
 _WAIT = 15.0  # generous per-step timeout so a wedge surfaces as a loud failure, never a hang
+
+
+def _race_two(call):
+    """Release two threads SIMULTANEOUSLY on a Barrier, each running `call`; return both results (an
+    exception in either propagates out of `.result()`). The deterministic-interleave primitive for the
+    same-identity / same-key first-write races."""
+    barrier = threading.Barrier(2)
+
+    def _run():
+        barrier.wait(timeout=_WAIT)
+        return call()
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1, f2 = ex.submit(_run), ex.submit(_run)
+        return [f1.result(timeout=30), f2.result(timeout=30)]
 
 
 def _wait_until_blocked(engine, *, timeout=10.0) -> None:
@@ -244,12 +260,21 @@ def test_rt_concurrent_divergent_capture_loser_re_verifies(seeded, rt, tmp_path)
 
 
 # --- L5: concurrent first-registration of one identity -> exactly one row, both agree --------------
+# BLOCK-1: model_identities has TWO non-PK uniques (identity_hash AND model_components_uq), so a single
+# 2-thread attempt catches the dual-unique race only ~⅓ of the time. LOOP it so one probe run exercises
+# the race many times and the RED (an unhandled IntegrityError on the non-arbiter index) is deterministic.
+_RACE_ROUNDS = 24
+
+
 def test_rt_concurrent_first_registration_one_row(seeded, rt):
-    """L5: two writers registering the SAME identity concurrently land exactly ONE row and BOTH callers
-    agree on the id (the ON CONFLICT DO NOTHING -> SELECT-existing fallback under contention)."""
+    """L5 (BLOCK-1): two writers registering the SAME identity concurrently land exactly ONE row and BOTH
+    callers agree on the id (the bare ON CONFLICT DO NOTHING -> SELECT-existing fallback under contention).
+
+    model_identities is the ONLY registry with two non-PK uniques (identity_hash + model_components_uq); an
+    `ON CONFLICT (identity_hash)` arbiter let a clash Postgres detected on the NON-arbiter model_components_uq
+    raise an unhandled IntegrityError. The bare ON CONFLICT (arbitrates on either index) closes it. Looped so
+    the RED is deterministic, not a ~⅓-per-attempt coin flip."""
     repo = seeded["repo"]
-    repo.register_tokenizer_identity(tokenizer_hash=b"concurrent-tok")  # register-first
-    barrier = threading.Barrier(2)
     args = dict(
         hf_repo="r",
         hf_revision="rev",
@@ -260,18 +285,55 @@ def test_rt_concurrent_first_registration_one_row(seeded, rt):
         arch_family="llama",
     )
 
-    def _register():
-        barrier.wait(timeout=_WAIT)
-        return repo.register_model_identity(**args)
+    for round_idx in range(_RACE_ROUNDS):
+        with (
+            repo.engine.begin() as conn
+        ):  # fresh slate each round so every round is a true first-registration
+            conn.execute(
+                text("TRUNCATE neuro.model_identities, neuro.tokenizer_identities RESTART IDENTITY CASCADE")
+            )
+        repo.register_tokenizer_identity(tokenizer_hash=b"concurrent-tok")  # register-first
+        ids = _race_two(lambda: repo.register_model_identity(**args))
+        assert ids[0] == ids[1], f"round {round_idx}: callers disagree on the model_id {ids}"
+        with repo.engine.connect() as conn:
+            n = conn.execute(text("SELECT count(*) FROM neuro.model_identities")).scalar_one()
+        assert n == 1, f"round {round_idx}: expected exactly one model_identities row, got {n}"
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f1 = ex.submit(_register)
-        f2 = ex.submit(_register)
-        ids = [f1.result(timeout=30), f2.result(timeout=30)]
-    assert ids[0] == ids[1]  # both agree on the one model_id
-    with repo.engine.connect() as conn:
-        n = conn.execute(text("SELECT count(*) FROM neuro.model_identities")).scalar_one()
-    assert n == 1  # exactly one row
+
+# --- L11 (BLOCK-1b): concurrent first-creation of one run -> exactly one row, both agree ------------
+def test_rt_concurrent_first_run_creation(seeded):
+    """L11 (BLOCK-1b): get_or_create_run was SELECT-then-INSERT with NO ON CONFLICT, and runs has two non-PK
+    uniques (run_key AND the partial runs_experiment_variant_uq). Two concurrent same-run_key creators both
+    SELECT-missed then both INSERTed -> the loser raised an unhandled IntegrityError. The bare ON CONFLICT DO
+    NOTHING -> re-SELECT dedupes to ONE row, both agree; and a DIFFERENT run_key claiming the SAME experiment
+    variant is an identity violation that raises LOUD (never a silent adopt). Looped so the RED is
+    deterministic (a single 2-thread attempt is a coin flip on which unique the conflict lands)."""
+    repo, cid, aid = seeded["repo"], seeded["campaign_id"], seeded["actor_id"]
+    common = dict(
+        campaign_id=cid,
+        work_slug="b1b",
+        variant_digest="v1",
+        actor_id=aid,
+        origin="o",
+        run_kind="experiment",
+    )
+
+    for round_idx in range(_RACE_ROUNDS):
+        with repo.engine.begin() as conn:  # fresh slate so every round is a true first-creation race
+            conn.execute(text("TRUNCATE neuro.runs RESTART IDENTITY CASCADE"))
+        ids = _race_two(lambda: repo.get_or_create_run("c-test/b1b/v1", **common))
+        assert ids[0] == ids[1], f"round {round_idx}: callers disagree on the run_id {ids}"
+        with repo.engine.connect() as conn:
+            n = conn.execute(text("SELECT count(*) FROM neuro.runs")).scalar_one()
+        assert n == 1, f"round {round_idx}: expected exactly one runs row, got {n}"
+
+    # a DIFFERENT run_key claiming the SAME (campaign, slug, digest, invocation=NULL) experiment variant is an
+    # identity violation, not a dedupe -> raise (runs_experiment_variant_uq under two run_keys, fail-loud).
+    with repo.engine.begin() as conn:
+        conn.execute(text("TRUNCATE neuro.runs RESTART IDENTITY CASCADE"))
+    repo.get_or_create_run("c-test/b1b/v1", **common)
+    with pytest.raises(IdentityMismatchError):
+        repo.get_or_create_run("c-test/b1b/v1-OTHER-KEY", **common)
 
 
 # --- L8 (ADR-accept #3): record_divergence is keep-first, NOT last-wins ----------------------------

@@ -211,9 +211,12 @@ def write_capture_event(
     )
     with engine.begin() as conn:
         # C10(b): bind capture_events.model_id to the run's fingerprint model (a write-path guard mirroring
-        # assert_assign_once; the in-schema trigger is the role-split-time hardening — see the Deferred-
-        # Obligation Register). A run with a labeled fingerprint pins its model; a capture claiming a
-        # DIFFERENT model_id is refused (closes the model_id<->run hole). NULL fingerprint (adhoc) = no bind.
+        # assert_assign_once). The in-schema trigger is the role-split-time hardening — see the
+        # Deferred-Obligation Register's "worker/registrar privilege SPLIT" entry, which now names
+        # capture_events.model_id as the INSERT-side in-schema-trigger obligation at split time (when an
+        # untrusted neuro_writer connects directly, this write-path check must become a trigger). A run with a
+        # labeled fingerprint pins its model; a capture claiming a DIFFERENT model_id is refused (closes the
+        # model_id<->run hole). NULL fingerprint (adhoc) = no bind.
         bound_model = conn.execute(
             text(
                 "SELECT f.model_id FROM neuro.runs r JOIN neuro.fingerprints f "

@@ -79,6 +79,38 @@ def test_rt_compare_disjoint_topk_is_max_divergence():
     assert not div.bitwise_identical
 
 
+# --- C7 fold-in (a): a disjoint top-k persists max_abs_diff=inf into PG, then raises ----------------
+@pytest.mark.pg
+def test_rt_disjoint_topk_persists_inf_before_raise(repo, tmp_path, rt_capture):
+    """C7 fold-in (a): a disjoint top-k replicate scores compare().max_abs_diff=inf; replicate_and_measure
+    records that divergence row (max_abs_diff=inf) BEFORE asserting the verdict, then raises
+    DivergenceVerdictError on the bitwise lane. New end-to-end coverage of an already-correct path (no
+    RED->GREEN required): inf round-trips into divergence_measurements.max_abs_diff (double precision) and is
+    visible to a FRESH connection (record_divergence commits before the loud raise)."""
+    from sqlalchemy import create_engine
+
+    from neuromancer_llm.capture.events import replicate_and_measure
+    from neuromancer_llm.composer import new_invocation_id
+
+    original = rt_capture(repo, tmp_path, _sample(base=1000, generated=1000), invocation_id=None)
+    replicate = rt_capture(
+        repo, tmp_path, _sample(base=5000, generated=5000), invocation_id=new_invocation_id()
+    )
+
+    with pytest.raises(DivergenceVerdictError):  # disjoint top-k is not bitwise-identical on the bitwise lane
+        replicate_and_measure(repo=repo, original=original, replicate=replicate)
+
+    fresh = create_engine(repo.engine.url, future=True)
+    try:
+        with fresh.connect() as conn:
+            persisted = conn.execute(
+                text("SELECT max_abs_diff FROM neuro.divergence_measurements")
+            ).scalar_one()
+    finally:
+        fresh.dispose()
+    assert math.isinf(persisted)  # the disjoint-top-k MAX divergence persisted as inf (never a silent 0.0)
+
+
 # --- L8: persist-before-raise on a SEVERE (argmax-flip) divergence ----------------------------------
 @pytest.mark.pg
 def test_rt_argmax_flip_persists_before_raise(repo, tmp_path, rt_capture):

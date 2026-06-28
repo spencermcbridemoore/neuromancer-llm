@@ -164,45 +164,52 @@ class Repository:
         immutable identity fields match. A changed fingerprint / campaign / slug / digest / kind /
         invocation under the SAME run_key raises IdentityMismatchError — a changed semantic config (new
         fingerprint) must NOT silently reuse the old run. (actor/origin/spec_hash/is_unlabeled are stamps,
-        not identity, and are not compared.)"""
+        not identity, and are not compared.)
+
+        BLOCK-1b (concurrent first-creation race): runs has TWO non-PK uniques — run_key AND the PARTIAL
+        runs_experiment_variant_uq (campaign, slug, digest, invocation WHERE run_kind='experiment'). The old
+        SELECT-then-INSERT (no ON CONFLICT) let two concurrent creators both SELECT-miss then both INSERT, so
+        the loser raised an unhandled IntegrityError. The INSERT now uses a bare ON CONFLICT DO NOTHING
+        (arbitrates on EITHER unique) so the loser falls through to the re-SELECT and the same compare —
+        identical-key concurrent creation dedupes to one row; a DIFFERENT run_key claiming the SAME experiment
+        variant is an identity violation that raises LOUD (never a silent adopt)."""
+        requested = {
+            "campaign_id": campaign_id,
+            "work_slug": work_slug,
+            "variant_digest": variant_digest,
+            "run_kind": run_kind,
+            "fingerprint_id": fingerprint_id,
+            "invocation_id": invocation_id,
+        }
+
+        def _verify_or_raise(existing) -> int:
+            for key, want in requested.items():
+                got = existing[key]
+                if key == "invocation_id":  # uuid column round-trips as uuid.UUID; compare as text
+                    got = str(got) if got is not None else None
+                    want = str(want) if want is not None else None
+                if got != want:
+                    raise IdentityMismatchError(
+                        f"run_key {run_key!r} already exists with {key}={existing[key]!r}, not "
+                        f"{requested[key]!r} (register-first, fail-loud; composer note D1 — a changed "
+                        "experiment under the same run_key must not silently reuse the old run)."
+                    )
+            return existing["run_id"]
+
+        select_by_key = (
+            "SELECT run_id, campaign_id, work_slug, variant_digest, run_kind, fingerprint_id, "
+            "invocation_id FROM neuro.runs WHERE run_key = :rk"
+        )
         with self.engine.begin() as conn:
-            existing = (
-                conn.execute(
-                    text(
-                        "SELECT run_id, campaign_id, work_slug, variant_digest, run_kind, fingerprint_id, "
-                        "invocation_id FROM neuro.runs WHERE run_key = :rk"
-                    ),
-                    {"rk": run_key},
-                )
-                .mappings()
-                .one_or_none()
-            )
+            existing = conn.execute(text(select_by_key), {"rk": run_key}).mappings().one_or_none()
             if existing is not None:
-                requested = {
-                    "campaign_id": campaign_id,
-                    "work_slug": work_slug,
-                    "variant_digest": variant_digest,
-                    "run_kind": run_kind,
-                    "fingerprint_id": fingerprint_id,
-                    "invocation_id": invocation_id,
-                }
-                for key, want in requested.items():
-                    got = existing[key]
-                    if key == "invocation_id":  # uuid column round-trips as uuid.UUID; compare as text
-                        got = str(got) if got is not None else None
-                        want = str(want) if want is not None else None
-                    if got != want:
-                        raise IdentityMismatchError(
-                            f"run_key {run_key!r} already exists with {key}={existing[key]!r}, not "
-                            f"{requested[key]!r} (register-first, fail-loud; composer note D1 — a changed "
-                            "experiment under the same run_key must not silently reuse the old run)."
-                        )
-                return existing["run_id"]
-            return conn.execute(
+                return _verify_or_raise(existing)
+            inserted = conn.execute(
                 text(
                     "INSERT INTO neuro.runs (run_key, campaign_id, work_slug, variant_digest, run_kind, "
                     "fingerprint_id, actor_id, origin, is_unlabeled, spec_hash, invocation_id) "
-                    "VALUES (:rk, :c, :ws, :vd, :kind, :fp, :a, :o, :ul, :sh, :inv) RETURNING run_id"
+                    "VALUES (:rk, :c, :ws, :vd, :kind, :fp, :a, :o, :ul, :sh, :inv) "
+                    "ON CONFLICT DO NOTHING RETURNING run_id"
                 ),
                 {
                     "rk": run_key,
@@ -217,7 +224,21 @@ class Repository:
                     "sh": spec_hash,
                     "inv": invocation_id,
                 },
-            ).scalar_one()
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            # The INSERT conflicted. Re-SELECT by run_key: if found, run the same identity compare (a lost
+            # same-key race dedupes / a drift raises). If NOT found, the conflict was runs_experiment_variant_uq
+            # under a DIFFERENT run_key — two run_keys claiming one experiment variant — an identity violation.
+            raced = conn.execute(text(select_by_key), {"rk": run_key}).mappings().one_or_none()
+            if raced is None:
+                raise IdentityMismatchError(
+                    f"run_key {run_key!r} could not be created: its (campaign, work_slug, variant_digest, "
+                    "invocation_id) experiment variant is already claimed by a DIFFERENT run_key "
+                    "(runs_experiment_variant_uq) — refusing to bind one experiment variant to two run_keys "
+                    "(register-first, fail-loud)."
+                )
+            return _verify_or_raise(raced)
 
     def get_or_create_storage_backend(
         self,
@@ -355,13 +376,19 @@ class Repository:
                 "serving_version": serving_version,
                 "arch_family": arch_family,
             }
+            # BLOCK-1 (concurrent first-registration race): model_identities has TWO non-PK uniques —
+            # identity_hash AND model_components_uq (the 7 components). With an `ON CONFLICT (identity_hash)`
+            # arbiter, a concurrent same-identity insert that Postgres happens to detect on the NON-arbiter
+            # model_components_uq index raised an unhandled IntegrityError (measured ~33% per 2-thread race).
+            # A BARE `ON CONFLICT DO NOTHING` arbitrates on EITHER unique index, so the loser of the race
+            # falls through to the re-SELECT (raise-on-drift preserved) instead of crashing.
             inserted = conn.execute(
                 text(
                     "INSERT INTO neuro.model_identities "
                     "(identity_hash, hf_repo, hf_revision, dtype_quant, tokenizer_id, serving_stack, "
                     "serving_version, arch_family) "
                     "VALUES (:ih, :hr, :rev, :dq, :tid, :ss, :sv, :af) "
-                    "ON CONFLICT (identity_hash) DO NOTHING RETURNING model_id"
+                    "ON CONFLICT DO NOTHING RETURNING model_id"
                 ),
                 {
                     "ih": identity_hash,
@@ -385,8 +412,17 @@ class Repository:
                     {"ih": identity_hash},
                 )
                 .mappings()
-                .one()
+                .one_or_none()
             )
+            if existing is None:
+                # The bare DO NOTHING swallowed a conflict on model_components_uq under a DIFFERENT
+                # identity_hash (same components, different hash) — with a deterministic hash + same args this
+                # is unreachable, but stay LOUD rather than crash on .one() or silently return None.
+                raise IdentityMismatchError(
+                    f"model_identity insert conflicted on the component tuple but no row matches "
+                    f"identity_hash {identity_hash.hex()[:12]} — a component-set / identity_hash split "
+                    "(register-first, fail-loud; never a silent adopt)."
+                )
             for key, want in components.items():
                 if existing[key] != want:
                     raise IdentityMismatchError(
@@ -425,7 +461,7 @@ class Repository:
             existing = (
                 conn.execute(
                     text(
-                        "SELECT fingerprint_id, model_id, declared_mode, semantic_config "
+                        "SELECT fingerprint_id, model_id, declared_mode "
                         "FROM neuro.fingerprints WHERE fingerprint_hash = :fh"
                     ),
                     {"fh": fingerprint_hash},
@@ -433,14 +469,15 @@ class Repository:
                 .mappings()
                 .one()
             )
-            if (
-                existing["semantic_config"] != semantic_config
-                or existing["model_id"] != model_id
-                or existing["declared_mode"] != declared_mode
-            ):
+            # Fold-in (d): the `existing["semantic_config"] != semantic_config` sub-clause is now DEAD — FIX #4
+            # recomputes fingerprint_hash(semantic_config) and raises BEFORE any write, so reaching this branch
+            # means the passed hash equals the recomputed hash, hence (barring a sha256 collision) the configs
+            # are equal. model_id and declared_mode are SEPARATE caller params (not in the hashed material), so
+            # a same-hash/same-config re-register with a different model or mode is reachable and stays guarded.
+            if existing["model_id"] != model_id or existing["declared_mode"] != declared_mode:
                 raise IdentityMismatchError(
                     f"fingerprint {fingerprint_hash.hex()[:12]} already exists with a different "
-                    "semantic_config / model / declared_mode (ADR-0005 insert-only, raise-on-mismatch)."
+                    "model / declared_mode (ADR-0005 insert-only, raise-on-mismatch)."
                 )
             return existing["fingerprint_id"]
 
@@ -868,6 +905,15 @@ class Repository:
         FIX #6 (b): the requeue AND the lease-release are ONE atomic statement (a data-modifying CTE chain),
         so the two halves can never straddle a concurrent heartbeat. Combined with the heartbeat's
         `expires_at >= now()` guard, the wedge (queued job + renewed active lease) is structurally closed.
+
+        BLOCK-2 finding (2026-06-28): #6a (the heartbeat `expires_at >= now()` guard) is the LOAD-BEARING fix.
+        Both reaper forms run inside ONE transaction, so a concurrent claim never observes an intermediate
+        "queued job + unreleased lease" state; the ONLY way to wedge is a heartbeat renewing an expired lease
+        mid-reap, which #6a unconditionally refuses. A hand-driven heartbeat-at-the-midpoint of the
+        two-statement form does NOT wedge with #6a present, and DOES wedge with #6a removed (verified). So #6b
+        is correct DEFENSE-IN-DEPTH that is SUBSUMED by #6a — there is no observable failure mode it closes
+        that #6a does not, hence no non-vacuous RED-on-revert probe is possible. It is kept (the atomic form
+        is the clearer expression of the invariant) but is intentionally NOT claimed as a probe-pinned fix.
 
         R5 (deadlock-free): jobs-before-leases lock order is preserved — the `requeued` CTE updates `jobs`
         first (and the `released` CTE consumes its output, so it runs after), then releases the leases.

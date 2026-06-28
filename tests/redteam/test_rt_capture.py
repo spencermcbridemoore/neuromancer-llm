@@ -115,6 +115,64 @@ def test_rt_capture_resume_stamp_drift_raises(seeded, rt, tmp_path):
     assert origin == "host-A"
 
 
+# --- C10(a) per-dimension: every immutable stamp is part of the resume immutability check -----------
+def test_rt_capture_resume_per_dimension_stamp_drift_raises(seeded, rt, tmp_path):
+    """C10(a) per-dimension: EACH immutable attribution stamp (model_id, actor_id, origin, provenance_header)
+    is checked on resume — a same-bytes resume drifting ANY ONE of them raises SeamIntegrityError. Uses the
+    NULL-fingerprint (adhoc) seeded run so the model_id drift reaches the _assert_capture_consistent stamp
+    loop (a fingerprint-bound run would raise C10b's IdentityMismatchError first). A refactor dropping any one
+    stamp from the loop turns the matching sub-assertion RED."""
+    repo = seeded["repo"]
+    backend, backend_id = _backend(repo, tmp_path)
+    run_id = seeded["run_id"]  # NULL fingerprint -> C10b allows any model_id, so the stamp loop is reachable
+    _ta, mid_a = rt.seed_tok_model(repo, tokenizer_hash=b"c10a-tok-a")
+    _tb, mid_b = rt.seed_tok_model(repo, tokenizer_hash=b"c10a-tok-b", dtype_quant="fp16")
+    actor_b = repo.create_actor("worker:c10a-B", kind="scheduled_worker")
+    base = dict(
+        run_id=run_id,
+        event_key="ev",
+        model_id=mid_a,
+        actor_id=seeded["actor_id"],
+        origin="host-A",
+        provenance_header="prov-A",
+        backend_id=backend_id,
+        partition_path="logprobs/run=x/part-0000",
+        request_body=b'{"a":1}',
+        response_body=b'{"b":2}',
+    )
+    first = write_capture_event(repo.engine, backend, **base)
+    # identical stamps + bytes -> idempotent
+    assert write_capture_event(repo.engine, backend, **base).capture_event_id == first.capture_event_id
+    # drift exactly ONE stamp at a time (bytes unchanged) -> SeamIntegrityError on each dimension
+    for field, drifted in (
+        ("model_id", mid_b),
+        ("actor_id", actor_b),
+        ("origin", "host-B"),
+        ("provenance_header", "prov-B"),
+    ):
+        with pytest.raises(SeamIntegrityError):
+            write_capture_event(repo.engine, backend, **{**base, field: drifted})
+    # the stored stamps are unchanged after every refused drift (the row is immutable)
+    with repo.engine.connect() as conn:
+        row = (
+            conn.execute(
+                text(
+                    "SELECT model_id, actor_id, origin, provenance_header FROM neuro.capture_events "
+                    "WHERE capture_event_id = :i"
+                ),
+                {"i": first.capture_event_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert (row["model_id"], row["actor_id"], row["origin"], row["provenance_header"]) == (
+        mid_a,
+        seeded["actor_id"],
+        "host-A",
+        "prov-A",
+    )
+
+
 # --- C10(b): capture_events.model_id is bound to the run's fingerprint model ------------------------
 def test_rt_capture_model_bound_to_run_fingerprint(seeded, rt, tmp_path):
     """C10(b): a run LABELED with a fingerprint pins its model — a capture claiming a DIFFERENT model_id is
