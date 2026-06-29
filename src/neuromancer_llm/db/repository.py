@@ -903,17 +903,28 @@ class Repository:
         original (now-dead) claimant: its stale token no longer matches, so its complete() CAS fails.
 
         FIX #6 (b): the requeue AND the lease-release are ONE atomic statement (a data-modifying CTE chain),
-        so the two halves can never straddle a concurrent heartbeat. Combined with the heartbeat's
-        `expires_at >= now()` guard, the wedge (queued job + renewed active lease) is structurally closed.
+        so within THIS transaction the two halves can never straddle a concurrent heartbeat. Combined with
+        the heartbeat's `expires_at >= now()` guard (#6a), this closes the ORIGINAL wedge vector — but NOT the
+        residual near-expiry one below; it is no longer claimed to close the wedge entirely.
 
-        BLOCK-2 finding (2026-06-28): #6a (the heartbeat `expires_at >= now()` guard) is the LOAD-BEARING fix.
-        Both reaper forms run inside ONE transaction, so a concurrent claim never observes an intermediate
-        "queued job + unreleased lease" state; the ONLY way to wedge is a heartbeat renewing an expired lease
-        mid-reap, which #6a unconditionally refuses. A hand-driven heartbeat-at-the-midpoint of the
-        two-statement form does NOT wedge with #6a present, and DOES wedge with #6a removed (verified). So #6b
-        is correct DEFENSE-IN-DEPTH that is SUBSUMED by #6a — there is no observable failure mode it closes
-        that #6a does not, hence no non-vacuous RED-on-revert probe is possible. It is kept (the atomic form
-        is the clearer expression of the invariant) but is intentionally NOT claimed as a probe-pinned fix.
+        BLOCK-2 finding (2026-06-28), CORRECTED by Panel #2 (2026-06-29): #6a (the heartbeat
+        `expires_at >= now()` guard) is the LOAD-BEARING fix and closes the ORIGINAL vector — a dead worker's
+        heartbeat renewing an ALREADY-EXPIRED lease mid-reap, which #6a unconditionally refuses. A hand-driven
+        heartbeat-at-the-midpoint of the two-statement reaper does NOT wedge with #6a present and DOES wedge
+        with #6a removed (verified); #6b is correct DEFENSE-IN-DEPTH for that vector — SUBSUMED by #6a (no
+        distinct observable failure mode), so it is kept but NOT probe-pinned.
+
+        RESIDUAL — near-expiry renewal vs the reaper (NOT closed by #6a OR #6b; empirically reproduced
+        2026-06-29): a heartbeat renewing a NOT-yet-expired lease at its OWN txn `now()` (so #6a ALLOWS it)
+        can commit AFTER the reaper's LATER `now()` reads the same lease as expired. The reaper's `requeued`
+        CTE sees the lease expired at the statement snapshot and sets the job `queued`, while the `released`
+        CTE re-evaluates the now-renewed lease (EvalPlanQual, after the heartbeat committed) as no-longer-
+        expired and skips it -> `queued` job + an active, unreleased lease -> the next `claim()` hits
+        `work_leases_active_uq` -> an un-claimable wedge. BOTH reaper forms wedge identically here, so #6b
+        does not close it either. This residual is reachable only under the DEFERRED concurrent renewal-loop
+        topology (`workers/runtime.py`); it is the READ COMMITTED class whose structural fix (`FOR UPDATE` on
+        the contended lease row, or `SERIALIZABLE`) is ADR-0046 (OPEN). #6a + #6b remain the regression net
+        for the original vector.
 
         R5 (deadlock-free): jobs-before-leases lock order is preserved — the `requeued` CTE updates `jobs`
         first (and the `released` CTE consumes its output, so it runs after), then releases the leases.

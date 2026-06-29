@@ -26,7 +26,7 @@ from sqlalchemy import text
 
 from neuromancer_llm.bundles.gc import collect_unsealed
 from neuromancer_llm.bundles.registrar import BundleRegistrar, SeamIntegrityError, SeamStateError
-from neuromancer_llm.capture.events import write_capture_event
+from neuromancer_llm.capture.events import INLINE_CAP, write_capture_event
 from neuromancer_llm.db.identity import sha256_bytes
 from neuromancer_llm.db.repository import IdentityMismatchError
 from neuromancer_llm.storage.backends import LocalFsBackend
@@ -49,6 +49,21 @@ def _race_two(call):
 
     with ThreadPoolExecutor(max_workers=2) as ex:
         f1, f2 = ex.submit(_run), ex.submit(_run)
+        return [f1.result(timeout=30), f2.result(timeout=30)]
+
+
+def _race_two_calls(call_a, call_b):
+    """Like `_race_two`, but releases two DISTINCT calls simultaneously on one Barrier. The same-content
+    spill race (FIX-A) needs two threads writing DIFFERENT event_keys, so they cannot run an identical
+    call. An exception in either propagates out of `.result()`."""
+    barrier = threading.Barrier(2)
+
+    def _run(call):
+        barrier.wait(timeout=_WAIT)
+        return call()
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1, f2 = ex.submit(_run, call_a), ex.submit(_run, call_b)
         return [f1.result(timeout=30), f2.result(timeout=30)]
 
 
@@ -420,3 +435,69 @@ def test_rt_resurrected_claimant_fenced_no_double_lease(seeded):
         ).scalar_one()
     assert active == 1  # exactly one active lease (no double-occupancy)
     assert repo.complete(job_id=job, claim_token=cB.claim_token) is True
+
+
+# --- FIX-A: concurrent same-content wire spill from two DIFFERENT event_keys dedupes to ONE artifact ---
+def test_rt_spill_concurrent_same_content_one_artifact(seeded, rt, tmp_path):
+    """FIX-A (Panel #2 — codex/gpt/opus): FIX #1 made the wire-spill key a FUNCTION of the content sha256
+    (`{prefix}/{sha256}.json`), so two CONCURRENT `write_capture_event` calls on the SAME run with DIFFERENT
+    `event_key`s but IDENTICAL >8 KB bodies now spill to the SAME artifact key. On `f2758d2` `_spill` does a
+    bare SELECT-then-INSERT with no `ON CONFLICT`: both racers SELECT-miss then both INSERT INTO
+    neuro.artifacts -> the loser raises `IntegrityError` on the `(backend_id, uri)` unique (the SAME
+    SELECT-then-INSERT class as BLOCK-1/1b, newly reachable via content-addressing). The targeted
+    `ON CONFLICT (backend_id, uri) DO NOTHING` -> re-SELECT-and-verify dedupes them: both captures succeed,
+    EXACTLY ONE `wire_payload` artifact exists at the content key, and both capture rows reference it.
+
+    Looped >=20 rounds (truncating capture_events + artifacts between) so the RED is deterministic — a single
+    2-thread attempt under-catches the SELECT-miss overlap (DIAG 1 reproduced it 40/40, but the loop pins it).
+    Uses the NULL-fingerprint (adhoc) seeded run so C10b allows the shared model_id."""
+    repo = seeded["repo"]
+    backend = LocalFsBackend(tmp_path)
+    backend_id = repo.get_or_create_storage_backend(
+        "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
+    )
+    _t, mid = rt.seed_tok_model(repo, tokenizer_hash=b"spill-race-tok")  # seeded run NULL fp -> C10b allows
+    run_id = seeded["run_id"]
+    big = b'{"prompt":"' + b"Z" * (INLINE_CAP + 1024) + b'"}'  # identical >8 KB body -> both threads spill it
+
+    def _write(ek):
+        return write_capture_event(
+            repo.engine,
+            backend,
+            run_id=run_id,
+            event_key=ek,
+            model_id=mid,
+            actor_id=seeded["actor_id"],
+            origin="h",
+            request_body=big,
+            response_body=b"{}",
+            backend_id=backend_id,
+            partition_path="logprobs/run=x/part-0000",
+        )
+
+    for round_idx in range(_RACE_ROUNDS):
+        with repo.engine.begin() as conn:  # fresh slate so every round is a true first-spill race
+            conn.execute(text("TRUNCATE neuro.capture_events, neuro.artifacts RESTART IDENTITY CASCADE"))
+        # both DIFFERENT event_keys -> two capture rows; the ONLY contention is the shared content artifact.
+        # On f2758d2 the loser's bare INSERT raises IntegrityError, which propagates out of `.result()` (RED).
+        ra, rb = _race_two_calls(lambda: _write("ev-A"), lambda: _write("ev-B"))
+        assert ra.request_spill_artifact_id is not None, f"round {round_idx}: request must have spilled"
+        assert ra.request_spill_artifact_id == rb.request_spill_artifact_id, (
+            f"round {round_idx}: same-content concurrent spills must dedupe to ONE artifact id "
+            f"({ra.request_spill_artifact_id} != {rb.request_spill_artifact_id})"
+        )
+        with repo.engine.connect() as conn:
+            n_art = conn.execute(
+                text("SELECT count(*) FROM neuro.artifacts WHERE kind = 'wire_payload'")
+            ).scalar_one()
+            n_ref = conn.execute(
+                text(
+                    "SELECT count(*) FROM neuro.capture_events "
+                    "WHERE run_id = :r AND request_spill_artifact_id = :a"
+                ),
+                {"r": run_id, "a": ra.request_spill_artifact_id},
+            ).scalar_one()
+        assert n_art == 1, f"round {round_idx}: expected exactly ONE wire_payload artifact, got {n_art}"
+        assert n_ref == 2, (
+            f"round {round_idx}: both capture rows must reference the one artifact, got {n_ref}"
+        )

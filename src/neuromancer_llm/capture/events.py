@@ -83,7 +83,15 @@ def _spill(conn: Connection, backend: StorageBackend, *, backend_id: int, prefix
     artifact INSERT never committed) can never be silently clobbered by a later divergent spill, and an
     identical re-spill is idempotent (one artifact, no re-write). The capture_events->artifact linkage is
     the FK, never the path (ADR docs/adr/0045: content-addressed wire-spill URI scheme). The queryable
-    parquet keeps its run/partition paths — only the verbatim wire-payload spill is content-addressed."""
+    parquet keeps its run/partition paths — only the verbatim wire-payload spill is content-addressed.
+
+    FIX-A (Panel #2 — the concurrent same-content collision): because the key is f(sha256), two CONCURRENT
+    spills of identical content from DIFFERENT event_keys race on the `(backend_id, uri)` unique — both
+    SELECT-miss above, both INSERT, and the loser raised an unhandled `IntegrityError`. The targeted
+    `ON CONFLICT (backend_id, uri) DO NOTHING` -> re-SELECT-and-verify dedupes them to ONE artifact (the SAME
+    SELECT-then-INSERT class as BLOCK-1/1b). The targeted arbiter is correct here because `(backend_id, uri)`
+    is the ONLY relevant unique (unlike BLOCK-1's bare form, forced by `model_identities`' two non-PK uniques);
+    identical-byte `backend.put` by both racers is harmless. Divergent bytes still land at a DIFFERENT key."""
     digest = sha256_bytes(data)
     key = f"{prefix}/{digest.hex()}.json"
     existing = conn.execute(
@@ -103,13 +111,33 @@ def _spill(conn: Connection, backend: StorageBackend, *, backend_id: int, prefix
             )
         return existing.artifact_id  # idempotent: identical bytes already spilled
     backend.put(key, data)  # only write the blob once we know it is new (or proven identical above)
-    return conn.execute(
+    inserted = conn.execute(
         text(
             "INSERT INTO neuro.artifacts (bundle_id, kind, backend_id, uri, sha256, size_bytes, retention) "
-            "VALUES (NULL, 'wire_payload', :be, :uri, :sha, :sz, 'ttl') RETURNING artifact_id"
+            "VALUES (NULL, 'wire_payload', :be, :uri, :sha, :sz, 'ttl') "
+            "ON CONFLICT (backend_id, uri) DO NOTHING RETURNING artifact_id"
         ),
         {"be": backend_id, "uri": key, "sha": digest, "sz": len(data)},
-    ).scalar_one()
+    ).scalar_one_or_none()
+    if inserted is not None:
+        return inserted
+    # FIX-A: lost a concurrent first-spill race — another writer committed this exact content key between
+    # our SELECT-miss and our INSERT. Re-SELECT the winner and verify its sha256/size match the content
+    # before adopting its id (R2: never a silent adopt of a corrupted/colliding row — the same defensive
+    # check as the idempotent SELECT-existing branch above).
+    raced = conn.execute(
+        text(
+            "SELECT artifact_id, sha256, size_bytes FROM neuro.artifacts "
+            "WHERE backend_id = :be AND uri = :uri"
+        ),
+        {"be": backend_id, "uri": key},
+    ).one()
+    if bytes(raced.sha256) != digest or raced.size_bytes != len(data):
+        raise SeamIntegrityError(
+            f"wire spill {key} was concurrently registered with a sha256/size that disagrees with its "
+            "content-addressed key — refusing to adopt a corrupted/colliding artifact (R2; fail loud)."
+        )
+    return raced.artifact_id
 
 
 def _assert_capture_consistent(
