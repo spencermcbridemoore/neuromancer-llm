@@ -156,6 +156,41 @@ def test_rt_adapter_empty_tokens_is_typed_error():
             parse(bad, "p", 1, "capture", -1)
 
 
+def test_rt_adapter_empty_per_token_dict_is_typed_error():
+    """C4.1 (audit 2026-07-02): `top_logprobs=[{}]` — a NON-empty list whose first per-token dict is
+    empty (or not a dict) — passed the Section-C guard and yielded an EMPTY distribution; two such
+    samples compare bitwise_identical=True, a VACUOUS bitwise PASS. Now a typed VLLMAdapterError."""
+    client = VLLMClient("http://127.0.0.1:1")  # never contacted; the pure parser is called directly
+    for bad_top in ({}, "not-a-dict", None, []):
+        data = {"choices": [{"logprobs": {"tokens": ["token_id:5"], "top_logprobs": [bad_top]}}]}
+        with pytest.raises(VLLMAdapterError):
+            client._parse_completion(data, "p", 1, "capture", -1)
+
+
+@pytest.mark.pg
+def test_rt_reader_zero_token_table_raises(seeded, tmp_path):
+    """C4.2 (audit 2026-07-02): a run whose manifests carry NO token_table artifact used to fall back to
+    `artifacts[0]` — silently reading an artifact of ANY kind as the logprob shard (asymmetric with the
+    >1 fail-closed branch). Zero token_tables now raises ConfigurationError."""
+    repo = seeded["repo"]
+    backend = LocalFsBackend(tmp_path)
+    backend_id = repo.get_or_create_storage_backend(
+        "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
+    )
+    reg = BundleRegistrar(repo.engine, backend, expected_lane="test")
+    reg.register(
+        run_id=seeded["run_id"],
+        backend_id=backend_id,
+        dataset_name="logprobs",
+        partition_path=f"logprobs/run={seeded['run_id']}/part-0000",
+        shards={"side-0000.bin": b"a non-token-table side artifact"},
+        artifact_kinds={"side-0000.bin": "other"},
+        table_manifests=[TableManifestSpec("side-0000.bin", "logprobs", row_count=0)],
+    )
+    with pytest.raises(ConfigurationError):  # no token_table -> refuse, never guess an arbitrary artifact
+        read_run_logprobs(repo.engine, backend, run_id=seeded["run_id"])
+
+
 def test_rt_adapter_string_keyed_logprobs_is_typed_error():
     """L4 GAP: a server NOT launched --return-tokens-as-token-ids returns string-keyed logprobs -> a typed
     VLLMAdapterError (the id-keyed contract is enforced loudly)."""

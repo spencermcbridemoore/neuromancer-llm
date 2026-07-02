@@ -41,6 +41,22 @@ def test_unprovisioned_blocks_writes(engine):
             )
 
 
+def test_wrong_lane_blocks_bundle_registrar(engine, tmp_path):
+    """C3.2 (audit 2026-07-02): the BundleRegistrar mirrors the Repository's R1 negatives — a wrong
+    expected_lane (or a wrong pinned uuid) fails closed AT CONSTRUCTION, before any seam write path
+    exists. Before this probe, removing verify_engine from the registrar alone kept the suite green."""
+    from neuromancer_llm.bundles.registrar import BundleRegistrar
+    from neuromancer_llm.storage.backends import LocalFsBackend
+
+    backend = LocalFsBackend(tmp_path)
+    with pytest.raises(LaneAssertionError):
+        BundleRegistrar(engine, backend, expected_lane="canonical")  # wrong lane
+    with pytest.raises(LaneAssertionError):
+        BundleRegistrar(engine, backend, expected_lane="test", expected_uuid=_uuid.uuid4())  # wrong uuid
+    # the positive construction still works (guards against a fail-everything regression)
+    BundleRegistrar(engine, backend, expected_lane="test")
+
+
 def test_expected_uuid_pins_instance(engine):
     # Canonical-lane callers pin the repo-known instance_uuid so a restored clone (fresh uuid) is rejected
     # — lane AND repo-pinned uuid. Exercised here on the 'test' lane (the mechanism is lane-agnostic).

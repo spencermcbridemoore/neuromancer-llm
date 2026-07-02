@@ -485,7 +485,12 @@ class Repository:
         self, *, declared_mode: str, substrate_key: str, expected: str, note: str | None = None
     ) -> int:
         """Idempotent one-time config seed of the EXPECTED heuristic table (ADR-0004; never identity).
-        ON CONFLICT (declared_mode, substrate_key) DO NOTHING — re-seeding is a no-op."""
+        ON CONFLICT (declared_mode, substrate_key) DO NOTHING — a SAME-value re-seed is a no-op.
+
+        Audit correction 2026-07-02: on conflict the stored `expected` is now COMPARED — a re-seed with
+        a DIFFERENT level raises (a wrongly-seeded EXPECTED was silently sticky: ABSENCE is loud via
+        FIX #2, wrongness was not). Changing a lane's EXPECTED level is an explicit rule-table update
+        (an admin act), never a silent re-seed. `note` is commentary, not compared."""
         with self.engine.begin() as conn:
             inserted = conn.execute(
                 text(
@@ -497,13 +502,25 @@ class Repository:
             ).scalar_one_or_none()
             if inserted is not None:
                 return inserted
-            return conn.execute(
-                text(
-                    "SELECT rule_id FROM neuro.expected_reproducibility_rules "
-                    "WHERE declared_mode = :dm AND substrate_key = :sk"
-                ),
-                {"dm": declared_mode, "sk": substrate_key},
-            ).scalar_one()
+            existing = (
+                conn.execute(
+                    text(
+                        "SELECT rule_id, expected FROM neuro.expected_reproducibility_rules "
+                        "WHERE declared_mode = :dm AND substrate_key = :sk"
+                    ),
+                    {"dm": declared_mode, "sk": substrate_key},
+                )
+                .mappings()
+                .one()
+            )
+            if existing["expected"] != expected:
+                raise IdentityMismatchError(
+                    f"expected rule ({declared_mode!r}, {substrate_key!r}) is already seeded with "
+                    f"expected={existing['expected']!r}, not {expected!r} — a re-seed is idempotent only "
+                    "for the SAME level; changing EXPECTED is an explicit rule-table update, never a "
+                    "silent re-seed (fail closed; audit 2026-07-02)."
+                )
+            return existing["rule_id"]
 
     # --- MEASURED determinism: method registry + replicate links + divergence (ADR-0004/0011) ----
     def register_method_version(

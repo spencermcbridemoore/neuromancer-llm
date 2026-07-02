@@ -111,6 +111,37 @@ def test_rt_disjoint_topk_persists_inf_before_raise(repo, tmp_path, rt_capture):
     assert math.isinf(persisted)  # the disjoint-top-k MAX divergence persisted as inf (never a silent 0.0)
 
 
+# --- C4.3 (audit 2026-07-02): a wrongly-seeded EXPECTED level cannot be silently sticky -------------
+@pytest.mark.pg
+def test_rt_expected_rule_reseed_drift_raises(repo):
+    """C4.3 (audit 2026-07-02): `seed_expected_rule` compared NOTHING on conflict — a wrongly-seeded
+    EXPECTED level was silently sticky (ABSENCE is loud via FIX #2; wrongness was not). Seed BITWISE,
+    re-seed the same (declared_mode, substrate_key) as TOLERANCE -> IdentityMismatchError; the stored
+    rule is unchanged; a SAME-value re-seed stays idempotent."""
+    from neuromancer_llm.db.repository import IdentityMismatchError
+
+    rid = repo.seed_expected_rule(
+        declared_mode="greedy", substrate_key="sm89/bi-on", expected=ExpectedLevel.BITWISE.value
+    )
+    # same-value re-seed: idempotent (returns the same rule)
+    assert (
+        repo.seed_expected_rule(
+            declared_mode="greedy", substrate_key="sm89/bi-on", expected=ExpectedLevel.BITWISE.value
+        )
+        == rid
+    )
+    with pytest.raises(IdentityMismatchError):  # drift the level -> loud, never silently sticky
+        repo.seed_expected_rule(
+            declared_mode="greedy", substrate_key="sm89/bi-on", expected=ExpectedLevel.TOLERANCE.value
+        )
+    with repo.engine.connect() as conn:  # the stored rule is unchanged after the refused drift
+        stored = conn.execute(
+            text("SELECT expected FROM neuro.expected_reproducibility_rules WHERE rule_id = :r"),
+            {"r": rid},
+        ).scalar_one()
+    assert stored == ExpectedLevel.BITWISE.value
+
+
 # --- L8: persist-before-raise on a SEVERE (argmax-flip) divergence ----------------------------------
 @pytest.mark.pg
 def test_rt_argmax_flip_persists_before_raise(repo, tmp_path, rt_capture):

@@ -1,8 +1,10 @@
 """`neuro capture` — logprob | replay | show. The Phase 4 VERTICAL SLICE is `capture logprob`.
 
-`logprob` is a THIN delegate: it parses arguments and makes ONE call into capture.events.capture_logprob
-(orchestration lives in the library, not the CLI — one implementation per concept). `replay`/`show` are
-the DEFERRED read/verify half (later gate) and remain Stage-2 stubs.
+Every command is a THIN delegate: it parses arguments and makes ONE call into the library
+(orchestration lives in capture/, not the CLI — one implementation per concept). `logprob` drives one
+verbatim capture end to end; `replay` closes the MEASURED divergence loop over an original + a distinct
+re-invocation; `show` is the SELECT-only, integrity-verified read-back. All three are built (Stage 2
+landed 2026-06-22).
 """
 
 from __future__ import annotations
@@ -12,6 +14,31 @@ from pathlib import Path
 import typer
 
 app = typer.Typer(no_args_is_help=True, help="Capture (Stage 2 vertical slice): logprob | replay | show.")
+
+
+def _tokenizer_hash_bytes(tokenizer_hash: str) -> bytes:
+    """Validate + decode a --tokenizer-hash value: exactly 64 hex chars -> the 32-byte sha256.
+
+    Audit correction 2026-07-02: `bytes.fromhex` accepted ANY even-length hex — a truncated (e.g.
+    2-byte) value became durable register-first tokenizer identity that raise-on-drift could never
+    reconcile with the later correct hash (a silent identity split) — and malformed hex escaped the
+    command's except-tuple as a raw ValueError traceback. Fail closed with the typed error instead."""
+    from ..db.lanes import ConfigurationError
+
+    value = tokenizer_hash.strip()
+    try:
+        decoded = bytes.fromhex(value)
+    except ValueError as exc:
+        raise ConfigurationError(
+            f"--tokenizer-hash is not valid hex: {tokenizer_hash!r} (expected the 64-hex-char sha256 "
+            "of tokenizer.json)."
+        ) from exc
+    if len(decoded) != 32:
+        raise ConfigurationError(
+            f"--tokenizer-hash must be a 64-hex-char sha256 (32 bytes); got {len(decoded)} byte(s) — a "
+            "truncated hash would mint a durable, irreconcilable tokenizer identity (fail closed)."
+        )
+    return decoded
 
 
 @app.command()
@@ -60,7 +87,7 @@ def logprob(
         if tokenizer_file is not None:
             tok_hash = sha256_bytes(Path(tokenizer_file).read_bytes())
         elif tokenizer_hash is not None:
-            tok_hash = bytes.fromhex(tokenizer_hash)
+            tok_hash = _tokenizer_hash_bytes(tokenizer_hash)
         else:
             raise ConfigurationError(
                 "tokenizer identity required: pass --tokenizer-file <tokenizer.json> or --tokenizer-hash <hex> "
@@ -171,7 +198,7 @@ def replay(
         if tokenizer_file is not None:
             tok_hash = sha256_bytes(Path(tokenizer_file).read_bytes())
         elif tokenizer_hash is not None:
-            tok_hash = bytes.fromhex(tokenizer_hash)
+            tok_hash = _tokenizer_hash_bytes(tokenizer_hash)
         else:
             raise ConfigurationError(
                 "tokenizer identity required: pass --tokenizer-file <tokenizer.json> or --tokenizer-hash <hex> "

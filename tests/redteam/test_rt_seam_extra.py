@@ -53,6 +53,38 @@ def test_rt_tombstoned_bundle_cannot_be_resurrected(seeded, tmp_path):
         )
 
 
+def test_rt_bundle_backend_id_drift_raises(seeded, tmp_path):
+    """C2 (audit 2026-07-02): on a bundle_uuid conflict the existing row's backend_id (and run_id) must
+    be COMPARED to the request — the only registry not following the raise-on-drift idiom (FIX #8 / R2 /
+    C10a). A re-register of the same bundle identity under a DIFFERENT backend raises SeamIntegrityError
+    BEFORE any blob write (never adopt, never update); the stored pointer is unchanged."""
+    repo = seeded["repo"]
+    reg, bid = _register(seeded, tmp_path, ds="seam_be", pp="seam_be/p0")
+    with repo.engine.connect() as conn:
+        original_backend = conn.execute(
+            text("SELECT backend_id FROM neuro.bundles WHERE bundle_id=:b"), {"b": bid}
+        ).scalar_one()
+    backend_b = repo.get_or_create_storage_backend(
+        "lake-b", driver="local_fs", lane="artifacts", base_uri=str(tmp_path / "b"), is_cloud=False
+    )
+    assert backend_b != original_backend
+    with pytest.raises(SeamIntegrityError):  # same bundle identity, different backend -> drift, refused
+        reg.register(
+            run_id=seeded["run_id"],
+            backend_id=backend_b,
+            dataset_name="seam_be",
+            partition_path="seam_be/p0",
+            shards=SHARDS,
+        )
+    with repo.engine.connect() as conn:  # the stored pointer was neither adopted nor re-pointed
+        assert (
+            conn.execute(
+                text("SELECT backend_id FROM neuro.bundles WHERE bundle_id=:b"), {"b": bid}
+            ).scalar_one()
+            == original_backend
+        )
+
+
 def test_rt_per_artifact_sha_divergence_raises(seeded, tmp_path):
     """L9 (defense-in-depth): if a stored artifact sha256 diverges from the blob while the manifest still
     matches, the per-artifact compare (registrar's last line) raises SeamIntegrityError. We force the

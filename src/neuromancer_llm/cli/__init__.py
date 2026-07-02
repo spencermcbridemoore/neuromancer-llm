@@ -9,9 +9,10 @@ import typer
 
 
 def stage2(command: str) -> None:
-    """Stage-1 scaffold placeholder for a command whose logic lands in Stage 2 (the vertical slice)."""
+    """Placeholder for a command whose logic is not yet built (deferred to its planned gate; the name
+    `stage2` is historical — kept so call sites stay stable)."""
     typer.secho(
-        f"`neuro {command}` lands in Stage 2 (not built in the Stage-1 scaffold).",
+        f"`neuro {command}` is not yet built (deferred; see the deferred-obligation register).",
         fg=typer.colors.YELLOW,
         err=True,
     )

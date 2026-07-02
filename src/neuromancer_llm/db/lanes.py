@@ -1,9 +1,12 @@
 """Lanes v2 — positive in-band database identity; UNKNOWN fails closed (ADR-0006).
 
 A singleton `neuro.database_identity` row is written at provisioning (`neuro db provision`) and
-verified at every connect BEFORE any write, via a *mandatory* `expected_lane` argument (never an env
-var of its own). The canonical check is lane AND repo-pinned uuid match. UNKNOWN fails closed for
-every intent. This closes the predecessor's confirmed bidirectional lane inversion.
+positively verified ONCE per engine construction at every writer entry point (R1: session.py
+verify_engine / make_verified_engine) BEFORE any write path exists, via a *mandatory* `expected_lane`
+argument (never an env var of its own). The canonical check is lane AND repo-pinned uuid match.
+UNKNOWN fails closed for every intent. This closes the predecessor's confirmed bidirectional lane
+inversion. (Caveat, ADR-0006 Amended 2026-07-02: pool_pre_ping recycles a dead pooled connection
+without re-verification; a per-connect listener is deferred to the ADR-0046/role-split bundle.)
 
 The same `assert_lane` guards migrations (migrations/env.py) once a DB is provisioned, and is skipped
 only on migrations-from-zero (empty DB with no identity row yet).
@@ -17,6 +20,10 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 VALID_LANES = frozenset({"canonical", "staging", "test"})  # 'unknown' is never a usable lane
+
+# The migrations-from-zero == frozen-DDL parity proof (tests/test_migration_ddl_parity.py) is anchored
+# to PostgreSQL 18; any other major is an UNPROVEN schema even where the migration syntax runs green.
+PG_PARITY_MAJOR = 18
 
 
 class LaneAssertionError(RuntimeError):
@@ -34,6 +41,24 @@ class ConfigurationError(RuntimeError):
     environment surface (e.g. NEURO_DATABASE_URL / NEURO_MIGRATION_EXPECTED_LANE unset). CLI delegates
     translate it to a clean typer.Exit; library code raises it instead of a raw SystemExit/KeyError (R8).
     """
+
+
+def assert_pg_major(server_version_num: int) -> None:
+    """Fail loud unless the connected server's major version is the PG-18 parity baseline.
+
+    Migration 0001's SYNTAX runs green on PG 15-17 (`NULLS NOT DISTINCT` needs >= 15;
+    `gen_random_uuid()` is core since 13), so nothing else would refuse a wrong major — but the
+    migrations==frozen-DDL parity proof is anchored to PG 18, so a quietly-green PG 16 build would be
+    an UNPROVEN schema. The migrate path calls this BEFORE any DDL (audit correction 2026-07-02;
+    closes the X8 runbook's false "a non-18 PG breaks migrate itself" safety net).
+    """
+    if not (180000 <= server_version_num < 190000):
+        raise ConfigurationError(
+            f"connected PostgreSQL is major {server_version_num // 10000} "
+            f"(server_version_num={server_version_num}) but the schema parity baseline is "
+            f"PG {PG_PARITY_MAJOR} — migrations-from-zero == frozen-DDL is proven on PG 18 only; "
+            "refusing to migrate (fail closed). Install the PGDG PostgreSQL 18 package."
+        )
 
 
 def read_identity(conn: Connection) -> dict | None:

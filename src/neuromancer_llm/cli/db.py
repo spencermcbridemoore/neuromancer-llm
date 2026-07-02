@@ -81,5 +81,5 @@ def verify(lane: str = typer.Option(..., help="the lane this connection must pos
 
 @app.command("restore-drill")
 def restore_drill() -> None:
-    """Scripted quarterly restore drill (ADR-0007 durability) — Stage 2."""
+    """Scripted quarterly restore drill (ADR-0007 durability) — not yet built (go-remote Stage A, A2-9)."""
     stage2("db restore-drill")

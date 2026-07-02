@@ -146,7 +146,15 @@ def read_run_logprobs(
             f"run {run_id} dataset {dataset_name!r} has {len(token_tables)} token_table shards; this reader "
             "expects exactly one — refusing to silently return a partial (first-shard-only) view."
         )
-    target = token_tables[0] if token_tables else artifacts[0]
+    if not token_tables:
+        # Audit correction 2026-07-02: the old fallback (`artifacts[0]`) silently read an artifact of
+        # ANY kind as the logprob shard — asymmetric with the >1 fail-closed branch above. Zero
+        # token_tables is a missing-shard condition: fail closed, never guess.
+        raise ConfigurationError(
+            f"run {run_id} dataset {dataset_name!r} has NO token_table artifact — refusing to read an "
+            "arbitrary artifact as the logprob shard (fail closed)."
+        )
+    target = token_tables[0]
     target_blob = b""
     for artifact in artifacts:
         blob = verify_artifact(backend, artifact)  # the binding on EVERY artifact, fail loud

@@ -1,6 +1,7 @@
 """neuromancer-llm — ORM (SQLAlchemy 2.0 declarative).
 
-Mirrors engagement/phase3/phase3-ddl.sql 1:1. This is the typed query/identity layer; the schema is
+Mirrors tests/reference/phase3-ddl.sql (the frozen canonical DDL) 1:1. This is the typed
+query/identity layer; the schema is
 owned by Alembic (migrations/). Postgres-only — there is no SQLite target
 (ADR-0039 Reconsidered 2026-06-17); PG-specific types (INTERVAL / JSONB / ARRAY / Uuid),
 NULLS NOT DISTINCT, and the assign-once trigger are used directly. Bindings preserved:

@@ -13,7 +13,11 @@ from logging.config import fileConfig
 from alembic import context
 from sqlalchemy import engine_from_config, pool, text
 
-from neuromancer_llm.db.lanes import ConfigurationError, assert_lane  # ADR-0006 positive identity
+from neuromancer_llm.db.lanes import (  # ADR-0006 positive identity + the PG-18 parity guard
+    ConfigurationError,
+    assert_lane,
+    assert_pg_major,
+)
 from neuromancer_llm.db.orm import Base  # the models in db/orm.py
 
 if context.config.config_file_name is not None:
@@ -53,6 +57,10 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
     with connectable.connect() as conn:
+        # PG-major guard BEFORE any DDL (audit correction 2026-07-02): the migration syntax runs green
+        # on PG 15-17, but the migrations==frozen-DDL parity proof is anchored to PG 18 — refuse any
+        # other major loudly rather than materialize an unproven schema.
+        assert_pg_major(conn.execute(text("SELECT current_setting('server_version_num')::int")).scalar_one())
         # B1 bootstrap: the alembic version table lives in schema `neuro` (version_table_schema below),
         # so the schema MUST exist before context.configure() on an empty DB (migrations-from-zero).
         # Commit the bootstrap BEFORE handing the connection to alembic: an in-progress transaction here

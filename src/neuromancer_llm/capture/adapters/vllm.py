@@ -286,6 +286,16 @@ class VLLMClient:
             )
         generated = _parse_token_id(lp["tokens"][0])
         top = lp["top_logprobs"][0]
+        if not isinstance(top, dict) or not top:
+            # Section-C tightening (audit 2026-07-02): a NON-empty top_logprobs list whose first
+            # per-token entry is an empty (or non-dict) value passed the guard above and yielded an
+            # EMPTY distribution — two such samples compare bitwise_identical=True, a vacuous bitwise
+            # PASS. A typed loud error instead.
+            raise VLLMAdapterError(
+                f"per-token top_logprobs entry is empty/malformed ({top!r}); expected a non-empty "
+                "token_id->logprob map (launch with --logprobs-mode raw_logprobs and --max-logprobs "
+                "high enough)."
+            )
         pairs = sorted((_parse_token_id(k), float(v)) for k, v in top.items())
         return LogprobSample(
             prompt=prompt,

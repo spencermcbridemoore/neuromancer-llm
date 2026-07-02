@@ -3,10 +3,16 @@
 An LLM experimentation platform with mechanistic-interpretability capture, provenance, and export
 discipline. Successor to study-query-llm.
 
-> **Status — Phase 4, Stage 1 (scaffold).** The package skeleton, the canonical schema as an Alembic
-> migration proven from zero against real PostgreSQL 18, least-privilege role provisioning, the tiered
-> CI, the golden-snapshot queue harness, the W1–W8 seam kill-tests, and the byte-stable generated-docs
-> gate. The vertical slice — "logprob capture done right" — is **Stage 2**, not built yet.
+> **Status — Phase 5 complete; go-remote planning underway (first checkpoint X8 pending).**
+> Stage 1 (scaffold): the package skeleton, the canonical schema as an Alembic migration proven from
+> zero against real PostgreSQL 18, least-privilege role provisioning, the tiered CI, the
+> golden-snapshot queue harness, the W1–W8 seam kill-tests, and the byte-stable generated-docs gate.
+> Stage 2 — the vertical slice, "logprob capture done right" — is **built**, both halves: verbatim wire
+> capture + register-first identity + the parquet-lake write path, and the integrity-verified
+> (sha256+size) read path + the MEASURED divergence loop, demonstrated live end to end. Phase 5
+> red-teamed the built surface against the binding lessons (the permanent adversarial suite lives in
+> `tests/redteam/`) and its correction passes have landed. Current phase: go-remote deployment
+> planning (Jetstream2 VM + real Azure) — nothing provisioned yet.
 
 ## Architecture
 
@@ -20,8 +26,10 @@ SELECT-only role by notebooks, DuckDB, and chat agents.
 The design is **Postgres-only** (ADR-0039 Reconsidered 2026-06-17); the schema is owned by Alembic
 migrations against real Postgres and is never created with `metadata.create_all`.
 
-The full design of record lives under `engagement/phase3/` (44 ADRs, the canonical DDL, the ORM, the
-Alembic design, the capture contract, the module layout, and the Appendix-A importer spec).
+The design of record, in-repo: [docs/adr/](docs/adr/index.md) (48 ADRs, generated from
+`docs/adr/_source/phase3-adrs.md`) and `tests/reference/phase3-ddl.sql` (the byte-identical in-repo
+copy of the canonical frozen DDL that the migration parity test builds against). The full engagement
+corpus (capture contract, module layout, importer spec, phase checkpoints) lives outside this repo.
 
 ## Six interpretability workflows (adoption order)
 
@@ -32,16 +40,16 @@ Alembic design, the capture contract, the module layout, and the Appendix-A impo
 
 ```bash
 uv sync                                   # create .venv, install deps, write uv.lock
-neuro --version
+uv run neuro --version                    # the console script lives in .venv/bin — invoke via `uv run`
 
 # Bring up a local Postgres 18 (Docker) and run migrations-from-zero:
 docker run -d --name neuro-pg -e POSTGRES_PASSWORD=neuro -p 5432:5432 postgres:18
 export NEURO_DATABASE_URL="postgresql+psycopg://postgres:neuro@localhost:5432/postgres"
-neuro db migrate                          # alembic upgrade head — materializes the canonical schema
-neuro db provision --lane test            # write the lanes-v2 identity row
-neuro db roles                            # create roles + apply phase3-grants.sql
+uv run neuro db migrate                   # alembic upgrade head — materializes the canonical schema
+uv run neuro db provision --lane test     # write the lanes-v2 identity row
+uv run neuro db roles                     # create roles + apply phase3-grants.sql
 
-neuro docs build --check                  # byte-stable generated-docs gate
+uv run neuro docs build --check           # byte-stable generated-docs gate
 uv run pytest -m "not gpu and not api and not network"
 ```
 

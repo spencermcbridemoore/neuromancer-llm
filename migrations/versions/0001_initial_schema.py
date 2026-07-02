@@ -1,4 +1,4 @@
-"""initial schema — materializes engagement/phase3/phase3-ddl.sql exactly.
+"""initial schema — materializes tests/reference/phase3-ddl.sql (the frozen canonical DDL) exactly.
 
 Migrations-from-zero target == phase3-ddl.sql (13 enums, 45 tables, the named CHECK/UNIQUE
 constraints, the partial + functional indexes, and the load-bearing assign-once trigger). The full

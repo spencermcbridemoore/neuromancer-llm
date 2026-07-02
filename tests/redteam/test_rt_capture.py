@@ -199,6 +199,49 @@ def test_rt_capture_model_bound_to_run_fingerprint(seeded, rt, tmp_path):
     assert write_capture_event(repo.engine, backend, model_id=mid_a, **common).capture_event_id is not None
 
 
+# --- C3.3 (audit 2026-07-02): spill-vs-spill divergent resume fires the stored-spill sha compare ----
+def test_rt_capture_spill_resume_divergent_raises(seeded, rt, tmp_path):
+    """C3.3 (audit 2026-07-02): a >8KB (SPILLED) capture resumed with a DIFFERENT >8KB body must trip
+    the stored-spill sha256/size compare in `_assert_capture_consistent` (events.py's artifacts branch)
+    — the one resume branch with zero coverage (existing probes are inline-vs-inline and inline->spill
+    tier-cross). The divergent body has the SAME length, so the sha256 clause is the one that fires;
+    the stored spill blob + artifact row stay untouched."""
+    from neuromancer_llm.db.identity import sha256_bytes
+
+    repo = seeded["repo"]
+    backend, backend_id = _backend(repo, tmp_path)
+    run_id, mid = _run_bound_to_model(seeded, rt, tok=b"spillres-tok", slug="spr")
+    common = dict(
+        run_id=run_id,
+        event_key="ev",
+        model_id=mid,
+        actor_id=seeded["actor_id"],
+        origin="h",
+        backend_id=backend_id,
+        partition_path="logprobs/run=x/part-0000",
+        response_body=b'{"b":2}',
+    )
+    first_body = b'{"x":"' + b"A" * (INLINE_CAP + 50) + b'"}'
+    first = write_capture_event(repo.engine, backend, request_body=first_body, **common)
+    assert not first.request_inlined and first.request_spill_artifact_id is not None
+    # identical >8KB resume -> idempotent (same spill artifact adopted)
+    resumed = write_capture_event(repo.engine, backend, request_body=first_body, **common)
+    assert resumed.capture_event_id == first.capture_event_id
+    # DIVERGENT resume at the SAME tier (both spill) and the SAME length -> the sha256 clause fires
+    divergent = b'{"x":"' + b"B" * (INLINE_CAP + 50) + b'"}'
+    assert len(divergent) == len(first_body)
+    with pytest.raises(SeamIntegrityError):
+        write_capture_event(repo.engine, backend, request_body=divergent, **common)
+    # the stored spill is unchanged (row sha256 matches the FIRST body; blob bytes intact)
+    with repo.engine.connect() as conn:
+        art = conn.execute(
+            text("SELECT uri, sha256 FROM neuro.artifacts WHERE artifact_id = :a"),
+            {"a": first.request_spill_artifact_id},
+        ).one()
+    assert bytes(art.sha256) == sha256_bytes(first_body)
+    assert backend.get(art.uri) == first_body
+
+
 # --- L4 GAP: cross-tier (inline <-> spill) resume drift --------------------------------------------
 def test_rt_capture_cross_tier_resume_drift_raises(seeded, rt, tmp_path):
     """L4 GAP: the inline/spill decision is part of the immutable row. A first write that inlines (<=8KB)

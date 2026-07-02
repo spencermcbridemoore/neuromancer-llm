@@ -147,6 +147,30 @@ _PRODUCT_ENV = [
         "Optional SELECT-only (neuro_reader) DSN for the read/export surface (`neuro capture show`); "
         "falls back to NEURO_DATABASE_URL. The SELECT-only boundary is the role (phase0 Q12).",
     ),
+    (
+        "NEURO_EXPECTED_LANE",
+        "The lane `neuro capture logprob`/`replay` positively verify before any write (default "
+        "`canonical`); for `capture show` it is an optional positive lane confirm (default: none). "
+        "Infra config for the fail-closed lane guard, never a behavior switch.",
+    ),
+    (
+        "NEURO_VLLM_BASE_URL",
+        "Base URL of the vLLM OpenAI-compatible server the capture lane talks to "
+        "(default http://127.0.0.1:8000).",
+    ),
+    (
+        "NEURO_NTFY_TOPIC",
+        "The alert-channel topic env var (ADR-0019). Only the VARIABLE NAME is documented — the topic "
+        "value IS the credential (a secret; never in git or generated docs). Not yet consumed: the "
+        "notify() send is unbuilt (go-remote Stage A, A2-12); today only the constant name exists.",
+    ),
+    (
+        "AZURE_STORAGE_CONNECTION_STRING",
+        "The production `AzureBlobBackend` credential path (account-key connection string — the "
+        "accepted Stage-A ADR-0013 deviation; user-delegation SAS via storage/sas.py is an unbuilt "
+        "Stage-B item). Today consumed only by the W1-W8 seam test; unset, the backend falls back to "
+        "the local Azurite emulator string.",
+    ),
 ]
 _SECRET_ENV = [
     (
@@ -161,12 +185,23 @@ _TEST_ENV = [
         "Test DB DSN; if set, the suite reuses it (CI service container) instead of testcontainers.",
     ),
     (
-        "NEURO_TEST_AZURITE / AZURE_STORAGE_CONNECTION_STRING",
-        "Azurite connection string for the W1-W8 seam tests.",
+        "NEURO_TEST_AZURITE",
+        "Azurite connection string for the W1-W8 seam tests (AZURE_STORAGE_CONNECTION_STRING, listed "
+        "under Product, is also honored there).",
     ),
     (
         "NEURO_TEST_GPU / NEURO_TEST_API / NEURO_TEST_NETWORK",
         "Capability flags; absent -> the matching marker skips visibly.",
+    ),
+    (
+        "NEURO_VLLM_CONTROL_BASE_URL",
+        "Optional second vLLM server (batch-invariance OFF) for the E6 control arm; unset -> the "
+        "control-arm assertions are omitted from the E6 test (the main arm still runs).",
+    ),
+    (
+        "NEURO_VLLM_TOKENIZER_FILE",
+        "Path to the served model's tokenizer.json for the live capture tests (sha256'd into the "
+        "durable tokenizer identity).",
     ),
     ("UV_SYSTEM_CERTS", "Make uv trust the OS certificate store (corporate TLS interception)."),
 ]
@@ -225,9 +260,10 @@ def _render_governance() -> str:
         "",
         "## CI lanes",
         "",
-        "- **fast** (every push): ruff + pyright + unit/`pg` tests on a session-scoped `postgres:18` (no `seam`).",
+        "- **fast** (every push): ruff + pyright + unit/`pg` tests on a session-scoped `postgres:18` (no `seam`); "
+        "`neuro docs build --check` (byte-gate) + offline lychee link check.",
         "- **full** (PR + main): migrations-from-zero + DDL parity + golden + W1-W8 seam on `postgres:18` + Azurite; "
-        "wheel build/install/`neuro --version` smoke; `neuro docs build --check`.",
+        "wheel build/install/`neuro --version` smoke; `neuro docs build --check`; Docker build + compose boot smoke.",
         "",
         "## ADR status inventory",
         "",
@@ -241,7 +277,11 @@ def _render_governance() -> str:
 
 # --- ADR split (from the carried source) -----------------------------------------------------------
 _ADR_HEADER = re.compile(r"^### (ADR-(\d{4})) — (.+)$")
-_STATUS = re.compile(r"^\*\*Status:\*\*\s*(.+?)(?:\s*·|\s*$)", re.MULTILINE)
+# The Status value ends at the ` · **Source:**` separator, at an inline `. **Decision.**` (the one-line
+# Group-3 ADRs put Status and Decision on a single line — without this stop the whole Decision paragraph
+# was captured as the Status, corrupting the index and splintering the governance status inventory), or
+# at end of line.
+_STATUS = re.compile(r"^\*\*Status:\*\*\s*(.+?)(?:\s*·|\.\s+\*\*Decision|\s*$)", re.MULTILINE)
 
 
 def _slug(title: str) -> str:

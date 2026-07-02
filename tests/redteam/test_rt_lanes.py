@@ -106,6 +106,65 @@ def test_rt_core_modules_read_no_env():
         assert "os.environ" not in src and "getenv" not in src, f"{rel} reads an env var (behavior-by-flag?)"
 
 
+def test_rt_no_write_path_on_unverified_engine():
+    """L1 probe-6 (matrix ~line 39, GAP-TEST-ONLY — chartered in the Phase-5 reconciliation, landed by
+    the 2026-07-02 audit correction pass): 'no write path executes on an unverified engine' is a
+    CONVENTION — this pins it statically so a new raw-engine write path must show up here and justify
+    itself.
+
+      * `create_engine(` exists in src/ ONLY in db/session.py (the one raw-engine factory);
+      * `make_engine(` callers outside session.py are ONLY cli/db.py's pre-identity bootstrap
+        (provision/roles/verify run before an identity row can exist — sanctioned);
+      * both domain-write choke points (Repository / BundleRegistrar) construct THROUGH verify_engine;
+      * `write_capture_event`'s single production callsite receives the VERIFIED repo.engine (exactly
+        one callsite in src/ besides the def);
+      * `collect_unsealed` has no production caller in src/ yet — a future caller appears here and must
+        receive a verified engine."""
+    import re
+
+    create_engine_files = []
+    make_engine_callers = []
+    collect_unsealed_callsites = []  # src/-wide, excluding only the def itself (gc.py included)
+    wce_callsites = []  # src/-wide write_capture_event callsites, excluding only the def itself
+    cli_db_make_engine_count = 0
+    for py in sorted(_SRC.rglob("*.py")):
+        rel = py.relative_to(_SRC).as_posix()
+        src = py.read_text(encoding="utf-8")
+        if "create_engine(" in src and rel != "db/session.py":
+            create_engine_files.append(rel)
+        if "make_engine(" in src and rel not in ("db/session.py", "cli/db.py"):
+            make_engine_callers.append(rel)
+        if rel == "cli/db.py":
+            cli_db_make_engine_count = src.count("make_engine(")
+        collect_unsealed_callsites += [rel for _ in re.finditer(r"(?<!def )collect_unsealed\(", src)]
+        wce_callsites += [rel for _ in re.finditer(r"(?<!def )write_capture_event\(", src)]
+    assert create_engine_files == [], f"create_engine( outside db/session.py: {create_engine_files}"
+    assert make_engine_callers == [], (
+        f"raw make_engine( outside session.py + cli/db.py's pre-identity bootstrap: {make_engine_callers}"
+    )
+    # the cli/db.py allowance is pinned to its CURRENT three bootstrap calls (provision/roles/verify) —
+    # a NEW raw-engine call added there must show up here and justify itself (review hardening).
+    assert cli_db_make_engine_count == 3, (
+        f"cli/db.py now has {cli_db_make_engine_count} make_engine( occurrences (expected the 3 "
+        "pre-identity bootstrap calls) — a new raw-engine caller must justify itself here"
+    )
+    assert collect_unsealed_callsites == [], (
+        f"new collect_unsealed( caller(s) {collect_unsealed_callsites} — route through a VERIFIED engine "
+        "and update this probe"
+    )
+    # the two domain-write choke points verify identity at construction (R1)
+    for rel in ("db/repository.py", "bundles/registrar.py"):
+        assert "verify_engine(engine" in (_SRC / rel).read_text(encoding="utf-8"), rel
+    # write_capture_event: exactly ONE production callsite anywhere in src/, and it gets the verified
+    # repo.engine (the scan is src/-wide, so a new callsite in ANY module trips this).
+    assert wce_callsites == ["capture/events.py"], (
+        f"write_capture_event callsites {wce_callsites} — a new callsite must receive a verified engine "
+        "and update this probe"
+    )
+    events_src = (_SRC / "capture" / "events.py").read_text(encoding="utf-8")
+    assert re.search(r"write_capture_event\(\s*repo\.engine", events_src)
+
+
 def test_rt_one_queue_one_registrar():
     """L13: exactly ONE claim path (the worker delegate is a pass-through to Repository.claim, not a second
     queue) and ONE registrar concept (a single BundleRegistrar class). A parallel implementation would bite."""

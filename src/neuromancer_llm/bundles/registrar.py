@@ -85,16 +85,31 @@ class BundleRegistrar:
         self.backend = backend
 
     def _ensure_bundle(self, run_id: int, backend_id: int, bundle_uuid) -> int:
+        # C2 (audit correction 2026-07-02): this was the ONLY registry adopting an existing row without
+        # comparing its identity to the request (the raise-on-drift idiom of FIX #8 / R2 / C10a).
+        # backend_id is NOT part of the bundle_uuid derivation (uuid5 over run/dataset/partition), so a
+        # re-register under a DIFFERENT backend silently adopted the old row while the artifact INSERTs
+        # used the NEW backend_id — a split-brain pointer. Never adopt, never update: the conflict arm
+        # is a self-assign no-op (the old form re-pointed run_id) purely so RETURNING yields the
+        # EXISTING row, and any backend_id/run_id drift raises before a single blob is touched.
         with self.engine.begin() as conn:
-            return conn.execute(
+            row = conn.execute(
                 text(
                     "INSERT INTO neuro.bundles (bundle_uuid, run_id, backend_id, state) "
                     "VALUES (:u, :r, :be, 'unsealed') "
-                    "ON CONFLICT (bundle_uuid) DO UPDATE SET run_id = EXCLUDED.run_id "
-                    "RETURNING bundle_id"
+                    "ON CONFLICT (bundle_uuid) DO UPDATE SET run_id = neuro.bundles.run_id "
+                    "RETURNING bundle_id, run_id, backend_id"
                 ),
                 {"u": bundle_uuid, "r": run_id, "be": backend_id},
-            ).scalar_one()
+            ).one()
+            if row.backend_id != backend_id or row.run_id != run_id:
+                raise SeamIntegrityError(
+                    f"bundle {bundle_uuid} already exists with run_id={row.run_id}, "
+                    f"backend_id={row.backend_id} — refusing to adopt/re-point it for run_id={run_id}, "
+                    f"backend_id={backend_id} (C2: register-first, raise-on-drift; never adopt, never "
+                    "update)."
+                )
+            return row.bundle_id
 
     def _assert_resume_consistent(self, bundle_id: int, manifest_digest: bytes) -> None:
         """R2 (fail-loud BEFORE clobbering blobs): a sealed/registered bundle's manifest is immutable, so
