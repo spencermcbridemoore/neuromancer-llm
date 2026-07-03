@@ -97,6 +97,7 @@ def test_rt_core_modules_read_no_env():
     migrations/env.py). A behavior-switching env read in these modules would be the SQ_*-style sin."""
     for rel in (
         "db/lanes.py",
+        "db/canonical_instance.py",  # A1-15: an env-overridable pin would reintroduce rejected option (b)
         "db/repository.py",
         "capture/events.py",
         "capture/determinism.py",

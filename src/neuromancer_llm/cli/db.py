@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import uuid as _uuid
 from collections.abc import Iterator
 
 import typer
@@ -68,14 +69,33 @@ def roles(
 
 
 @app.command()
-def verify(lane: str = typer.Option(..., help="the lane this connection must positively be")) -> None:
+def verify(
+    lane: str = typer.Option(..., help="the lane this connection must positively be"),
+    expected_uuid: str | None = typer.Option(
+        None,
+        help="instance_uuid the DB must hold; --lane canonical auto-resolves the repo pin "
+        "(db/canonical_instance.py) when omitted — an absent pin fails closed (A1-15)",
+    ),
+) -> None:
     """Positively verify the connected DB's identity; fail closed on any mismatch (ADR-0006)."""
-    from ..db.lanes import assert_lane
+    from ..db.canonical_instance import expected_uuid_for_lane
+    from ..db.lanes import ConfigurationError, assert_lane
     from ..db.session import make_engine
 
     with _clean_fail():
+        if expected_uuid is not None:
+            # parse via uuid.UUID so case/braces normalize (assert_lane compares canonical str forms);
+            # a malformed value fails closed with the CLI's uniform error style, not a raw ValueError.
+            try:
+                pin: _uuid.UUID | None = _uuid.UUID(expected_uuid)
+            except ValueError:
+                raise ConfigurationError(
+                    f"--expected-uuid {expected_uuid!r} is not a valid UUID (fail closed)."
+                ) from None
+        else:
+            pin = expected_uuid_for_lane(lane)
         with make_engine().connect() as conn:
-            identity = assert_lane(conn, expected_lane=lane)
+            identity = assert_lane(conn, expected_lane=lane, expected_uuid=pin)
         typer.echo(f"verified: lane={identity['lane']} instance_uuid={identity['instance_uuid']}")
 
 

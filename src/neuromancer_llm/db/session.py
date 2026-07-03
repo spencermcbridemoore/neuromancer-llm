@@ -7,7 +7,10 @@ R1 (fail-closed write choke point): `make_verified_engine` / `verify_engine` run
 guard ONCE before exposing the engine, so no write path exists on an unverified target (ADR-0006). The
 engine verifies the DB IDENTITY (lane/uuid), not the connected ROLE — Postgres grants enforce the role.
 The repository and the bundle registrar are constructed FROM a verified engine — they cannot be built
-against an unprovisioned or wrong-lane DB.
+against an unprovisioned or wrong-lane DB. Canonical-lane construction THROUGH verify_engine resolves
+the repo-pinned instance_uuid (canonical_instance.py, A1-15) when the caller passes none; an absent pin
+fails closed. (make_reader_engine's optional lane confirm stays lane-only — the reader-path pin is
+deferred with the restore/clone-tooling obligation in the Deferred-Obligation Register.)
 """
 
 from __future__ import annotations
@@ -18,6 +21,7 @@ import uuid as _uuid
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
+from .canonical_instance import expected_uuid_for_lane
 from .lanes import ConfigurationError, assert_lane
 
 ENV_URL = "NEURO_DATABASE_URL"
@@ -44,9 +48,14 @@ def verify_engine(
 ) -> Engine:
     """Positively verify the engine's target identity ONCE (ADR-0006), then return it. Fail closed.
 
-    Canonical-lane callers SHOULD also pass expected_uuid (the repo-pinned instance) so a restored clone
-    with a fresh instance_uuid is rejected — lane AND repo-pinned uuid is the canonical check.
+    Canonical-lane construction with NO caller-passed expected_uuid resolves the repo pin itself
+    (db/canonical_instance.py, A1-15) and fails closed (ConfigurationError) if the pin is absent — so
+    a restored clone with a fresh instance_uuid is rejected with zero per-site wiring: lane AND
+    repo-pinned uuid is the canonical check. An explicit expected_uuid overrides the pin; staging/test
+    resolve no pin (unchanged). Resolution happens BEFORE the verifying connection.
     """
+    if expected_uuid is None:
+        expected_uuid = expected_uuid_for_lane(expected_lane)
     with engine.connect() as conn:
         assert_lane(conn, expected_lane=expected_lane, expected_uuid=expected_uuid)
     return engine
@@ -81,7 +90,9 @@ def make_reader_engine(
     The SELECT-only boundary is the connected ROLE, not this engine — connect with neuro_reader creds. No
     write guard runs (reads need none, ADR-0006); the read-time binding is integrity verify (sha256+size,
     capture/reader.py). When expected_lane is given, the lane is positively confirmed first (a SELECT the
-    reader role may run) so a consumer can refuse to read the wrong lane.
+    reader role may run) so a consumer can refuse to read the wrong lane — LANE-ONLY, no uuid pin: the
+    A1-15 pin guards write-side construction; the reader-path pin is deferred with the restore/clone
+    obligation in the Deferred-Obligation Register.
     """
     engine = make_engine(url, echo=echo)
     if expected_lane is not None:

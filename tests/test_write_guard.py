@@ -19,7 +19,9 @@ pytestmark = pytest.mark.pg
 
 
 def test_wrong_lane_blocks_writes(engine):
-    # the test DB is provisioned 'test'; demanding 'canonical' fails closed BEFORE any write path exists
+    # the test DB is provisioned 'test'; demanding 'canonical' fails closed BEFORE any write path exists.
+    # (post-A1-15 the canonical pin also resolves here — the pin is committed, so resolution succeeds,
+    # and the lane mismatch fires before the uuid comparison: the type stays LaneAssertionError)
     with pytest.raises(LaneAssertionError):
         Repository(engine, expected_lane="canonical")
 
@@ -50,7 +52,9 @@ def test_wrong_lane_blocks_bundle_registrar(engine, tmp_path):
 
     backend = LocalFsBackend(tmp_path)
     with pytest.raises(LaneAssertionError):
-        BundleRegistrar(engine, backend, expected_lane="canonical")  # wrong lane
+        # wrong lane (post-A1-15 the canonical pin resolves first, but lane mismatch still fires
+        # before the uuid comparison — the expected type is unchanged)
+        BundleRegistrar(engine, backend, expected_lane="canonical")
     with pytest.raises(LaneAssertionError):
         BundleRegistrar(engine, backend, expected_lane="test", expected_uuid=_uuid.uuid4())  # wrong uuid
     # the positive construction still works (guards against a fail-everything regression)
