@@ -59,6 +59,10 @@ uv run pytest -m "not gpu and not api and not network"
 library. Run `neuro --help` for the command surface (`db`, `runs`, `bundles`, `workers`, `storage`,
 `capture`, `derive`, `importer`, `spend`, `probe`, `docs`).
 
+## Operations
+
+Canonical Jetstream2 Postgres VM (re)provisioning is captured as code in [ops/provision-canonical.sh](ops/provision-canonical.sh) — the ADR-0041 docs-that-cannot-rot infrastructure layer (a rebuild restores the pinned identity; it never re-provisions).
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
