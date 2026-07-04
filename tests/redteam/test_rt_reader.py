@@ -41,7 +41,7 @@ def test_rt_same_size_tamper_fires_sha256(seeded, tmp_path):
     backend_id = repo.get_or_create_storage_backend(
         "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
     )
-    pq, n = logprob_parquet(_sample(12))
+    pq, n, _ = logprob_parquet(_sample(12))
     reg = BundleRegistrar(repo.engine, backend, expected_lane="test")
     reg.register(
         run_id=seeded["run_id"],
@@ -86,7 +86,7 @@ def test_rt_non_target_shard_tamper_raises(seeded, tmp_path):
     backend_id = repo.get_or_create_storage_backend(
         "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
     )
-    pq, n = logprob_parquet(_sample(8))
+    pq, n, _ = logprob_parquet(_sample(8))
     reg = BundleRegistrar(repo.engine, backend, expected_lane="test")
     shards = {"logprobs-0000.parquet": pq, "side-0000.bin": b"a non-token-table side artifact"}
     reg.register(
@@ -120,8 +120,8 @@ def test_rt_multi_shard_reader_raises(seeded, tmp_path):
     backend_id = repo.get_or_create_storage_backend(
         "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
     )
-    p0, n0 = logprob_parquet(_sample(8))
-    p1, n1 = logprob_parquet(_sample(12))
+    p0, n0, _ = logprob_parquet(_sample(8))
+    p1, n1, _ = logprob_parquet(_sample(12))
     reg = BundleRegistrar(repo.engine, backend, expected_lane="test")
     shards = {"logprobs-0000.parquet": p0, "logprobs-0001.parquet": p1}
     reg.register(
@@ -210,7 +210,7 @@ def test_rt_backend_fetch_error_propagates(seeded, tmp_path):
     backend_id = repo.get_or_create_storage_backend(
         "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
     )
-    pq, n = logprob_parquet(_sample(8))
+    pq, n, _ = logprob_parquet(_sample(8))
     reg = BundleRegistrar(repo.engine, backend, expected_lane="test")
     art_name = "logprobs-0000.parquet"
     reg.register(

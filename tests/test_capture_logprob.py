@@ -51,7 +51,7 @@ def test_logprob_parquet_is_valid_and_derived():
     import pyarrow.parquet as pq
 
     sample = _synthetic_sample(20)
-    data, row_count = logprob_parquet(sample)
+    data, row_count, _ = logprob_parquet(sample)
     assert row_count == 20
     table = pq.read_table(io.BytesIO(data))
     assert table.num_rows == 20
@@ -363,8 +363,8 @@ def test_table_manifest_fanout_one_row_per_queryable_artifact(seeded, tmp_path):
     backend = LocalFsBackend(tmp_path)
     reg = BundleRegistrar(repo.engine, backend, expected_lane="test")
 
-    p0, n0 = logprob_parquet(_synthetic_sample(8))
-    p1, n1 = logprob_parquet(_synthetic_sample(12))
+    p0, n0, _ = logprob_parquet(_synthetic_sample(8))
+    p1, n1, _ = logprob_parquet(_synthetic_sample(12))
     shards = {"logprobs-0000.parquet": p0, "logprobs-0001.parquet": p1}
     bundle_id = reg.register(
         run_id=seeded["run_id"],
@@ -395,7 +395,10 @@ def test_table_manifest_fanout_one_row_per_queryable_artifact(seeded, tmp_path):
         )
     assert len(manifests) == 2
     assert {m["kind"] for m in manifests} == {"token_table"}
-    assert [m["row_count"] for m in manifests] == [n0, n1]
+    # keyed by shard NAME (the uri's last segment): the uri's sha256 directory segment (FIX #7
+    # content-addressing) makes raw uri ORDER a function of the parquet bytes — hash luck, not identity.
+    by_name = {m["uri"].rsplit("/", 1)[-1]: m["row_count"] for m in manifests}
+    assert by_name == {"logprobs-0000.parquet": n0, "logprobs-0001.parquet": n1}
     assert all(m["model_id"] == model_id for m in manifests)
 
 

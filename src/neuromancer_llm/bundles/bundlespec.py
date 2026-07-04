@@ -50,6 +50,42 @@ def bundle_uuid_for(*parts: object) -> uuid.UUID:
 
 
 @dataclass(frozen=True)
+class RunModelIdentityBlock:
+    """Manifest block 2 payload — the run -> fingerprint -> model-identity chain as VALUES (natural keys:
+    hashes + components), so the identity rows are re-registrable from the manifest alone (contract §5).
+    DB surrogate ids are deliberately excluded: a crawl-rebuild mints fresh ids, so embedding them would
+    manufacture false manifest<->DB disagreements under the §8 reconcile rule — the hashes are what an
+    identity compare quarantines on. `semantic_config` is the fingerprint-hash preimage (owner-ruled IN
+    2026-07-03): with it the fingerprints row is rebuildable, and the register-time recompute (FIX #4)
+    keeps any rebuild loud."""
+
+    run_key: str
+    fingerprint_hash_hex: str
+    declared_mode: str
+    semantic_config: str
+    identity_hash_hex: str
+    hf_repo: str
+    hf_revision: str
+    dtype_quant: str
+    tokenizer_hash_hex: str
+    serving_stack: str
+    serving_version: str
+    arch_family: str
+
+
+@dataclass(frozen=True)
+class TokenizationBlock:
+    """Manifest block 5 payload — the tokenizer_identities row's natural key (tokenizer_hash) + components,
+    plus the manifest-INTERNAL name of the queryable token-table shard (resolvable through blocks 6/8 with
+    zero ambient state; None = this bundle carries no token table)."""
+
+    tokenizer_hash_hex: str
+    hf_repo: str | None
+    hf_revision: str | None
+    token_table_shard: str | None
+
+
+@dataclass(frozen=True)
 class Shard:
     """One payload file in a bundle."""
 

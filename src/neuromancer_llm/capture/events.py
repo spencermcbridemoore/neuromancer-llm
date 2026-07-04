@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from sqlalchemy import Engine, text
 from sqlalchemy.engine import Connection
 
+from ..bundles.bundlespec import RunModelIdentityBlock, TokenizationBlock, canonical_json
 from ..bundles.registrar import BundleRegistrar, SeamIntegrityError, TableManifestSpec
 from ..composer import compose_run_key
 from ..config.semantic import build_semantic_config
@@ -363,10 +364,19 @@ def write_capture_event(
     )
 
 
-def logprob_parquet(sample: LogprobSample) -> tuple[bytes, int]:
+def logprob_parquet(
+    sample: LogprobSample, *, dataset_name: str = "logprobs", schema_major: int = 1
+) -> tuple[bytes, int, dict[str, str]]:
     """Serialize the next-token top-k distribution to a deterministic PARQUET shard (DuckDB-friendly lake
     bulk; ADR-0001/0002). One row per candidate token: rank, token_id, logprob, is_generated. This is the
-    queryable projection DERIVED from the verbatim response — the wire bytes remain the authority."""
+    queryable projection DERIVED from the verbatim response — the wire bytes remain the authority.
+
+    The shard is SELF-DESCRIBING (contract §5 block 14): a deterministic `neuromancer.*` str->str KV is
+    embedded in the parquet schema/footer metadata and returned so the caller records the SAME dict in
+    manifest block 14 and mirrors its sha256 to table_manifests.footer_kv_sha256. Only the neuromancer.*
+    subset is the contract — never the raw footer (whose ARROW:schema blob is pyarrow-version-dependent).
+    No timestamps/UUIDs: identical inputs must keep yielding identical bytes (resume idempotency + the
+    sealed-manifest immutability both ride on it)."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -379,9 +389,18 @@ def logprob_parquet(sample: LogprobSample) -> tuple[bytes, int]:
             "is_generated": pa.array([tid == sample.generated_token_id for tid, _ in pairs], pa.bool_()),
         }
     )
+    columns = [{"name": f.name, "type": str(f.type)} for f in table.schema]
+    footer_kv = {
+        "neuromancer.format": "neuromancer-bundle/1",
+        "neuromancer.dataset_name": dataset_name,
+        "neuromancer.schema_major": str(schema_major),
+        "neuromancer.columns": canonical_json(columns).decode("utf-8"),
+        "neuromancer.row_count": str(table.num_rows),
+    }
+    table = table.replace_schema_metadata(footer_kv)
     buf = io.BytesIO()
     pq.write_table(table, buf, compression="zstd")
-    return buf.getvalue(), table.num_rows
+    return buf.getvalue(), table.num_rows, footer_kv
 
 
 @dataclass(frozen=True)
@@ -568,11 +587,15 @@ def capture_logprob(
     )
 
     # 7. PARQUET bulk -> W1-W8 registrar -> table_manifests fan-out (one row per queryable parquet artifact).
-    pq_bytes, row_count = logprob_parquet(captured.sample)
+    pq_bytes, row_count, footer_kv = logprob_parquet(captured.sample, dataset_name=dataset_name)
     shard_name = "logprobs-0000.parquet"
     registrar = BundleRegistrar(
         repo.engine, backend, expected_lane=expected_lane, expected_uuid=expected_uuid
     )
+    # §5(a): manifest blocks 2/5 carry the SAME values that fed the registered identity rows above —
+    # natural keys (hashes + components), no DB surrogate ids (a crawl-rebuild mints fresh ids; §8's
+    # identity compare quarantines on the hashes). Blocks 4/6/7/12 are structurally N/A for a logprob
+    # table shard (no hook points / tensor metadata / chunks / tensor stats) and completeness says so.
     bundle_id = registrar.register(
         run_id=run_id,
         backend_id=backend_id,
@@ -580,6 +603,27 @@ def capture_logprob(
         partition_path=partition_path,
         shards={shard_name: pq_bytes},
         artifact_kinds={shard_name: "token_table"},
+        run_model_identity=RunModelIdentityBlock(
+            run_key=run_key,
+            fingerprint_hash_hex=fp_hash.hex(),
+            declared_mode=declared.value,
+            semantic_config=semantic_config,
+            identity_hash_hex=model_identity_hex,
+            hf_repo=hf_repo,
+            hf_revision=hf_revision,
+            dtype_quant=dtype_quant,
+            tokenizer_hash_hex=tokenizer_hash.hex(),
+            serving_stack=serving_stack,
+            serving_version=serving_version,
+            arch_family=arch_family,
+        ),
+        tokenization=TokenizationBlock(
+            tokenizer_hash_hex=tokenizer_hash.hex(),
+            hf_repo=hf_repo,
+            hf_revision=hf_revision,
+            token_table_shard=shard_name,
+        ),
+        not_applicable=("chunk_map", "hook_point_map", "payloads", "per_tensor_stats"),
         table_manifests=[
             TableManifestSpec(
                 shard_name=shard_name,
@@ -587,6 +631,7 @@ def capture_logprob(
                 row_count=row_count,
                 model_id=model_id,
                 schema_major=1,
+                footer_kv=footer_kv,
             )
         ],
     )

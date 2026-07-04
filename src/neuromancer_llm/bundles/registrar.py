@@ -28,7 +28,14 @@ from dataclasses import dataclass
 from sqlalchemy import Engine, text
 
 from ..storage.backends import StorageBackend
-from .bundlespec import Shard, bundle_uuid_for, sha256_bytes
+from .bundlespec import (
+    RunModelIdentityBlock,
+    Shard,
+    TokenizationBlock,
+    bundle_uuid_for,
+    canonical_json,
+    sha256_bytes,
+)
 from .manifest import build_manifest, manifest_bytes
 
 
@@ -36,7 +43,10 @@ from .manifest import build_manifest, manifest_bytes
 class TableManifestSpec:
     """One QUERYABLE parquet artifact -> one table_manifests row (resolves the Stage-1 per-artifact
     fan-out DEFER). `shard_name` selects which registered shard the manifest points at; the partition
-    columns (run_id/model_id/hook_point_id) are real FK columns, never parsed (ADR-0001)."""
+    columns (run_id/model_id/hook_point_id) are real FK columns, never parsed (ADR-0001). `footer_kv`
+    is the shard's embedded footer self-description KV (contract §5 block 14): the SAME dict is recorded
+    in manifest block 14 and sha256-mirrored to table_manifests.footer_kv_sha256 — one source object;
+    None keeps the column honestly NULL (a spec-less/generic shard embeds no KV)."""
 
     shard_name: str
     dataset_name: str
@@ -44,6 +54,7 @@ class TableManifestSpec:
     model_id: int | None = None
     hook_point_id: int | None = None
     schema_major: int = 1
+    footer_kv: Mapping[str, str] | None = None
 
 
 # Injectable crash points (the kill-test windows). None = run to completion.
@@ -161,6 +172,9 @@ class BundleRegistrar:
         schema_major: int = 1,
         artifact_kinds: Mapping[str, str] | None = None,
         table_manifests: Sequence[TableManifestSpec] | None = None,
+        run_model_identity: RunModelIdentityBlock | None = None,
+        tokenization: TokenizationBlock | None = None,
+        not_applicable: Sequence[str] = (),
         crash_at: str | None = None,
     ) -> int:
         """Run the W1-W8 ordering. Returns the bundle_id. Idempotent on resume for IDENTICAL bytes.
@@ -168,12 +182,28 @@ class BundleRegistrar:
         `artifact_kinds` maps shard name -> artifact_kind (default 'other'; the logprob lane passes
         'token_table' for the parquet). `table_manifests` declares ONE table_manifests row per QUERYABLE
         parquet artifact (the fan-out); when omitted, a single legacy manifest points at the first shard
-        (Stage-1 behaviour preserved for the generic seam tests)."""
+        (Stage-1 behaviour preserved for the generic seam tests). `run_model_identity` / `tokenization` /
+        `not_applicable` are the §5(a) identity payloads threaded VERBATIM into manifest blocks 2/5/13 —
+        plain values, never queried (the manifest stays buildable with zero ambient state); omitting them
+        yields an honestly-incomplete manifest (completeness `absent`), not a lie."""
         if crash_at is not None and crash_at not in CRASH_POINTS:
             raise ValueError(f"unknown crash point {crash_at!r}")
 
         bundle_uuid = bundle_uuid_for(run_id, dataset_name, partition_path)
         bundle_id = self._ensure_bundle(run_id, backend_id, bundle_uuid)
+
+        # Resolve the table_manifests specs BEFORE the manifest build: block 14 records each spec's
+        # footer_kv and the W6-W7 INSERT hashes the SAME object — one source of truth for the mirror.
+        specs = (
+            list(table_manifests)
+            if table_manifests is not None
+            else [
+                TableManifestSpec(
+                    shard_name=sorted(shards)[0], dataset_name=dataset_name, schema_major=schema_major
+                )
+            ]
+        )
+        shard_footer_kv = {s.shard_name: s.footer_kv for s in specs if s.footer_kv is not None}
 
         # Build the manifest (from in-memory shard hashes) BEFORE writing any blob, so the resume-
         # consistency check can fail loud before clobbering existing bytes (R2).
@@ -187,7 +217,14 @@ class BundleRegistrar:
         # capture<->artifact linkage stays on the FK, never the path (ADR docs/adr/0045).
         keys = [f"{partition_path}/{shard.sha256_hex}/{shard.name}" for shard in shard_objs]
         manifest = build_manifest(
-            producer="bundle-registrar", run_id=run_id, dataset_name=dataset_name, shards=shard_objs
+            producer="bundle-registrar",
+            run_id=run_id,
+            dataset_name=dataset_name,
+            shards=shard_objs,
+            run_model_identity=run_model_identity,
+            tokenization=tokenization,
+            not_applicable=not_applicable,
+            shard_footer_kv=shard_footer_kv or None,
         )
         mbytes = manifest_bytes(manifest)
         manifest_digest = sha256_bytes(mbytes)
@@ -250,25 +287,20 @@ class BundleRegistrar:
                 artifact_id_by_name[shard.name] = row.artifact_id
             if crash_at == "mid_register":
                 raise CrashInjected("W7: mid-register txn — must roll back atomically")
-            # ONE table_manifests row per QUERYABLE parquet artifact (Stage-1 DEFER resolved). When no
-            # explicit specs are given, fall back to a single manifest at the first shard (the generic
-            # seam tests' Stage-1 behaviour); the logprob lane passes a spec per queryable parquet file.
-            specs = (
-                list(table_manifests)
-                if table_manifests is not None
-                else [
-                    TableManifestSpec(
-                        shard_name=shard_objs[0].name, dataset_name=dataset_name, schema_major=schema_major
-                    )
-                ]
-            )
+            # ONE table_manifests row per QUERYABLE parquet artifact (Stage-1 DEFER resolved); specs were
+            # resolved before the manifest build so block 14 and this INSERT share one footer_kv object.
+            # footer_kv_sha256 mirrors sha256(canonical_json(footer_kv)) — the manifest-side recompute is
+            # identical, so file<->manifest<->DB cross-check on the SAME bytes (contract §5 block 14).
             for spec in specs:
+                fkv_sha = (
+                    sha256_bytes(canonical_json(dict(spec.footer_kv))) if spec.footer_kv is not None else None
+                )
                 conn.execute(
                     text(
                         "INSERT INTO neuro.table_manifests "
                         "(dataset_name, run_id, model_id, hook_point_id, schema_major, partition_path, "
-                        "row_count, artifact_id) "
-                        "VALUES (:ds, :r, :mid, :hp, :sm, :pp, :rc, :aid) "
+                        "row_count, artifact_id, footer_kv_sha256) "
+                        "VALUES (:ds, :r, :mid, :hp, :sm, :pp, :rc, :aid, :fkv) "
                         "ON CONFLICT (dataset_name, partition_path, artifact_id) DO NOTHING"
                     ),
                     {
@@ -280,6 +312,7 @@ class BundleRegistrar:
                         "pp": partition_path,
                         "rc": spec.row_count,
                         "aid": artifact_id_by_name[spec.shard_name],
+                        "fkv": fkv_sha,
                     },
                 )
             res = conn.execute(

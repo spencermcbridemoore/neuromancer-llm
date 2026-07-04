@@ -27,7 +27,7 @@ def _sample(n: int = 20, generated: int = 1000) -> LogprobSample:
 def _write_logprob_bundle(repo, backend, backend_id, run_id, sample) -> tuple[int, int]:
     """Write one real logprob parquet shard through the W1-W8 registrar with its table_manifests row
     (as the trusted writer path); returns (bundle_id, row_count). The read path then consumes it."""
-    pq_bytes, n = logprob_parquet(sample)
+    pq_bytes, n, _ = logprob_parquet(sample)
     reg = BundleRegistrar(repo.engine, backend, expected_lane="test")
     shard = "logprobs-0000.parquet"
     bundle_id = reg.register(
