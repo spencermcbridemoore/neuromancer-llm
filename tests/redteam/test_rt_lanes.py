@@ -92,9 +92,10 @@ def test_rt_provision_refuses_reprovision_and_unknown(engine):
 
 # --- L13: no behavior-by-env-flag; one implementation per concept ---------------------------------
 def test_rt_core_modules_read_no_env():
-    """L13: the identity / queue / determinism / capture CORE reads NO os.environ / getenv — behavior never
-    lives in an env var (env carries infrastructure config only: the DSN + lane, read in session.py /
-    migrations/env.py). A behavior-switching env read in these modules would be the SQ_*-style sin."""
+    """L13: the identity / queue / determinism / capture / cost-safety CORE reads NO os.environ / getenv —
+    behavior never lives in an env var (env carries infrastructure config only: the DSN + lane, read in
+    session.py / migrations/env.py). A behavior-switching env read in these modules would be the SQ_*-style
+    sin."""
     for rel in (
         "db/lanes.py",
         "db/canonical_instance.py",  # A1-15: an env-overridable pin would reintroduce rejected option (b)
@@ -102,6 +103,8 @@ def test_rt_core_modules_read_no_env():
         "capture/events.py",
         "capture/determinism.py",
         "bundles/registrar.py",
+        "storage/price_pin.py",  # A2-3: an env-overridable price would reintroduce rejected option (b)
+        "storage/quota.py",  # A2-3: the R3 $-ceiling split is owner-adjustable DATA, never an env switch
     ):
         src = (_SRC / rel).read_text(encoding="utf-8")
         assert "os.environ" not in src and "getenv" not in src, f"{rel} reads an env var (behavior-by-flag?)"
