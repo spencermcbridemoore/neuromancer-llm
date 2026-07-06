@@ -12,9 +12,11 @@ broader query surface lands with the workflows that consume it.
 
 from __future__ import annotations
 
+import datetime as _dt
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from decimal import Decimal
 
 from sqlalchemy import Engine, text
 
@@ -49,6 +51,31 @@ class Claim:
     job_id: int
     claim_token: uuid.UUID
     claim_seq: int
+
+
+@dataclass(frozen=True)
+class ReconcileResult:
+    """One spend reconciliation (A2-15 / R4(c)): the LEDGER-predicted total vs the ACTUAL billed figure, the
+    SIGNED divergence percent (positive = billed OVER predicted), and whether it breaches the threshold."""
+
+    predicted_usd: Decimal
+    billed_usd: Decimal
+    divergence_pct: Decimal
+    threshold_pct: Decimal
+    breach: bool
+
+
+@dataclass(frozen=True)
+class SpendReport:
+    """The `neuro spend report` result: per-run non-standing spend (run_id -> USD), the standing total, the
+    unattributed total (non-standing spend with NO run_id), and the grand total — the SU/$ accounting that
+    doubles as Jetstream2-renewal evidence (A2-15). The three buckets PARTITION every ledger row, so
+    sum(per_run) + standing_usd + unattributed_usd == total_usd always holds (no spend is hidden)."""
+
+    per_run: tuple[tuple[int, Decimal], ...]
+    standing_usd: Decimal
+    unattributed_usd: Decimal
+    total_usd: Decimal
 
 
 class Repository:
@@ -982,3 +1009,179 @@ class Repository:
                 ),
                 {"job": job_id},
             )
+
+    # --- spend governance (A2-15: the ledger + rate cards + run plans + reconcile) ----------------
+    def get_or_create_rate_card(
+        self,
+        *,
+        backend_or_lane: str,
+        unit: str,
+        rate: str | int | float | Decimal,
+        effective_from: _dt.datetime,
+    ) -> int:
+        """Register-first / idempotent rate card on the natural key UNIQUE(backend_or_lane, effective_from)
+        (the sibling raise-on-drift idiom, FIX #8 family): re-seeding the SAME (backend_or_lane,
+        effective_from) with a DIFFERENT unit/rate raises IdentityMismatchError — a rate card is an auditable
+        price of record, never silently repriced under a stable natural key (reprice = a NEW effective_from).
+        INPUT #2 storage default = azure-blob-storage / usd_per_gb / 0.0184; the PRODUCTION seed's
+        effective_from = the A2-1 provisioning date is applied at A2-1 deploy time (this helper is the
+        mechanism, unit-tested here). Registrar-role op (grants.sql)."""
+        rate_s = str(rate)
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.rate_cards (backend_or_lane, unit, rate, effective_from) "
+                    "VALUES (:b, :u, :r, :ef) "
+                    "ON CONFLICT (backend_or_lane, effective_from) DO NOTHING RETURNING rate_card_id"
+                ),
+                {"b": backend_or_lane, "u": unit, "r": rate_s, "ef": effective_from},
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            existing = (
+                conn.execute(
+                    text(
+                        "SELECT rate_card_id, unit, rate FROM neuro.rate_cards "
+                        "WHERE backend_or_lane = :b AND effective_from = :ef"
+                    ),
+                    {"b": backend_or_lane, "ef": effective_from},
+                )
+                .mappings()
+                .one()
+            )
+            if existing["unit"] != unit or Decimal(str(existing["rate"])) != Decimal(rate_s):
+                raise IdentityMismatchError(
+                    f"rate_card ({backend_or_lane!r}, effective_from={effective_from.isoformat()}) already "
+                    f"registered with unit={existing['unit']!r} rate={existing['rate']}, not unit={unit!r} "
+                    f"rate={rate_s} — a rate card is an auditable price of record; reprice with a NEW "
+                    "effective_from (register-first, raise-on-drift)."
+                )
+            return existing["rate_card_id"]
+
+    def record_spend(
+        self,
+        *,
+        run_id: int | None,
+        rate_card_id: int,
+        quantity: str | int | float | Decimal,
+        amount: str | int | float | Decimal,
+        is_standing: bool,
+    ) -> int:
+        """INSERT one spend_entries row — the ledger (A2-15). run_id is nullable (a STANDING infra charge,
+        e.g. monthly storage, has no run); rate_card_id is a NOT NULL FK so a cost never lands without a
+        priced basis, and a row is written ONLY when there IS spend (a free run writes none). is_standing
+        marks a recurring standing charge (storage) vs a per-run charge. Writer-role op (grants.sql)."""
+        with self.engine.begin() as conn:
+            return conn.execute(
+                text(
+                    "INSERT INTO neuro.spend_entries (run_id, rate_card_id, quantity, amount, is_standing) "
+                    "VALUES (:r, :rc, :q, :a, :s) RETURNING spend_entry_id"
+                ),
+                {"r": run_id, "rc": rate_card_id, "q": str(quantity), "a": str(amount), "s": is_standing},
+            ).scalar_one()
+
+    def record_run_plan(
+        self,
+        *,
+        run_id: int | None,
+        justification: str,
+        est_usd: str | int | float | Decimal | None = None,
+        est_su: str | int | float | Decimal | None = None,
+        est_gpu_hours: str | int | float | Decimal | None = None,
+    ) -> int:
+        """INSERT a run_plans justification row (A2-15): a plan justifies a run's spend above the budget
+        threshold and doubles as Jetstream2-renewal evidence. justification is NOT NULL; the est_* figures
+        (GPU-hours / USD / SU) are optional estimates."""
+        with self.engine.begin() as conn:
+            return conn.execute(
+                text(
+                    "INSERT INTO neuro.run_plans (run_id, justification, est_usd, est_su, est_gpu_hours) "
+                    "VALUES (:r, :j, :u, :su, :gh) RETURNING run_plan_id"
+                ),
+                {
+                    "r": run_id,
+                    "j": justification,
+                    "u": None if est_usd is None else str(est_usd),
+                    "su": None if est_su is None else str(est_su),
+                    "gh": None if est_gpu_hours is None else str(est_gpu_hours),
+                },
+            ).scalar_one()
+
+    def spend_report(self) -> SpendReport:
+        """Per-run non-standing spend (run_id -> USD) + the standing total + the UNATTRIBUTED total
+        (non-standing spend with NO run_id) + the grand total, from the ledger — the SU/$ accounting that
+        doubles as Jetstream2-renewal evidence (A2-15). The three buckets PARTITION every ledger row
+        (per_run = non-standing WITH run_id; standing = is_standing; unattributed = non-standing WITHOUT
+        run_id), so no spend is hidden: sum(per_run) + standing + unattributed == total."""
+        with self.engine.begin() as conn:
+            per_run_rows = (
+                conn.execute(
+                    text(
+                        "SELECT run_id, COALESCE(SUM(amount), 0) AS amt FROM neuro.spend_entries "
+                        "WHERE is_standing = false AND run_id IS NOT NULL GROUP BY run_id ORDER BY run_id"
+                    )
+                )
+                .mappings()
+                .all()
+            )
+            standing = conn.execute(
+                text("SELECT COALESCE(SUM(amount), 0) FROM neuro.spend_entries WHERE is_standing = true")
+            ).scalar_one()
+            unattributed = conn.execute(
+                text(
+                    "SELECT COALESCE(SUM(amount), 0) FROM neuro.spend_entries "
+                    "WHERE is_standing = false AND run_id IS NULL"
+                )
+            ).scalar_one()
+            total = conn.execute(
+                text("SELECT COALESCE(SUM(amount), 0) FROM neuro.spend_entries")
+            ).scalar_one()
+        per_run = tuple((int(r["run_id"]), Decimal(str(r["amt"]))) for r in per_run_rows)
+        return SpendReport(
+            per_run=per_run,
+            standing_usd=Decimal(str(standing)),
+            unattributed_usd=Decimal(str(unattributed)),
+            total_usd=Decimal(str(total)),
+        )
+
+    def reconcile_spend(
+        self,
+        *,
+        billed_usd: str | int | float | Decimal,
+        threshold_pct: str | int | float | Decimal = 20,
+        backend_or_lane: str | None = None,
+    ) -> ReconcileResult:
+        """Reconcile the ACTUAL billed spend (passed IN — there is NO live Cost-Management query until A2-1
+        provisioning) against the LEDGER-predicted total (SUM(spend_entries.amount), optionally restricted to
+        one backend_or_lane's rate cards), flagging a BREACH when |divergence| exceeds threshold_pct (default
+        20%, owner-adjustable — matches the pin's 20-30% headroom). R4(c). Signed divergence percent: a
+        positive value = billed OVER predicted."""
+        with self.engine.begin() as conn:
+            if backend_or_lane is None:
+                predicted_raw = conn.execute(
+                    text("SELECT COALESCE(SUM(amount), 0) FROM neuro.spend_entries")
+                ).scalar_one()
+            else:
+                predicted_raw = conn.execute(
+                    text(
+                        "SELECT COALESCE(SUM(se.amount), 0) FROM neuro.spend_entries se "
+                        "JOIN neuro.rate_cards rc ON rc.rate_card_id = se.rate_card_id "
+                        "WHERE rc.backend_or_lane = :b"
+                    ),
+                    {"b": backend_or_lane},
+                ).scalar_one()
+        predicted = Decimal(str(predicted_raw))
+        billed = Decimal(str(billed_usd))
+        threshold = Decimal(str(threshold_pct))
+        if predicted == 0:
+            # nothing predicted: any nonzero billing is an unbounded divergence -> a breach (>=100%).
+            divergence = Decimal(0) if billed == 0 else Decimal(100)
+        else:
+            divergence = (billed - predicted) / predicted * 100
+        return ReconcileResult(
+            predicted_usd=predicted,
+            billed_usd=billed,
+            divergence_pct=divergence,
+            threshold_pct=threshold,
+            breach=abs(divergence) > threshold,
+        )

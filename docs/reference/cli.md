@@ -36,9 +36,9 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro runs new` — STAGE 2 — mint a labeled run via the composer.
 - `neuro runs show` — STAGE 2 — show a run + its inputs/metrics.
 - `neuro spend` — Spend governance: report | plan | reconcile.
-- `neuro spend plan` — STAGE 2 — record a run_plan justification artifact (required above budget threshold).
-- `neuro spend reconcile` — STAGE 2 — nightly spend reconciliation.
-- `neuro spend report` — STAGE 2 — per-run SU/$ report (doubles as Jetstream2 renewal evidence).
+- `neuro spend plan` — Record a run_plans justification artifact (required above the budget threshold).
+- `neuro spend reconcile` — Reconcile ACTUAL billed spend against the ledger-predicted total; flag divergence (R4c).
+- `neuro spend report` — Per-run SU/$ + standing spend from the ledger (Jetstream2 renewal evidence).
 - `neuro storage` — Storage: put | mirror-audit | quota | sas-mint | pin.
 - `neuro storage mirror-audit` — STAGE 2 — monthly full-hash audit against the desktop NVMe mirror (ADR-0014).
 - `neuro storage pin` — STAGE 2 — promote bytes to cloud now (ADR-0034).
