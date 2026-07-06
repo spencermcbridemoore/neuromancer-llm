@@ -281,6 +281,15 @@ class Repository:
         repoint of the lake driver/URI under a stable backend_key = split-brain blob storage. It now matches
         the sibling registries: INSERT-only, raise IdentityMismatchError on ANY drift of
         (driver, lane, base_uri, is_cloud); identical re-register is idempotent."""
+        # A2-4 (GO §5): a cloud DRIVER must carry is_cloud=True. `driver` and `is_cloud` are otherwise
+        # decoupled (no CHECK links them), so a cost gate keying on the cloud driver / is_cloud could be
+        # fooled by an azure_blob row registered is_cloud=False. Refuse it at the registration choke point
+        # (the sibling raise-on-drift idiom) so no consumer of is_cloud can be misled by a decoupled row.
+        if driver == "azure_blob" and not is_cloud:
+            raise IdentityMismatchError(
+                f"storage_backend {backend_key!r} declares driver='azure_blob' but is_cloud=False — a cloud "
+                "driver must carry is_cloud=True (fail closed; register the cloud backend with is_cloud=True)."
+            )
         with self.engine.begin() as conn:
             inserted = conn.execute(
                 text(

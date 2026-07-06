@@ -81,7 +81,7 @@ def logprob(
     from ..db.lanes import ConfigurationError, LaneAssertionError
     from ..db.repository import IdentityMismatchError, Repository
     from ..db.session import make_verified_engine
-    from ..storage.backends import LocalFsBackend
+    from ..registry.backends import LOCAL_LAKE_BACKEND_KEY, LOCAL_LAKE_BASE_URI, make_backend
 
     try:
         if tokenizer_file is not None:
@@ -96,13 +96,13 @@ def logprob(
         engine = make_verified_engine(expected_lane=lane)
         repo = Repository(engine, expected_lane=lane)
         backend_id = repo.get_or_create_storage_backend(
-            "local-lake",
+            LOCAL_LAKE_BACKEND_KEY,
             driver="local_fs",
             lane="artifacts",
-            base_uri=str(Path(lake_root).resolve()),
+            base_uri=LOCAL_LAKE_BASE_URI,
             is_cloud=False,
         )
-        backend = LocalFsBackend(lake_root)
+        backend = make_backend("local_fs", base_uri=LOCAL_LAKE_BASE_URI, local_root=lake_root)
         client = VLLMClient(base_url, timeout=120.0)
         result = capture_logprob(
             repo=repo,
@@ -192,7 +192,7 @@ def replay(
     from ..db.lanes import ConfigurationError, LaneAssertionError
     from ..db.repository import IdentityMismatchError, Repository
     from ..db.session import make_verified_engine
-    from ..storage.backends import LocalFsBackend
+    from ..registry.backends import LOCAL_LAKE_BACKEND_KEY, LOCAL_LAKE_BASE_URI, make_backend
 
     try:
         if tokenizer_file is not None:
@@ -207,13 +207,13 @@ def replay(
         engine = make_verified_engine(expected_lane=lane)
         repo = Repository(engine, expected_lane=lane)
         backend_id = repo.get_or_create_storage_backend(
-            "local-lake",
+            LOCAL_LAKE_BACKEND_KEY,
             driver="local_fs",
             lane="artifacts",
-            base_uri=str(Path(lake_root).resolve()),
+            base_uri=LOCAL_LAKE_BASE_URI,
             is_cloud=False,
         )
-        backend = LocalFsBackend(lake_root)
+        backend = make_backend("local_fs", base_uri=LOCAL_LAKE_BASE_URI, local_root=lake_root)
         client = VLLMClient(base_url, timeout=120.0)
         stamp = origin or socket.gethostname()
 
