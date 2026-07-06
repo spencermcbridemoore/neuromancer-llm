@@ -43,7 +43,7 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro storage mirror-audit` — STAGE 2 — monthly full-hash audit against the desktop NVMe mirror (ADR-0014).
 - `neuro storage pin` — STAGE 2 — promote bytes to cloud now (ADR-0034).
 - `neuro storage put` — STAGE 2 — put bytes to a registered backend (quota fails closed).
-- `neuro storage quota` — STAGE 2 — per-prefix dollar-calibrated quota report (fails closed, ADR-0040).
+- `neuro storage quota` — Per-prefix dollar-calibrated storage quota report (fails closed, ADR-0040).
 - `neuro storage sas-mint` — STAGE 2 — mint a user-delegation SAS with surfaced expiry (ADR-0013).
 - `neuro workers` — Workers: run | claim | residency | preflight.
 - `neuro workers claim` — STAGE 2 — claim one job (SKIP LOCKED) via the repository.

@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from collections.abc import Sequence
+from dataclasses import dataclass
 from decimal import ROUND_FLOOR, Decimal
 
 from sqlalchemy import Connection, text
@@ -158,3 +159,40 @@ def check_quota(
             f"incoming {max(incoming_bytes, 0)} = {projected} bytes >= {ceiling} bytes (fail closed) — "
             "DENYING the write"
         )
+
+
+@dataclass(frozen=True)
+class QuotaLine:
+    """One per-prefix line of the storage quota report (A2-5 / `neuro storage quota`): the dollar ceiling, the
+    pin-resolved byte ceiling, and the current billable usage from the DB catalog."""
+
+    prefix: str
+    usd_ceiling: Decimal
+    byte_ceiling: int
+    used_bytes: int
+
+
+def quota_report(conn: Connection) -> list[QuotaLine]:
+    """The per-prefix storage quota report: for every budgeted R3 prefix, its dollar ceiling, its pin-resolved
+    byte ceiling (floor($ / tier0_price) x 10^9), and the current usage from the DB catalog. `used_bytes` is
+    the whole budget GROUP's combined footprint (SUM(artifacts.size_bytes) over ALL registered group members)
+    against the SHARED ceiling — the SAME basis check_quota enforces on — so a shared group (artifacts-dev +
+    artifacts-stage under one $1.50) reports the SAME combined usage on each of its lines and never shows
+    false per-prefix headroom while the group is over budget. Fails closed on an absent/expired price pin
+    (raised before any sizing). Sorted by prefix for a stable render (the CLI is a thin delegate over this)."""
+    lines: list[QuotaLine] = []
+    for prefix in sorted(_CEILING_USD):
+        ceiling = byte_ceiling_for_prefix(prefix)  # pin -> ConfigurationError before any sizing
+        ids: list[int] = []
+        for member in budget_group_for_prefix(prefix):  # the shared group (dev+stage share; rest singletons)
+            backend_id = conn.execute(
+                text("SELECT backend_id FROM neuro.storage_backends WHERE backend_key = :k"),
+                {"k": member},
+            ).scalar_one_or_none()
+            if backend_id is not None:
+                ids.append(int(backend_id))
+        used = usage_bytes(conn, ids) if ids else 0
+        lines.append(
+            QuotaLine(prefix=prefix, usd_ceiling=_CEILING_USD[prefix], byte_ceiling=ceiling, used_bytes=used)
+        )
+    return lines

@@ -18,10 +18,18 @@ the credential DSN, never a behavior switch); the driver policy lives in the sto
 from __future__ import annotations
 
 import os
+from decimal import Decimal
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
+
+from sqlalchemy import text
 
 from ..db.lanes import ConfigurationError
 from ..storage.backends import AzureBlobBackend, LocalFsBackend, StorageBackend
+from ..storage.quota import QuotaDeniedError, budget_group_for_prefix, check_quota
+
+if TYPE_CHECKING:
+    from ..db.repository import Repository
 
 # The portable, host-INDEPENDENT base_uri the capture lane records for the local lake. The PHYSICAL root is
 # host-specific (passed to LocalFsBackend as local_root); recording it in base_uri would drift across hosts
@@ -101,3 +109,120 @@ def make_backend(
         return AzureBlobBackend(container, connection_string=conn)
 
     raise ConfigurationError(f"unknown storage driver {driver!r} (fail closed; known: local_fs, azure_blob).")
+
+
+# 1 GB == 10^9 bytes (decimal) — the usd_per_gb rate basis (matches the price meter's "1 GB/Month").
+_GB_DECIMAL = Decimal(10**9)
+
+
+class QuotaGuardedBackend:
+    """Wraps a CLOUD StorageBackend so every put() CONSULTS the fail-CLOSED quota guard (C1) before the
+    upload and RECORDS a spend ledger row (C2) — so no cloud byte is written over budget, and no cloud cost
+    lands without a ledger row (A2-5). Because both the registrar and capture/_spill write via put(), one
+    wrapper guards BOTH surfaces uniformly, touching neither. get/exists/delete delegate unchanged; `.driver`
+    mirrors the inner cloud driver so downstream introspection is unchanged. Applied ONLY to cloud backends
+    (guard_capture_backend); local writes are returned unwrapped and are not quota-bound.
+
+    Order is fail-safe for cost: consult (deny -> nothing written) -> record the ledger row -> upload. The
+    row therefore precedes the cost (the GO's 'no cost without a ledger row'); the rare cost of a record that
+    is followed by a failed upload is an over-count (the conservative direction; the reconcile catches it).
+    Per-object storage $ is sub-cent and rounds toward 0 at Numeric(18,6) — the row is provenance; the honest
+    cost signal is the aggregate + the monthly reconcile (the C1 honest-limit note)."""
+
+    def __init__(
+        self,
+        inner: StorageBackend,
+        *,
+        repo: Repository,
+        prefix: str,
+        backend_ids: list[int],
+        rate_card_id: int,
+        rate: str | int | float | Decimal,
+    ) -> None:
+        self._inner = inner
+        self.driver = inner.driver  # gate/introspection still sees the cloud driver
+        self._repo = repo
+        self._prefix = prefix
+        self._backend_ids = list(backend_ids)
+        self._rate_card_id = rate_card_id
+        self._rate = Decimal(str(rate))
+
+    def put(self, key: str, data: bytes) -> str:
+        n = len(data)
+        with self._repo.engine.begin() as conn:
+            check_quota(conn, prefix=self._prefix, backend_ids=self._backend_ids, incoming_bytes=n)
+        gb = Decimal(n) / _GB_DECIMAL
+        self._repo.record_spend(
+            run_id=None,
+            rate_card_id=self._rate_card_id,
+            quantity=gb,
+            amount=gb * self._rate,
+            is_standing=True,
+        )
+        return self._inner.put(key, data)
+
+    def get(self, key: str) -> bytes:
+        return self._inner.get(key)
+
+    def exists(self, key: str) -> bool:
+        return self._inner.exists(key)
+
+    def delete(self, key: str) -> None:
+        self._inner.delete(key)
+
+
+def _resolve_group_backend_ids(repo: Repository, *, prefix: str, writing_backend_id: int) -> list[int]:
+    """Resolve the prefix's R3 budget group to the REGISTERED backend_ids to measure (the C1 bogus-id
+    existence check, C4 side): an un-budgeted prefix fails closed (budget_group_for_prefix raises
+    QuotaDeniedError); each group member that is registered is included; the writing backend is always
+    measured; and the set is never empty/bogus (fail closed) — so check_quota is never handed absence of
+    evidence. A member prefix not yet registered contributes 0 usage and is simply omitted (no under-count)."""
+    members = budget_group_for_prefix(prefix)  # QuotaDeniedError (fail closed) if the prefix is un-budgeted
+    ids: list[int] = []
+    with repo.engine.connect() as conn:
+        for member in members:
+            backend_id = conn.execute(
+                text("SELECT backend_id FROM neuro.storage_backends WHERE backend_key = :k"),
+                {"k": member},
+            ).scalar_one_or_none()
+            if backend_id is not None:
+                ids.append(int(backend_id))
+    if writing_backend_id not in ids:
+        ids.append(int(writing_backend_id))  # the backend being written is always measured
+    if not ids:  # defensive: never certify a write against an empty/bogus backend set (the C1 fail-open)
+        raise QuotaDeniedError(
+            f"no registered backend resolves for the budget group of prefix {prefix!r} — refusing to guard "
+            "a cloud write against an empty backend set (fail closed)."
+        )
+    return ids
+
+
+def guard_capture_backend(
+    repo: Repository | None,
+    *,
+    backend_key: str,
+    backend_id: int,
+    inner: StorageBackend,
+    rate_card_id: int,
+    rate: str | int | float | Decimal,
+) -> StorageBackend:
+    """Wrap `inner` in a QuotaGuardedBackend IFF it is a CLOUD driver (driver == 'azure_blob'), gating on the
+    DRIVER not is_cloud (they are decoupled — a real-cloud row can carry is_cloud=False, tests/seam). A
+    local_fs backend is returned UNWRAPPED (not quota-bound); its repo is never consulted. For a cloud
+    backend, resolve the R3 budget group's registered backend_ids first (fail closed on an un-budgeted prefix
+    or an empty set — the C1 bogus-id existence check)."""
+    if inner.driver != "azure_blob":
+        return inner
+    budget_group_for_prefix(
+        backend_key
+    )  # fail closed (QuotaDeniedError) on an un-budgeted prefix, before repo
+    assert repo is not None, "a cloud (azure_blob) backend requires a repo for the quota consult + spend"
+    backend_ids = _resolve_group_backend_ids(repo, prefix=backend_key, writing_backend_id=backend_id)
+    return QuotaGuardedBackend(
+        inner,
+        repo=repo,
+        prefix=backend_key,
+        backend_ids=backend_ids,
+        rate_card_id=rate_card_id,
+        rate=rate,
+    )
