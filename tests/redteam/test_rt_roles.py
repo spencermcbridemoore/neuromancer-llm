@@ -69,6 +69,58 @@ def test_rt_registrar_denied_worker_lifecycle(provisioned_roles, role_url, rt):
     assert rt.exec_as(r, "UPDATE neuro.bundles SET state='sealed' WHERE bundle_id=-1") is False
 
 
+def test_rt_backup_freshness_grant_boundary(provisioned_roles, role_url, rt):
+    """L7 (A2-10 durability): the backup-freshness signal leans on a grant ASYMMETRY — the writer bumps the
+    operational health columns but can neither seed the row nor forge the `stale_after` sentinel; the row is
+    seeded ONCE by registrar/admin. A grant widened to stale_after or INSERT would let a compromised worker
+    fake 'backup fresh' and slip a stale-DB cloud write past the ADR-0020 gate."""
+    writer = role_url(provisioned_roles, "neuro_writer")
+    registrar = role_url(provisioned_roles, "neuro_registrar")
+    reader = role_url(provisioned_roles, "neuro_reader")
+    nope = {"k": "__rt_nope__"}  # 0-row WHERE: the column grant is checked before a row is touched
+    # writer GRANTED the three operational columns (grants.sql:48)
+    assert (
+        rt.exec_as(writer, "UPDATE neuro.system_health SET status=status WHERE health_key=:k", nope) is True
+    )
+    assert (
+        rt.exec_as(writer, "UPDATE neuro.system_health SET measured_at=measured_at WHERE health_key=:k", nope)
+        is True
+    )
+    assert (
+        rt.exec_as(writer, "UPDATE neuro.system_health SET detail=detail WHERE health_key=:k", nope) is True
+    )
+    # writer DENIED the sentinel column and the seed INSERT (un-forgeable freshness contract)
+    assert (
+        rt.exec_as(writer, "UPDATE neuro.system_health SET stale_after=stale_after WHERE health_key=:k", nope)
+        is False
+    )
+    assert (
+        rt.exec_as(
+            writer,
+            "INSERT INTO neuro.system_health (health_key, status) VALUES ('__rt_w__','blocked') "
+            "ON CONFLICT (health_key) DO NOTHING",
+        )
+        is False
+    )
+    # writer GRANTED the probe_reports audit INSERT (grants.sql:30)
+    assert (
+        rt.exec_as(writer, "INSERT INTO neuro.probe_reports (probe_key, status) VALUES ('__rt_w__','ok')")
+        is True
+    )
+    # registrar GRANTED the seed INSERT; reader DENIED any system_health write
+    assert (
+        rt.exec_as(
+            registrar,
+            "INSERT INTO neuro.system_health (health_key, status) VALUES ('__rt_seed__','blocked') "
+            "ON CONFLICT (health_key) DO NOTHING",
+        )
+        is True
+    )
+    assert (
+        rt.exec_as(reader, "UPDATE neuro.system_health SET status=status WHERE health_key=:k", nope) is False
+    )
+
+
 def test_rt_reader_is_strictly_select_only(provisioned_roles, role_url, rt):
     """L7: neuro_reader holds NO write grant — INSERT on a registry table, UPDATE on an operational table,
     and DELETE are all DENIED (every consumption surface uses this role)."""
