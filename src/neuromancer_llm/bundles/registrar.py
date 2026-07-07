@@ -27,6 +27,7 @@ from dataclasses import dataclass
 
 from sqlalchemy import Engine, text
 
+from ..governance.health import assert_durability_ok
 from ..storage.backends import StorageBackend
 from .bundlespec import (
     RunModelIdentityBlock,
@@ -94,6 +95,8 @@ class BundleRegistrar:
 
         self.engine = verify_engine(engine, expected_lane=expected_lane, expected_uuid=expected_uuid)
         self.backend = backend
+        # A2-11b: the verified lane — the durability consult gates CANONICAL cloud writes only (ADR-0020).
+        self._expected_lane = expected_lane
 
     def _ensure_bundle(self, run_id: int, backend_id: int, bundle_uuid) -> int:
         # C2 (audit correction 2026-07-02): this was the ONLY registry adopting an existing row without
@@ -122,18 +125,26 @@ class BundleRegistrar:
                 )
             return row.bundle_id
 
-    def _assert_resume_consistent(self, bundle_id: int, manifest_digest: bytes) -> None:
+    def _assert_resume_consistent(self, bundle_id: int, manifest_digest: bytes) -> bool:
         """R2 (fail-loud BEFORE clobbering blobs): a sealed/registered bundle's manifest is immutable, so
-        re-registering DIFFERENT bytes for the same identity is refused before any blob is overwritten."""
+        re-registering DIFFERENT bytes for the same identity is refused before any blob is overwritten.
+
+        Returns True iff the bundle is already SEALED — manifest_sha256 is set atomically at _seal and stays
+        set through 'registered', so a non-NULL value means the blobs are durable / GC-exempt (ADR-0010). A2-11b
+        uses this to skip the durability consult on an already-durable resume (finishing/re-saving durable
+        bytes must not be blocked by a health flip — Option A)."""
         with self.engine.connect() as conn:
             row = conn.execute(
                 text("SELECT manifest_sha256 FROM neuro.bundles WHERE bundle_id = :b"), {"b": bundle_id}
             ).one()
-        if row.manifest_sha256 is not None and bytes(row.manifest_sha256) != manifest_digest:
+        if row.manifest_sha256 is None:
+            return False
+        if bytes(row.manifest_sha256) != manifest_digest:
             raise SeamIntegrityError(
                 f"bundle {bundle_id} is already sealed with a different manifest — refusing to re-register "
                 f"divergent bytes for the same identity (R2)."
             )
+        return True
 
     def _seal(self, bundle_id: int, manifest_sha256: bytes) -> None:
         with self.engine.begin() as conn:
@@ -228,7 +239,17 @@ class BundleRegistrar:
         )
         mbytes = manifest_bytes(manifest)
         manifest_digest = sha256_bytes(mbytes)
-        self._assert_resume_consistent(bundle_id, manifest_digest)
+        already_durable = self._assert_resume_consistent(bundle_id, manifest_digest)
+
+        # A2-11b (ADR-0020, Option A): gate the CANONICAL cloud writes on the durability interlock. Consult
+        # ABOVE the first backend.put so a stale/flipped system_health status stops a NEW bundle before ANY
+        # blob is put or sealed (the W1-W5 writes), not merely at the later register txn. Canonical-lane ONLY
+        # (ADR-0020 governs canonical writes; owner-ruled 2026-07-07) and RESUME-AWARE — an already-durable
+        # bundle (sealed/registered: blobs exist, GC-exempt) is NOT gated, so finishing/re-saving durable
+        # bytes is never blocked by a flip. This is minimal over hoisting the :256-257 register short-circuit,
+        # which stays untouched (its idempotent-resume return still fires downstream).
+        if self._expected_lane == "canonical" and not already_durable:
+            assert_durability_ok(self.engine)
 
         # W1-W3: write shards to blob, hashing each.
         for i, (shard, key) in enumerate(zip(shard_objs, keys, strict=True)):

@@ -41,7 +41,9 @@ from ..bundles.registrar import BundleRegistrar, SeamIntegrityError, TableManife
 from ..composer import compose_run_key
 from ..config.semantic import build_semantic_config
 from ..db.identity import content_hash, fingerprint_hash, model_identity_hash, sha256_bytes
+from ..db.lanes import ConfigurationError
 from ..db.repository import IdentityMismatchError, Repository
+from ..governance.health import assert_durability_ok
 from ..storage.backends import StorageBackend
 from .adapters.vllm import LogprobSample, VLLMClient
 from .determinism import (
@@ -476,6 +478,19 @@ def capture_logprob(
     worker, identity/bundle registration on the control plane — belongs with the distributed worker runtime
     (workers/runtime.py); not built now.
     """
+    # A2-11b: the durability consult (below) and the internal bundle registrar gate/verify on the lane, which
+    # must be TRUSTWORTHY — `expected_lane` is a free param, but `repo` was verify_engine'd for its OWN lane at
+    # construction. A param that DISAGREES with the repo's verified lane is a caller misconfiguration that must
+    # fail CLOSED here, BEFORE any durable write — else a canonical repo called with expected_lane='test' would
+    # skip the canonical consult and write identity/fingerprint/wire rows to the canonical DB ungated (the
+    # BundleRegistrar re-verify only errors later, after those writes). After this, expected_lane == the
+    # verified lane, so the canonical gate is trustworthy.
+    if expected_lane != repo.expected_lane:
+        raise ConfigurationError(
+            f"capture_logprob expected_lane={expected_lane!r} disagrees with the repository's verified lane "
+            f"{repo.expected_lane!r} — refusing (fail closed; the durability consult must trust the lane)."
+        )
+
     prompt = prompt if prompt is not None else DEFAULT_TARGET_PROMPT
     # C5: the substrate_key is a FUNCTION of the flag + hardware, never a free string that could disagree.
     substrate_key = derive_substrate_key(compute_capability, batch_invariant=batch_invariant)
@@ -483,6 +498,13 @@ def capture_logprob(
     # 1. CAPTURE the true wire payload verbatim (request + response bytes), with the derived distribution.
     served = client.served_model()
     captured = client.next_token_logprobs_capture(prompt, model=served, n_logprobs=n_logprobs, seed=seed)
+
+    # A2-11b (ADR-0020): gate the CANONICAL capture on the durability interlock, BEFORE the FIRST durable
+    # write (the register-first identity INSERTs below). A stale/flipped system_health status refuses the
+    # capture before any identity, fingerprint, wire-payload, parquet, or bundle row is persisted. Canonical-
+    # lane ONLY (owner-ruled 2026-07-07); the bundle registrar re-consults before its blob puts.
+    if expected_lane == "canonical":
+        assert_durability_ok(repo.engine)
 
     # 2. IDENTITY — register-first, fail-loud (registrar role; ADR-0005). INSERT-only; raise on mismatch.
     tokenizer_id = repo.register_tokenizer_identity(

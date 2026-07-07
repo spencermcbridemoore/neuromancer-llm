@@ -88,6 +88,9 @@ class Repository:
         from .session import verify_engine
 
         self.engine = verify_engine(engine, expected_lane=expected_lane, expected_uuid=expected_uuid)
+        # The VERIFIED lane (assert_lane confirmed the engine's identity matches it) — the trustworthy basis
+        # for the A2-11b durability consult, which must never trust a free caller-passed lane (capture side).
+        self.expected_lane = expected_lane
 
     # --- seed helpers (minimal; full registry write paths are registrar-side) -------------------
     def create_actor(self, actor_key: str, *, kind: str = "agent", display_name: str | None = None) -> int:
