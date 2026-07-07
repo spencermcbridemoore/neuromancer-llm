@@ -136,7 +136,12 @@ def test_rt_no_write_path_on_unverified_engine():
         src = py.read_text(encoding="utf-8")
         if "create_engine(" in src and rel != "db/session.py":
             create_engine_files.append(rel)
-        if "make_engine(" in src and rel not in ("db/session.py", "cli/db.py"):
+        # db/restore.py: the A2-9 restore-drill's raw path is SANCTIONED (justified here per the convention) —
+        # it scrubs a SCRATCH clone's identity, a pre-identity DESTRUCTIVE-REWRITE path that cannot go through
+        # verify_engine (which would require the very canonical identity the drill rewrites). The safety is not
+        # identity verification but a TARGET guard: restore_drill refuses without --confirm-scratch AND if the
+        # scratch DSN resolves to the canonical NEURO_DATABASE_URL (db/restore.py).
+        if "make_engine(" in src and rel not in ("db/session.py", "cli/db.py", "db/restore.py"):
             make_engine_callers.append(rel)
         if rel == "cli/db.py":
             cli_db_make_engine_count = src.count("make_engine(")

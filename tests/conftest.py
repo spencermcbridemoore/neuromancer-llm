@@ -147,6 +147,44 @@ def engine(pg_url):
     eng.dispose()
 
 
+@pytest.fixture
+def scratch_db(pg_url):
+    """An ISOLATED throwaway database for the A2-9 restore-drill: the drill MUTATES `database_identity`
+    (the identity scrub), so it must NOT share the session 'test' identity row. Created + full-DDL-applied
+    + dropped per test (pg-marked via the probes that use it)."""
+    import uuid as _uuid
+    from pathlib import Path
+
+    from sqlalchemy.engine import make_url
+
+    name = f"scratch_a2_9_{_uuid.uuid4().hex[:12]}"
+    admin = create_engine(pg_url, future=True, isolation_level="AUTOCOMMIT")
+    with admin.connect() as c:
+        c.exec_driver_sql(f'CREATE DATABASE "{name}"')  # noqa: S608 — name is a generated hex, not user input
+    admin.dispose()
+    # render_as_string(hide_password=False): str(URL) masks the password as '***' (would break the connection)
+    scratch_url = make_url(pg_url).set(database=name).render_as_string(hide_password=False)
+    ddl = Path("tests/reference/phase3-ddl.sql").read_text(encoding="utf-8")
+    seng = create_engine(scratch_url, future=True)
+    with seng.begin() as c:
+        # the frozen schema — a faithful stand-in for a restored cluster. exec_driver_sql runs through
+        # psycopg's paramstyle, so a literal % (format()/comments in the DDL) must be escaped %% or psycopg
+        # rejects it as a bad placeholder.
+        c.exec_driver_sql(ddl.replace("%", "%%"))
+    seng.dispose()
+    try:
+        yield scratch_url
+    finally:
+        admin = create_engine(pg_url, future=True, isolation_level="AUTOCOMMIT")
+        with admin.connect() as c:
+            c.exec_driver_sql(
+                f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                f"WHERE datname = '{name}' AND pid <> pg_backend_pid()"  # noqa: S608 — generated name
+            )
+            c.exec_driver_sql(f'DROP DATABASE IF EXISTS "{name}"')  # noqa: S608 — generated name
+        admin.dispose()
+
+
 def _truncate_all(eng) -> None:
     with eng.begin() as conn:
         conn.execute(

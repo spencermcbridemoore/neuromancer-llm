@@ -15,7 +15,7 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro db` — Database control plane: migrate, provision, roles, verify.
 - `neuro db migrate` — Run `alembic upgrade head` — materialize the canonical schema (migrations own it, never create_all).
 - `neuro db provision` — Write the singleton lanes-v2 identity row on a provably-empty, just-migrated DB (ADR-0006).
-- `neuro db restore-drill` — Scripted quarterly restore drill (ADR-0007 durability) — not yet built (go-remote Stage A, A2-9).
+- `neuro db restore-drill` — Restore drill: scrub a restored clone's identity so a verbatim canonical backup verifies NON-canonical (A2-9).
 - `neuro db roles` — Create the four roles (admin/writer/reader/registrar) then apply phase3-grants.sql (ADR-0007).
 - `neuro db verify` — Positively verify the connected DB's identity; fail closed on any mismatch (ADR-0006).
 - `neuro derive` — Derived-satellite promotion: run | reparity.

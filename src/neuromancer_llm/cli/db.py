@@ -8,8 +8,6 @@ from collections.abc import Iterator
 
 import typer
 
-from . import stage2
-
 app = typer.Typer(no_args_is_help=True, help="Database control plane: migrate, provision, roles, verify.")
 
 
@@ -100,6 +98,22 @@ def verify(
 
 
 @app.command("restore-drill")
-def restore_drill() -> None:
-    """Scripted quarterly restore drill (ADR-0007 durability) — not yet built (go-remote Stage A, A2-9)."""
-    stage2("db restore-drill")
+def restore_drill(
+    scratch_url: str = typer.Option(
+        ..., help="the SCRATCH DB DSN to scrub — must NOT resolve to the canonical NEURO_DATABASE_URL"
+    ),
+    confirm_scratch: bool = typer.Option(
+        False,
+        "--confirm-scratch",
+        help="affirm the target is a throwaway (required — the drill rewrites database_identity)",
+    ),
+) -> None:
+    """Restore drill: scrub a restored clone's identity so a verbatim canonical backup verifies NON-canonical (A2-9)."""
+    from ..db.restore import restore_drill as _drill
+
+    with _clean_fail():
+        result = _drill(scratch_url, confirm_scratch=confirm_scratch)
+        typer.echo(
+            f"restore-drill: scrubbed clone -> non-canonical "
+            f"(instance_uuid {result['old_uuid']} -> {result['new_uuid']}; cloned_from recorded)"
+        )
