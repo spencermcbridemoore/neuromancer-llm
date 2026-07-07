@@ -161,8 +161,14 @@ _PRODUCT_ENV = [
     (
         "NEURO_NTFY_TOPIC",
         "The alert-channel topic env var (ADR-0019). Only the VARIABLE NAME is documented — the topic "
-        "value IS the credential (a secret; never in git or generated docs). Not yet consumed: the "
-        "notify() send is unbuilt (go-remote Stage A, A2-12); today only the constant name exists.",
+        "value IS the credential (a secret; never in git or generated docs). Consumed by "
+        "governance.notify() (the stdlib ntfy.sh push, go-remote Stage A A2-12); a missing topic fails "
+        "loud (ConfigurationError, no default-topic fallback).",
+    ),
+    (
+        "NEURO_NTFY_BASE_URL",
+        "Optional ntfy endpoint override for governance.notify() (default https://ntfy.sh); set to a "
+        "self-hosted ntfy server. Infrastructure config (which endpoint), never a behavior switch.",
     ),
     (
         "AZURE_STORAGE_CONNECTION_STRING",
