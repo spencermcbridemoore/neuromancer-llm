@@ -39,6 +39,12 @@ if TYPE_CHECKING:
     from sqlalchemy import Engine
 
 
+# The health_keys assert_durability_ok consults — enforced against governance/durability.py::DURABILITY_KEYS
+# (a test asserts GATE_CONSULTED_KEYS <= DURABILITY_KEYS) so a NEW gate branch cannot ship without its
+# provisioning row. Today: backup_freshness only; the WAL-lag arm (item 3) adds 'wal_lag' HERE and a branch.
+GATE_CONSULTED_KEYS: frozenset[str] = frozenset({BACKUP_FRESHNESS_KEY})
+
+
 class DurabilityGateError(RuntimeError):
     """The durability interlock is BLOCKING a write (ADR-0020): the DB backup is missing, unprovisioned,
     mis-provisioned (drift), already-failed, or stale. Fail LOUD — a caller must not proceed to a canonical

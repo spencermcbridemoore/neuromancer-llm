@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import datetime as _dt
 
-from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from ..db.lanes import ConfigurationError
@@ -62,15 +61,11 @@ def seed_backup_freshness(conn: Connection) -> bool:
         on NULL). The authoritative comparison basis is still the repo constant, never this column.
 
     Returns True iff it inserted (False == already seeded). Commits (mirrors db/restore.py::scrub_identity).
+
+    Delegates to the single durability seeding implementation (GO-D-seed, governance/durability.py::seed_row)
+    so there is exactly one seed path across every durability row — behavior is unchanged (born blocked/epoch,
+    the same born detail, the pin resolved BEFORE any write, commit-on-bare-Connection).
     """
-    stale = resolve_backup_stale_after()  # fail closed if the pin is absent, before any write
-    result = conn.execute(
-        text(
-            "INSERT INTO neuro.system_health (health_key, status, detail, measured_at, stale_after) "
-            "VALUES (:k, 'blocked', :d, 'epoch'::timestamptz, :stale) "
-            "ON CONFLICT (health_key) DO NOTHING"
-        ),
-        {"k": BACKUP_FRESHNESS_KEY, "d": "seeded; awaiting first verified backup", "stale": stale},
-    )
-    conn.commit()
-    return bool(result.rowcount)
+    from .durability import BACKUP_FRESHNESS_ROW, seed_row  # function-local: no durability<-freshness cycle
+
+    return seed_row(conn, BACKUP_FRESHNESS_ROW)

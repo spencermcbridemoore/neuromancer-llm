@@ -73,7 +73,10 @@ def test_rt_backup_freshness_grant_boundary(provisioned_roles, role_url, rt):
     """L7 (A2-10 durability): the backup-freshness signal leans on a grant ASYMMETRY — the writer bumps the
     operational health columns but can neither seed the row nor forge the `stale_after` sentinel; the row is
     seeded ONCE by registrar/admin. A grant widened to stale_after or INSERT would let a compromised worker
-    fake 'backup fresh' and slip a stale-DB cloud write past the ADR-0020 gate."""
+    fake 'backup fresh' and slip a stale-DB cloud write past the ADR-0020 gate. Corollary (GO-D-seed): the
+    `neuro db durability reconcile` (stale_after UPDATE) is ADMIN-ONLY — registrar holds INSERT-all but NO
+    system_health UPDATE, so it is denied the sentinel re-align exactly like the writer (adding a registrar
+    stale_after grant to 'fix' that would reopen this exact forgery surface)."""
     writer = role_url(provisioned_roles, "neuro_writer")
     registrar = role_url(provisioned_roles, "neuro_registrar")
     reader = role_url(provisioned_roles, "neuro_reader")
@@ -118,6 +121,27 @@ def test_rt_backup_freshness_grant_boundary(provisioned_roles, role_url, rt):
     )
     assert (
         rt.exec_as(reader, "UPDATE neuro.system_health SET status=status WHERE health_key=:k", nope) is False
+    )
+    assert (
+        rt.exec_as(
+            reader,
+            "INSERT INTO neuro.system_health (health_key, status) VALUES ('__rt_r__','blocked') "
+            "ON CONFLICT (health_key) DO NOTHING",
+        )
+        is False
+    )  # reader cannot seed either — pin the reader seed-forgery denial alongside the writer's
+    # GO-D-seed reconcile (stale_after UPDATE) is ADMIN-ONLY: registrar is DENIED it (INSERT != UPDATE), and
+    # only neuro_admin (GRANT ALL) may re-align the sentinel — pins reconcile's grade to admin, not registrar.
+    admin = role_url(provisioned_roles, "neuro_admin")
+    assert (
+        rt.exec_as(
+            registrar, "UPDATE neuro.system_health SET stale_after=stale_after WHERE health_key=:k", nope
+        )
+        is False
+    )
+    assert (
+        rt.exec_as(admin, "UPDATE neuro.system_health SET stale_after=stale_after WHERE health_key=:k", nope)
+        is True
     )
 
 

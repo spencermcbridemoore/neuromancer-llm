@@ -13,6 +13,10 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro capture replay` — Replicate a capture for divergence measurement (ADR-0004 MEASURED): capture the experiment, capture a
 - `neuro capture show` — Read a captured run's logprobs from the lake AS A SELECT-ONLY CONSUMER: locate the parquet via
 - `neuro db` — Database control plane: migrate, provision, roles, verify.
+- `neuro db durability` — Durability-gate rows (ADR-0020): seed | reconcile | status.
+- `neuro db durability reconcile` — Re-align each durability row's stale_after sentinel to the pinned bound (ADMIN-ONLY). Run after a
+- `neuro db durability seed` — Seed the ADR-0020 durability rows born fail-closed (idempotent; registrar/admin). A2-16 provisioning.
+- `neuro db durability status` — Report each durability row (present / status / stale_after drift). Exit non-zero on any missing or
 - `neuro db migrate` — Run `alembic upgrade head` — materialize the canonical schema (migrations own it, never create_all).
 - `neuro db provision` — Write the singleton lanes-v2 identity row on a provably-empty, just-migrated DB (ADR-0006).
 - `neuro db restore-drill` — Restore drill: scrub a restored clone's identity so a verbatim canonical backup verifies NON-canonical (A2-9).

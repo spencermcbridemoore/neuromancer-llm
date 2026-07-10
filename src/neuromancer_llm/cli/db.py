@@ -117,3 +117,96 @@ def restore_drill(
             f"restore-drill: scrubbed clone -> non-canonical "
             f"(instance_uuid {result['old_uuid']} -> {result['new_uuid']}; cloned_from recorded)"
         )
+
+
+# --- durability rows (ADR-0020): the one provisioning surface (GO-D-seed) --------------------------------
+durability_app = typer.Typer(
+    no_args_is_help=True, help="Durability-gate rows (ADR-0020): seed | reconcile | status."
+)
+app.add_typer(durability_app, name="durability")
+
+
+@durability_app.command()
+def seed(
+    lane: str = typer.Option("canonical", help="the lane this DB must positively be before seeding"),
+) -> None:
+    """Seed the ADR-0020 durability rows born fail-closed (idempotent; registrar/admin). A2-16 provisioning."""
+    from ..db.session import make_verified_engine
+    from ..governance.durability import seed_all
+
+    with _clean_fail():
+        # verified write engine (R1): lane + repo-pinned uuid checked at construction, fail-closed — the
+        # durability rows are POST-provision state, so this is a verified write path, not pre-identity bootstrap.
+        with make_verified_engine(expected_lane=lane).connect() as conn:
+            inserted = seed_all(conn)
+        new = sorted(k for k, v in inserted.items() if v)
+        present = sorted(k for k, v in inserted.items() if not v)
+        typer.echo(
+            f"durability seed (lane={lane}): {len(new)} inserted, {len(present)} already present"
+            + (f"; inserted={new}" if new else "")
+            + (f"; present={present}" if present else "")
+        )
+
+
+@durability_app.command()
+def reconcile(
+    lane: str = typer.Option("canonical", help="the lane this DB must positively be before reconciling"),
+) -> None:
+    """Re-align each durability row's stale_after sentinel to the pinned bound (ADMIN-ONLY). Run after a
+    bound-constant change (auditable commit + ADR); never fills a NULL (that is `seed`'s job)."""
+    from ..db.session import make_verified_engine
+    from ..governance.durability import reconcile_all
+
+    with _clean_fail():
+        with make_verified_engine(expected_lane=lane).connect() as conn:
+            result = reconcile_all(conn)
+        missing = sorted(k for k, (is_present, _) in result.items() if not is_present)
+        reconciled = sum(cnt for _, cnt in result.values())
+        typer.echo(f"durability reconcile (lane={lane}): {reconciled} sentinel(s) re-aligned to the pin")
+        if missing:
+            typer.secho(
+                f"durability reconcile: MISSING rows (run `neuro db durability seed`): {missing}",
+                fg=typer.colors.RED,
+                err=True,
+            )
+            raise typer.Exit(code=1)
+
+
+@durability_app.command()
+def status(
+    lane: str = typer.Option("canonical", help="the lane this DB must positively be"),
+) -> None:
+    """Report each durability row (present / status / stale_after drift). Exit non-zero on any missing or
+    drifted row — the CI / A2-16-provisioning check."""
+    from ..db.session import make_verified_engine
+    from ..governance.durability import status_all
+
+    with _clean_fail():
+        # verified engine: confirms this is THE canonical instance (lane + repo-pinned uuid) before reporting;
+        # status only reads, but a provisioning/CI check should assert it is looking at the intended DB.
+        with make_verified_engine(expected_lane=lane).connect() as conn:
+            rows = status_all(conn)
+        for r in rows:
+            if not r.present:
+                typer.secho(f"  {r.health_key}: MISSING (run `seed`)", fg=typer.colors.RED)
+            elif r.drift and r.stale_after is None:
+                # a present-but-NULL sentinel (gate branch-2, unprovisioned): reconcile CANNOT fill a NULL (M1),
+                # so the remedy is a reseed / admin repair, NOT `reconcile` — don't send the operator to a dead end.
+                typer.secho(
+                    f"  {r.health_key}: UNPROVISIONED stale_after=NULL (reseed / admin repair)",
+                    fg=typer.colors.RED,
+                )
+            elif r.drift:
+                typer.secho(
+                    f"  {r.health_key}: DRIFT status={r.status} stale_after={r.stale_after} (run `reconcile`)",
+                    fg=typer.colors.YELLOW,
+                )
+            else:
+                typer.echo(f"  {r.health_key}: ok status={r.status} stale_after={r.stale_after}")
+        bad = [r.health_key for r in rows if not r.present or r.drift]
+        if bad:
+            typer.secho(
+                f"durability status: NOT provisioned/consistent: {bad}", fg=typer.colors.RED, err=True
+            )
+            raise typer.Exit(code=1)
+        typer.echo(f"durability status (lane={lane}): all {len(rows)} row(s) provisioned + consistent")
