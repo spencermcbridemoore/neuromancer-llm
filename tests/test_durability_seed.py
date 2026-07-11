@@ -38,6 +38,7 @@ from neuromancer_llm.governance.health import (
     DurabilityGateError,
     assert_durability_ok,
 )
+from neuromancer_llm.governance.wal_archiving import WAL_LAG_KEY
 
 _EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC)
 _EIGHT_DAYS = _dt.timedelta(days=8)
@@ -79,7 +80,7 @@ def _status(engine, rows=None):
 
 @pytest.mark.pg
 def test_seed_all_seeds_backup_freshness_born_blocked(repo):
-    assert _seed(repo.engine) == {BACKUP_FRESHNESS_KEY: True}
+    assert _seed(repo.engine) == {BACKUP_FRESHNESS_KEY: True, WAL_LAG_KEY: True}
     row = _read(repo.engine)
     assert row is not None
     assert row["status"] == "blocked"  # born fail-closed
@@ -89,9 +90,24 @@ def test_seed_all_seeds_backup_freshness_born_blocked(repo):
 
 
 @pytest.mark.pg
+def test_seed_all_seeds_wal_lag_boundless_born_blocked(repo):
+    # GO-D-wal: the real item-3 row — the ONE seed surface covers it with zero CLI change (the owner's
+    # "one surface" constraint, realized; promotes the synthetic bound-less proof below to a real member).
+    _seed(repo.engine)
+    row = _read(repo.engine, WAL_LAG_KEY)
+    assert row is not None
+    assert row["status"] == "blocked"  # born fail-closed: the gate BLOCKs until the first healthy probe
+    assert row["measured_at"] == _EPOCH
+    assert row["stale_after"] is None  # bound-less: row PRESENCE is the provisioning proof
+    assert row["detail"] == "seeded; awaiting first WAL-archiver probe"
+    st = {s.health_key: s for s in _status(repo.engine)}[WAL_LAG_KEY]
+    assert st.present is True and st.has_bound is False and st.drift is False
+
+
+@pytest.mark.pg
 def test_seed_all_idempotent(repo):
-    assert _seed(repo.engine) == {BACKUP_FRESHNESS_KEY: True}
-    assert _seed(repo.engine) == {BACKUP_FRESHNESS_KEY: False}  # already present
+    assert _seed(repo.engine) == {BACKUP_FRESHNESS_KEY: True, WAL_LAG_KEY: True}
+    assert _seed(repo.engine) == {BACKUP_FRESHNESS_KEY: False, WAL_LAG_KEY: False}  # already present
     row = _read(repo.engine)
     assert row is not None and row["measured_at"] == _EPOCH  # undisturbed
 
@@ -128,7 +144,8 @@ def test_reconcile_realigns_drift_but_leaves_status_and_measured_at(repo):
             ),
             {"m": marker, "k": BACKUP_FRESHNESS_KEY},
         )
-    assert _reconcile(repo.engine) == {BACKUP_FRESHNESS_KEY: (True, 1)}  # present, 1 re-aligned
+    # both rows present; only the bound-carrying backup row re-aligns (wal_lag is bound-less -> (True, 0))
+    assert _reconcile(repo.engine) == {BACKUP_FRESHNESS_KEY: (True, 1), WAL_LAG_KEY: (True, 0)}
     row = _read(repo.engine)
     assert row is not None
     assert row["stale_after"] == _EIGHT_DAYS  # re-aligned to the pin
@@ -149,7 +166,8 @@ def test_reconcile_never_fills_null_sentinel_gate_stays_blocked(repo):
             {"k": BACKUP_FRESHNESS_KEY},
         )
     # reconcile must NOT fill the NULL — filling it would flip the gate to FRESH with no backup recorded.
-    assert _reconcile(repo.engine) == {BACKUP_FRESHNESS_KEY: (True, 0)}  # present, 0 re-aligned
+    # (wal_lag was never inserted here -> (False, 0); the loud-missing report is the CLI's job.)
+    assert _reconcile(repo.engine) == {BACKUP_FRESHNESS_KEY: (True, 0), WAL_LAG_KEY: (False, 0)}
     row = _read(repo.engine)
     assert row is not None and row["stale_after"] is None  # still NULL
     with pytest.raises(DurabilityGateError):  # gate STAYS fail-closed (branch 2: stale_after IS NULL)
@@ -162,8 +180,8 @@ def test_reconcile_never_fills_null_sentinel_gate_stays_blocked(repo):
 @pytest.mark.pg
 def test_status_reports_missing_then_ok_then_drift(repo):
     st = _status(repo.engine)  # unseeded (repo truncated)
-    assert len(st) == 1 and st[0].health_key == BACKUP_FRESHNESS_KEY
-    assert st[0].present is False
+    assert len(st) == 2 and st[0].health_key == BACKUP_FRESHNESS_KEY  # registry order; wal_lag is st[1]
+    assert st[0].present is False and st[1].present is False
     _seed(repo.engine)
     st0 = _status(repo.engine)[0]
     assert st0.present is True and st0.drift is False and st0.status == "blocked"
@@ -227,7 +245,7 @@ def test_cli_seed_status_reconcile_on_test_lane(repo):
     # repo truncates system_health; the CLI hits the SAME session DB (lane='test') via NEURO_DATABASE_URL.
     assert _runner.invoke(app, ["db", "durability", "status", "--lane", "test"]).exit_code == 1  # unseeded
     r = _runner.invoke(app, ["db", "durability", "seed", "--lane", "test"])
-    assert r.exit_code == 0 and "1 inserted" in r.stdout
+    assert r.exit_code == 0 and "2 inserted" in r.stdout  # backup_freshness + wal_lag, one surface
     r = _runner.invoke(app, ["db", "durability", "status", "--lane", "test"])
     assert r.exit_code == 0 and "provisioned + consistent" in r.stdout
     assert _runner.invoke(app, ["db", "durability", "reconcile", "--lane", "test"]).exit_code == 0

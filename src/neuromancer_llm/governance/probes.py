@@ -159,14 +159,19 @@ def _bump_freshness(engine: Engine, *, ok: bool, detail: str) -> None:
         )
 
 
-def _record_probe_report(engine: Engine, *, status: str, report_text: str, actor_id: int | None) -> None:
+def _record_probe_report(
+    engine: Engine, *, probe_key: str, status: str, report_text: str, actor_id: int | None
+) -> None:
+    """The ONE probe_reports audit-writer (GO-D-wal fold 6): every durability producer records its audit row
+    through here (backup_freshness here; wal_lag in governance/wal_archiving.py) — parametrized by probe_key
+    rather than duplicated per arm."""
     with engine.begin() as conn:
         conn.execute(
             text(
                 "INSERT INTO neuro.probe_reports (probe_key, actor_id, status, report_text) "
                 "VALUES (:pk, :a, :s, :rt)"
             ),
-            {"pk": BACKUP_FRESHNESS_KEY, "a": actor_id, "s": status, "rt": report_text},
+            {"pk": probe_key, "a": actor_id, "s": status, "rt": report_text},
         )
 
 
@@ -200,7 +205,11 @@ def run_backup_probe(
     except Exception as exc:  # noqa: BLE001 — record the failure, then re-raise loud (never a silent pass)
         _bump_freshness(engine, ok=False, detail=f"backup driver raised: {exc!r}")
         _record_probe_report(
-            engine, status="blocked", report_text=f"{destination}: driver raised: {exc!r}", actor_id=actor_id
+            engine,
+            probe_key=BACKUP_FRESHNESS_KEY,
+            status="blocked",
+            report_text=f"{destination}: driver raised: {exc!r}",
+            actor_id=actor_id,
         )
         raise BackupProbeError(f"backup probe failed: driver raised for {destination!r}") from exc
 
@@ -212,7 +221,11 @@ def run_backup_probe(
     # consume side threads one connection through the read+write).
     _bump_freshness(engine, ok=outcome.ok, detail=outcome.detail)
     _record_probe_report(
-        engine, status=status, report_text=f"{destination}: {outcome.detail}", actor_id=actor_id
+        engine,
+        probe_key=BACKUP_FRESHNESS_KEY,
+        status=status,
+        report_text=f"{destination}: {outcome.detail}",
+        actor_id=actor_id,
     )
     if not outcome.ok:
         raise BackupProbeError(

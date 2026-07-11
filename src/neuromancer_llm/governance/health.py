@@ -1,12 +1,11 @@
-"""GO-D-gate (A2-11a): the durability-staleness gate (ADR-0020) — the CONSUMER of the backup-freshness signal.
+"""GO-D-gate (A2-11a) + GO-D-wal: the durability gate (ADR-0020) — the CONSUMER of the durability signals.
 
-`assert_backup_fresh(engine)` reads system_health['backup_freshness'] (produced by governance/probes.py, A2-10)
-and RAISES `DurabilityGateError` (fail closed) unless the DB backup is provably fresh, so a caller (A2-11b's
-consult) can refuse a canonical write before it happens. `assert_durability_ok(engine)` is the STABLE single
-entry point the consult targets; today it delegates to `assert_backup_fresh`, and the WAL-lag arm (its own
-system_health['wal_lag'] row + a pg_stat_archiver producer + branch; owner-ruled 2026-07-07 interim = block on
-any archiver error, numeric threshold deferred) slots in HERE as a focused follow-on unit — deferred so the
-consult callsite never changes when it lands.
+`assert_backup_fresh(engine)` reads system_health['backup_freshness'] (produced by governance/probes.py,
+A2-10) and RAISES `DurabilityGateError` (fail closed) unless the DB backup is provably fresh.
+`assert_wal_archiving_ok(engine)` reads system_health['wal_lag'] (produced by governance/wal_archiving.py,
+GO-D-wal 2026-07-11) and RAISES unless WAL archiving is provably healthy. `assert_durability_ok(engine)` is
+the STABLE single entry point A2-11b's consult targets — it composes BOTH arms (the callsite never changed
+when the WAL arm landed, exactly as designed), so a caller can refuse a canonical write before it happens.
 
 Doctrine:
   - The staleness bound is the REPO CONSTANT governance/freshness.py::BACKUP_STALE_AFTER, never the DB column
@@ -32,6 +31,7 @@ from sqlalchemy import text
 
 from .freshness import BACKUP_FRESHNESS_KEY, resolve_backup_stale_after
 from .notify import notify
+from .wal_archiving import WAL_LAG_KEY
 
 if TYPE_CHECKING:
     import datetime as _dt
@@ -41,8 +41,9 @@ if TYPE_CHECKING:
 
 # The health_keys assert_durability_ok consults — enforced against governance/durability.py::DURABILITY_KEYS
 # (a test asserts GATE_CONSULTED_KEYS <= DURABILITY_KEYS) so a NEW gate branch cannot ship without its
-# provisioning row. Today: backup_freshness only; the WAL-lag arm (item 3) adds 'wal_lag' HERE and a branch.
-GATE_CONSULTED_KEYS: frozenset[str] = frozenset({BACKUP_FRESHNESS_KEY})
+# provisioning row. backup_freshness (A2-11a) + wal_lag (GO-D-wal, the item-3 second edit of the two-edit
+# change).
+GATE_CONSULTED_KEYS: frozenset[str] = frozenset({BACKUP_FRESHNESS_KEY, WAL_LAG_KEY})
 
 
 class DurabilityGateError(RuntimeError):
@@ -136,13 +137,46 @@ def assert_backup_fresh(engine: Engine) -> None:
     return None  # fresh: provisioned, no drift, status ok, within the bound
 
 
+def assert_wal_archiving_ok(engine: Engine) -> None:
+    """Fail-closed gate on the WAL-archiving arm of ADR-0020 (GO-D-wal). Raises DurabilityGateError unless
+    the wal_lag signal is present and healthy. Branch order (fail closed at each step):
+
+      1. row missing     -> BLOCK (never seeded)
+      2. status != 'ok'  -> BLOCK (the producer recorded unconfigured/failing archiving — or the born-blocked
+                            state, awaiting the first healthy probe)
+      3. else            -> return (healthy).
+
+    NO flip/notify here — a deliberate asymmetry from assert_backup_fresh: the backup gate flips+alerts for
+    faults IT detects that its producer cannot (sentinel drift, age staleness); the interim WAL arm has no
+    gate-detected fault — it only reads a status the producer set (and the producer already raised loud at
+    probe time), and a missing row has nothing to flip. The gate-detected fault this arm WILL have — the
+    signal going stale because the producer stopped running — is the deferred numeric-threshold follow-on,
+    which adds the flip + notify() when it lands."""
+    with engine.begin() as conn:
+        status = conn.execute(
+            text("SELECT status FROM neuro.system_health WHERE health_key = :k"), {"k": WAL_LAG_KEY}
+        ).scalar_one_or_none()
+    if status is None:
+        raise DurabilityGateError(
+            "durability BLOCK: system_health['wal_lag'] row is missing (never seeded). Seed it "
+            "(`neuro db durability seed`, registrar/admin) at provisioning before a canonical write."
+        )
+    if status != "ok":
+        raise DurabilityGateError(
+            f"durability BLOCK: wal_lag.status is {status!r} (not 'ok') — WAL archiving is unconfigured, "
+            "failing, or the first archiver probe has not run (governance/wal_archiving.py)."
+        )
+    return None  # healthy: provisioned and the last archiver probe classified ok
+
+
 def assert_durability_ok(engine: Engine) -> None:
-    """The STABLE single entry point A2-11b's consult targets (ADR-0020). Today it is the backup-freshness
-    gate; the WAL-lag arm (system_health['wal_lag'] + a pg_stat_archiver producer + branch; owner-ruled
-    interim = block on any archiver error, 2026-07-07) slots in HERE as a focused follow-on unit.
+    """The STABLE single entry point A2-11b's consult targets (ADR-0020): EVERY durability arm is consulted
+    here — backup freshness (A2-11a) AND WAL archiving (GO-D-wal) — so one-arm-healthy can never read the
+    other-arm-missing as healthy. Both must pass; either raises DurabilityGateError (fail closed).
 
     PRECONDITION: pass a WRITER-grade engine — a drift/stale transition flips system_health.status, an UPDATE
     only neuro_writer/neuro_admin hold (grants.sql:48); a reader/registrar engine would raise an untyped
     InsufficientPrivilege on the flip. A2-11b (the consult) chooses the engine and must treat ANY exception
     from this call as a BLOCK (fail closed)."""
     assert_backup_fresh(engine)
+    assert_wal_archiving_ok(engine)

@@ -92,11 +92,24 @@ def test_rt_backup_freshness_grant_boundary(provisioned_roles, role_url, rt):
     assert (
         rt.exec_as(writer, "UPDATE neuro.system_health SET detail=detail WHERE health_key=:k", nope) is True
     )
+    # GO-D-wal: the SAME table grant carries the wal_lag producer — exercised on the new arm's real key
+    # (0-row WHERE in the unseeded roles DB: grant-legality only; grants are column- not row-scoped, so this
+    # pins that the archiver producer runs as plain neuro_writer with NO grant change).
+    wal = {"k": "wal_lag"}
+    assert rt.exec_as(writer, "UPDATE neuro.system_health SET status=status WHERE health_key=:k", wal) is True
+    assert (
+        rt.exec_as(writer, "UPDATE neuro.system_health SET measured_at=measured_at WHERE health_key=:k", wal)
+        is True
+    )
     # writer DENIED the sentinel column and the seed INSERT (un-forgeable freshness contract)
     assert (
         rt.exec_as(writer, "UPDATE neuro.system_health SET stale_after=stale_after WHERE health_key=:k", nope)
         is False
     )
+    assert (
+        rt.exec_as(writer, "UPDATE neuro.system_health SET stale_after=stale_after WHERE health_key=:k", wal)
+        is False
+    )  # the wal_lag sentinel (NULL for life on a bound-less row) is exactly as un-forgeable
     assert (
         rt.exec_as(
             writer,

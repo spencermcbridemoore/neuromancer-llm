@@ -4,9 +4,10 @@ The ADR-0020 durability gate (governance/health.py) fail-closed BLOCKs a canonic
 `neuro.system_health` durability rows prove the DB is durable. Those rows must be SEEDED once at
 provisioning (registrar/admin — the writer holds no INSERT, grants.sql:48), and their `stale_after`
 SENTINEL kept aligned to the pinned bound. This module is the ONE surface that seeds/reconciles/reports
-EVERY durability row, so a future arm (the WAL-lag arm, pre-cliff item 3) is a PURE APPEND to
-DURABILITY_ROWS — never a per-arm CLI that forgets a row (a provisioning trap; owner's top constraint,
-2026-07-07). `neuro db durability {seed,reconcile,status}` is the thin CLI over it.
+EVERY durability row, so a new arm is a PURE APPEND to DURABILITY_ROWS — never a per-arm CLI that forgets a
+row (a provisioning trap; owner's top constraint, 2026-07-07). The WAL-archiving arm (GO-D-wal, 2026-07-11)
+landed exactly that way: WAL_LAG_ROW below, zero CLI change. `neuro db durability {seed,reconcile,status}`
+is the thin CLI over it.
 
 Doctrine (the freshness.py / canonical_instance.py / price_pin.py pin idiom, carried):
   - Each row is seeded born-FAIL-CLOSED (status='blocked', measured_at=epoch) so the gate BLOCKs until a
@@ -32,6 +33,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from .freshness import BACKUP_FRESHNESS_KEY, resolve_backup_stale_after
+from .wal_archiving import WAL_LAG_KEY
 
 
 @dataclass(frozen=True)
@@ -61,15 +63,22 @@ class RowStatus:
     drift: bool  # only meaningful for bound-carrying rows; always False for bound-less / absent rows
 
 
-# The registry: the ONE place every durability row is declared. Item 3 appends its wal_lag row here (with
-# stale_after_bound=None — a genuine pure append). backup_freshness reuses freshness.py's key + bound so
-# there is exactly one seeding implementation (seed_row); seed_backup_freshness delegates to it.
+# The registry: the ONE place every durability row is declared. backup_freshness reuses freshness.py's key +
+# bound so there is exactly one seeding implementation (seed_row); seed_backup_freshness delegates to it.
+# wal_lag (GO-D-wal, the item-3 pure append) is BOUND-LESS: its interim policy is the boolean archiver check
+# (wal_archiving.classify_archiver), so stale_after seeds NULL — row PRESENCE is its provisioning proof and
+# health.assert_wal_archiving_ok supplies its liveness.
 BACKUP_FRESHNESS_ROW = DurabilityRow(
     health_key=BACKUP_FRESHNESS_KEY,
     born_detail="seeded; awaiting first verified backup",
     stale_after_bound=resolve_backup_stale_after,
 )
-DURABILITY_ROWS: tuple[DurabilityRow, ...] = (BACKUP_FRESHNESS_ROW,)
+WAL_LAG_ROW = DurabilityRow(
+    health_key=WAL_LAG_KEY,
+    born_detail="seeded; awaiting first WAL-archiver probe",
+    stale_after_bound=None,
+)
+DURABILITY_ROWS: tuple[DurabilityRow, ...] = (BACKUP_FRESHNESS_ROW, WAL_LAG_ROW)
 
 # The set of health_keys this surface provisions — cross-checked against the keys the gate consults
 # (governance/health.py::GATE_CONSULTED_KEYS; a test asserts GATE_CONSULTED_KEYS <= DURABILITY_KEYS), so a new

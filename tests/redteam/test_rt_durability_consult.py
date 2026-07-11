@@ -24,9 +24,11 @@ from neuromancer_llm.db.canonical_instance import CANONICAL_INSTANCE_UUID
 from neuromancer_llm.db.lanes import ConfigurationError
 from neuromancer_llm.db.provision import provision
 from neuromancer_llm.db.repository import Repository
+from neuromancer_llm.governance.durability import WAL_LAG_ROW, seed_row
 from neuromancer_llm.governance.freshness import BACKUP_FRESHNESS_KEY, seed_backup_freshness
 from neuromancer_llm.governance.health import DurabilityGateError
 from neuromancer_llm.governance.probes import _bump_freshness
+from neuromancer_llm.governance.wal_archiving import _bump_wal_lag
 from neuromancer_llm.storage.backends import LocalFsBackend
 
 pytestmark = pytest.mark.pg
@@ -122,10 +124,15 @@ class _FakeClient:
 
 
 def _seed_interlock(engine, *, healthy: bool) -> None:
+    # BOTH ADR-0020 arms (GO-D-wal §10 MUST-FIX 1): the consult composes backup_freshness AND wal_lag, so a
+    # healthy interlock must heal both. The WAL heal is SYNTHETIC (_bump_wal_lag) — the archiving-OFF test PG
+    # cannot produce a healthy real archiver read. blocked keeps both born-'blocked' (backup blocks first).
     with engine.connect() as conn:
         seed_backup_freshness(conn)  # fail-closed birth: status='blocked', measured_at=epoch
+        seed_row(conn, WAL_LAG_ROW)
     if healthy:
         _bump_freshness(engine, ok=True, detail="test provisioning: healthy backup")
+        _bump_wal_lag(engine, ok=True, detail="test provisioning: healthy archiver")
 
 
 def _flip_blocked(engine) -> None:

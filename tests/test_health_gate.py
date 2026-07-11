@@ -6,6 +6,11 @@ Composes A2-10's producer (seed_backup_freshness + _bump_freshness) to set up ea
 gate fails CLOSED per the pinned contract: row-missing / stale_after-NULL / drift / status!=ok / stale ->
 DurabilityGateError; a drift/stale transition flips status 'ok'->'blocked' via a guarded CAS and notify()s
 ONCE per transition (no storm); a fresh, provisioned, in-bound signal passes.
+
+GO-D-wal additions: the WAL-arm branches (assert_wal_archiving_ok: row-missing / born-blocked / healthy —
+no gate-side flip/notify by design) and the composed assert_durability_ok cross-arm invariant (a fresh
+backup never vouches for a missing wal_lag signal). Healthy fixtures heal the WAL arm SYNTHETICALLY — the
+archiving-OFF test PG cannot produce a healthy real archiver read.
 """
 
 from __future__ import annotations
@@ -14,15 +19,18 @@ import pytest
 from sqlalchemy import text
 
 from neuromancer_llm.db.lanes import ConfigurationError
+from neuromancer_llm.governance.durability import WAL_LAG_ROW, seed_row
 from neuromancer_llm.governance.freshness import BACKUP_FRESHNESS_KEY, seed_backup_freshness
 from neuromancer_llm.governance.health import (
     DurabilityGateError,
     _flip_and_notify,
     assert_backup_fresh,
     assert_durability_ok,
+    assert_wal_archiving_ok,
 )
 from neuromancer_llm.governance.notify import NotifyError
 from neuromancer_llm.governance.probes import _bump_freshness
+from neuromancer_llm.governance.wal_archiving import _bump_wal_lag
 
 
 class _NotifyRecorder:
@@ -42,11 +50,26 @@ def notify_rec(monkeypatch):
     return rec
 
 
-def _seed_fresh(engine) -> None:
+def _seed_backup_fresh(engine) -> None:
     # produce a fresh, healthy backup_freshness row via the A2-10 producer (seed -> verified success bump)
     with engine.connect() as conn:
         seed_backup_freshness(conn)
     _bump_freshness(engine, ok=True, detail="verified backup 1.0GiB")
+
+
+def _heal_wal(engine) -> None:
+    # heal the WAL arm SYNTHETICALLY (GO-D-wal §10 MUST-FIX 1): the archiving-OFF test PG can never produce
+    # a healthy real read, so healthy fixtures bump wal_lag 'ok' directly (the producer's own paths are
+    # probed in tests/test_wal_archiving.py).
+    with engine.connect() as conn:
+        seed_row(conn, WAL_LAG_ROW)
+    _bump_wal_lag(engine, ok=True, detail="test provisioning: healthy archiver")
+
+
+def _seed_fresh(engine) -> None:
+    # the WHOLE interlock healthy (both ADR-0020 arms) — the healthy-path fixture
+    _seed_backup_fresh(engine)
+    _heal_wal(engine)
 
 
 def _exec(engine, sql: str, **params) -> None:
@@ -193,7 +216,33 @@ def test_flip_cas_guard_no_clobber_on_stale_read(repo, notify_rec):
     assert notify_rec.messages == []  # NOT alerted
 
 
-# ---- pg: assert_durability_ok delegates (the stable A2-11b consult entry point) ----------------------
+# ---- pg: the WAL-archiving arm branches (GO-D-wal) ----------------------------------------------------
+
+
+@pytest.mark.pg
+def test_wal_arm_row_missing_blocks(repo, notify_rec):
+    # repo truncates system_health -> the wal_lag row is absent (never seeded)
+    with pytest.raises(DurabilityGateError, match="wal_lag.*missing"):
+        assert_wal_archiving_ok(repo.engine)
+    assert notify_rec.messages == []  # the interim arm has NO gate-side notify by design
+
+
+@pytest.mark.pg
+def test_wal_arm_born_blocked_blocks(repo, notify_rec):
+    with repo.engine.connect() as conn:
+        seed_row(conn, WAL_LAG_ROW)  # born 'blocked' -> the gate BLOCKs until the first healthy probe
+    with pytest.raises(DurabilityGateError, match="not 'ok'"):
+        assert_wal_archiving_ok(repo.engine)
+    assert notify_rec.messages == []
+
+
+@pytest.mark.pg
+def test_wal_arm_healthy_passes(repo):
+    _heal_wal(repo.engine)
+    assert assert_wal_archiving_ok(repo.engine) is None
+
+
+# ---- pg: assert_durability_ok composes BOTH arms (the stable A2-11b consult entry point) --------------
 
 
 @pytest.mark.pg
@@ -206,6 +255,18 @@ def test_durability_ok_delegates(repo, notify_rec):
     )
     with pytest.raises(DurabilityGateError):
         assert_durability_ok(repo.engine)
+
+
+@pytest.mark.pg
+def test_durability_ok_blocks_when_wal_missing_despite_fresh_backup(repo, notify_rec):
+    # THE cross-arm invariant (GO-D-wal §4 test h / the merged-handoff constraint): one-arm-healthy must
+    # never read the other-arm-missing as healthy — a fresh backup does NOT vouch for the WAL signal.
+    _seed_backup_fresh(repo.engine)  # backup arm fresh + healthy; wal_lag row deliberately ABSENT
+    assert assert_backup_fresh(repo.engine) is None  # arm 1 alone passes...
+    with pytest.raises(DurabilityGateError, match="wal_lag"):
+        assert_durability_ok(repo.engine)  # ...but the composed gate BLOCKs
+    _heal_wal(repo.engine)
+    assert assert_durability_ok(repo.engine) is None  # both arms healthy -> passes
 
 
 # ---- pg: the stale-branch CAS guard THROUGH the gate (the race this unit exists to close) ------------
