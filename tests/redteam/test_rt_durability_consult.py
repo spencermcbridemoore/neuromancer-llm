@@ -78,6 +78,7 @@ class _RecordingBackend:
 
     def __init__(self, inner: LocalFsBackend) -> None:
         self._inner = inner
+        self.driver = inner.driver  # GO-D-cost C1: the choke points classify by driver (missing = refused)
         self.puts: list[str] = []
 
     def put(self, key: str, data: bytes) -> str:

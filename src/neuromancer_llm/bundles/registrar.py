@@ -27,7 +27,9 @@ from dataclasses import dataclass
 
 from sqlalchemy import Engine, text
 
+from ..db.lanes import ConfigurationError
 from ..governance.health import assert_durability_ok
+from ..registry.backends import QuotaGuardedBackend, assert_cloud_put_guarded
 from ..storage.backends import StorageBackend
 from .bundlespec import (
     RunModelIdentityBlock,
@@ -94,6 +96,12 @@ class BundleRegistrar:
         from ..db.session import verify_engine
 
         self.engine = verify_engine(engine, expected_lane=expected_lane, expected_uuid=expected_uuid)
+        # C1 (GO-D-cost): no cloud-put path exists around a RAW cloud backend — a non-local backend must be
+        # a QuotaGuardedBackend (quota consult + spend row on every put) or construction refuses. Checked
+        # here, NOT per-register: a wiring property is time-invariant, and unlike the A2-11b consult below
+        # (time-varying health, resume-aware) an already-durable resume still re-puts real cloud bytes that
+        # must stay ledgered — so there is no resume-skip on this guard.
+        assert_cloud_put_guarded(backend)
         self.backend = backend
         # A2-11b: the verified lane — the durability consult gates CANONICAL cloud writes only (ADR-0020).
         self._expected_lane = expected_lane
@@ -199,6 +207,15 @@ class BundleRegistrar:
         yields an honestly-incomplete manifest (completeness `absent`), not a lie."""
         if crash_at is not None and crash_at not in CRASH_POINTS:
             raise ValueError(f"unknown crash point {crash_at!r}")
+        # GO-D-cost fold 4: a guarded backend is STAMPED with its storage_backends row — a register threading
+        # a DIFFERENT backend_id would land artifact pointers under a row whose base_uri points elsewhere
+        # (the C4 split-brain) and consult the wrong R3 group. Fail closed on the mismatch, before any write.
+        if isinstance(self.backend, QuotaGuardedBackend) and backend_id != self.backend.backend_id:
+            raise ConfigurationError(
+                f"register(backend_id={backend_id}) disagrees with the resolved backend's storage_backends "
+                f"row (backend.backend_id={self.backend.backend_id}) — refusing the split-brain pointer "
+                "(fail closed; thread resolve_capture_backend's (backend_id, backend) pair together)."
+            )
 
         bundle_uuid = bundle_uuid_for(run_id, dataset_name, partition_path)
         bundle_id = self._ensure_bundle(run_id, backend_id, bundle_uuid)

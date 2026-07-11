@@ -93,6 +93,7 @@ class _GatedBackend:
 
     def __init__(self, root, *, role, barrier, winner_done):
         self._inner = LocalFsBackend(root)
+        self.driver = self._inner.driver  # GO-D-cost C1: choke points classify by driver (missing = refused)
         self._role = role
         self._barrier = barrier
         self._winner_done = winner_done

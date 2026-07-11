@@ -7,42 +7,65 @@ Crash between every pair of ordered steps and assert the left-state + recovery:
 
 Plus integrity (R2/R-GC): re-register with DIFFERENT bytes raises; the GC grace window protects a bundle
 a worker is mid-registering.
+
+GO-D-cost (GO-input 4, owner-ruled 2026-07-11): the fixture backend is built through the REAL guarded path
+(resolve_capture_backend on the budgeted 'artifacts-dev' prefix, explicit Azurite conn string per C5), so
+the registrar's C1 guard passes and every seam put ALSO consults quota + writes a spend_entries row inside
+the crash-injection kill windows — deliberate and harmless: the W1-W8 assertions count bundles/artifacts,
+never spend_entries, and the crash points fire inside register() exactly as before (pinned by
+test_kill_windows_fire_through_the_guarded_backend below).
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
+import os
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import text
 
 from neuromancer_llm.bundles.gc import collect_unsealed
 from neuromancer_llm.bundles.registrar import BundleRegistrar, CrashInjected, SeamIntegrityError
-from neuromancer_llm.storage.backends import AzureBlobBackend
+from neuromancer_llm.registry.backends import (
+    STORAGE_RATE_CARD_KEY,
+    QuotaGuardedBackend,
+    resolve_capture_backend,
+)
+from neuromancer_llm.storage.backends import AZURITE_DEFAULT_CONNECTION_STRING
+from neuromancer_llm.storage.price_pin import resolve_price
 
 pytestmark = pytest.mark.seam
 
 SHARDS = {"shard-0000.bin": b"\x00\x01\x02logprob-bytes", "shard-0001.bin": b"second shard payload"}
 
-
-def _seed_backend(engine, key: str) -> int:
-    with engine.begin() as conn:
-        return conn.execute(
-            text(
-                "INSERT INTO neuro.storage_backends (backend_key, driver, lane, base_uri, is_cloud) "
-                "VALUES (:k, 'azure_blob', 'scratch', 'azure://seamtest', false) "
-                "ON CONFLICT (backend_key) DO UPDATE SET driver = EXCLUDED.driver RETURNING backend_id"
-            ),
-            {"k": key},
-        ).scalar_one()
+# Explicit Azurite credential (C5: the backend class no longer reads env / falls back — fixtures thread it).
+_AZURITE_CONN = os.environ.get("NEURO_TEST_AZURITE") or AZURITE_DEFAULT_CONNECTION_STRING
+# The registered base_uri must cross-check against the credential's endpoint host (make_backend, C4):
+# Azurite is path-style — host 127.0.0.1, container = the last path segment.
+_SEAM_BASE_URI = "http://127.0.0.1:10000/devstoreaccount1/seamtest"
 
 
 @pytest.fixture
 def seam_env(seeded):
-    engine = seeded["repo"].engine
-    backend_id = _seed_backend(engine, "azure-seamtest")
-    backend = AzureBlobBackend(container="seamtest")
-    # Constructed THROUGH the lanes-v2 write guard (R1): the registrar verifies identity at construction.
+    repo = seeded["repo"]
+    engine = repo.engine
+    # The budgeted R3 prefix (GO-input 4a: 'artifacts-dev', never an unruled _BUDGET_GROUPS edit) + the
+    # rate card the spend ledger FKs to. Registered through the repo helper, which ENFORCES driver<->is_cloud
+    # coherence (the decoupled is_cloud=False posture is pinned separately, via direct SQL, in
+    # test_rt_quota_wiring::test_rt_cloud_driver_quota_bound_regardless_of_is_cloud).
+    repo.get_or_create_storage_backend(
+        "artifacts-dev", driver="azure_blob", lane="scratch", base_uri=_SEAM_BASE_URI, is_cloud=True
+    )
+    repo.get_or_create_rate_card(
+        backend_or_lane=STORAGE_RATE_CARD_KEY,
+        unit="usd_per_gb",
+        rate=resolve_price(),
+        effective_from=datetime(2026, 7, 5, tzinfo=UTC),  # == the pin's retrieved_at (the seed CLI default)
+    )
+    backend_id, backend = resolve_capture_backend(
+        repo, backend_key="artifacts-dev", connection_string=_AZURITE_CONN
+    )
+    assert isinstance(backend, QuotaGuardedBackend)  # the seam now runs the REAL guarded cloud path
     reg = BundleRegistrar(engine, backend, expected_lane="test")
     return {
         "engine": engine,
@@ -214,3 +237,23 @@ def test_after_register_is_durable(seam_env):
             text("SELECT bundle_id FROM neuro.bundles WHERE state = 'registered'")
         ).scalar_one()
     assert reg.artifact_count(bid) == len(SHARDS)
+
+
+def test_kill_windows_fire_through_the_guarded_backend(seam_env):
+    """GO-input 4's crash-window pin: the quota/spend guard wrapping the seam backend must not absorb or
+    reorder the kill windows. A W2 crash still fires AND the first shard's put ran the full guarded path —
+    a spend_entries row landed BEFORE the crash (consult -> record -> upload -> CrashInjected)."""
+    with seam_env["engine"].connect() as conn:
+        spends_before = conn.execute(text("SELECT count(*) FROM neuro.spend_entries")).scalar_one()
+    with pytest.raises(CrashInjected):
+        seam_env["reg"].register(
+            run_id=seam_env["run_id"],
+            backend_id=seam_env["backend_id"],
+            dataset_name="seam_guarded_kill",
+            partition_path="seam_guarded_kill/p0",
+            shards=SHARDS,
+            crash_at="after_first_shard",
+        )
+    with seam_env["engine"].connect() as conn:
+        spends_after = conn.execute(text("SELECT count(*) FROM neuro.spend_entries")).scalar_one()
+    assert spends_after == spends_before + 1  # exactly the first (crashed-after) shard's ledger row

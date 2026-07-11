@@ -44,6 +44,7 @@ from ..db.identity import content_hash, fingerprint_hash, model_identity_hash, s
 from ..db.lanes import ConfigurationError
 from ..db.repository import IdentityMismatchError, Repository
 from ..governance.health import assert_durability_ok
+from ..registry.backends import QuotaGuardedBackend, assert_cloud_put_guarded
 from ..storage.backends import StorageBackend
 from .adapters.vllm import LogprobSample, VLLMClient
 from .determinism import (
@@ -231,6 +232,18 @@ def write_capture_event(
     Resume is fail-loud (R2): on a (run_id, event_key) conflict the EXISTING row is verified byte-for-byte
     against this re-capture (inline re-encode AND spilled sha256/size) and a drift raises — never a blind
     return of the old id while reporting new byte counts. Idempotent ONLY for identical bytes."""
+    # C1 (GO-D-cost): the _spill put below fires BEFORE any registrar exists and only on >8 KB bodies — a
+    # registrar-only guard would lie dormant until the first large payload. A raw cloud backend is refused
+    # HERE, at the entry every (present and future/adhoc) capture-event caller passes through.
+    assert_cloud_put_guarded(backend)
+    # GO-D-cost fold 4: a guarded backend is stamped with its storage_backends row; a mis-threaded
+    # backend_id would land the spill pointer under a row whose base_uri points elsewhere. Fail closed.
+    if isinstance(backend, QuotaGuardedBackend) and backend_id != backend.backend_id:
+        raise ConfigurationError(
+            f"capture-event backend_id={backend_id} disagrees with the resolved backend's storage_backends "
+            f"row (backend.backend_id={backend.backend_id}) — refusing the split-brain pointer (fail "
+            "closed; thread resolve_capture_backend's (backend_id, backend) pair together)."
+        )
     req_inline = len(request_body) <= INLINE_CAP
     resp_inline = len(response_body) <= INLINE_CAP
     # FIX #1: the verbatim wire spill is content-addressed under the run/partition `wire/` prefix (the key is
@@ -490,6 +503,10 @@ def capture_logprob(
             f"capture_logprob expected_lane={expected_lane!r} disagrees with the repository's verified lane "
             f"{repo.expected_lane!r} — refusing (fail closed; the durability consult must trust the lane)."
         )
+    # C1 (GO-D-cost): refuse a raw cloud backend HERE — before served_model()/the capture wire call (fold 9),
+    # so a mis-wired cloud lane costs zero adapter I/O. Defense-in-depth over the write_capture_event and
+    # registrar-construction guards downstream (grep-verified: every src put path passes one of the three).
+    assert_cloud_put_guarded(backend)
 
     prompt = prompt if prompt is not None else DEFAULT_TARGET_PROMPT
     # C5: the substrate_key is a FUNCTION of the flag + hardware, never a free string that could disagree.

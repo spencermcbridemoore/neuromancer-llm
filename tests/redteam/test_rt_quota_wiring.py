@@ -67,6 +67,7 @@ def test_rt_put_denied_on_quota_fail_closed():
         inner,
         repo=_FakeRepo(),
         prefix="artifacts-prod",
+        backend_id=1,
         backend_ids=[1],
         rate_card_id=1,
         rate=Decimal("0.0184"),

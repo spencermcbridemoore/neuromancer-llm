@@ -60,6 +60,11 @@ def logprob(
     actor_key: str = typer.Option("owner", help="actor stamped on the run + capture (phase0 Q13)"),
     origin: str | None = typer.Option(None, help="origin stamp (defaults to the hostname)"),
     lake_root: str = typer.Option("./_lake", help="local lake root for parquet + wire spills"),
+    backend_key: str = typer.Option(
+        "local-lake",
+        help="registered storage_backends row to resolve the lake through (GO-D-cost: the ONE row-bound "
+        "resolver; a cloud key must be provisioned via `neuro storage seed` first)",
+    ),
     lane: str = typer.Option(
         "canonical",
         envvar="NEURO_EXPECTED_LANE",
@@ -81,7 +86,13 @@ def logprob(
     from ..db.lanes import ConfigurationError, LaneAssertionError
     from ..db.repository import IdentityMismatchError, Repository
     from ..db.session import make_verified_engine
-    from ..registry.backends import LOCAL_LAKE_BACKEND_KEY, LOCAL_LAKE_BASE_URI, make_backend
+    from ..governance.health import DurabilityGateError
+    from ..registry.backends import (
+        LOCAL_LAKE_BACKEND_KEY,
+        LOCAL_LAKE_BASE_URI,
+        resolve_capture_backend,
+    )
+    from ..storage.quota import QuotaDeniedError
 
     try:
         if tokenizer_file is not None:
@@ -95,14 +106,17 @@ def logprob(
             )
         engine = make_verified_engine(expected_lane=lane)
         repo = Repository(engine, expected_lane=lane)
-        backend_id = repo.get_or_create_storage_backend(
-            LOCAL_LAKE_BACKEND_KEY,
-            driver="local_fs",
-            lane="artifacts",
-            base_uri=LOCAL_LAKE_BASE_URI,
-            is_cloud=False,
-        )
-        backend = make_backend("local_fs", base_uri=LOCAL_LAKE_BASE_URI, local_root=lake_root)
+        # The local-lake row is self-bootstrapping (fold 12: ONLY for the local key — a cloud key must be
+        # provisioning-seeded, and the resolver fails closed on its absence, never a side-effect INSERT).
+        if backend_key == LOCAL_LAKE_BACKEND_KEY:
+            repo.get_or_create_storage_backend(
+                LOCAL_LAKE_BACKEND_KEY,
+                driver="local_fs",
+                lane="artifacts",
+                base_uri=LOCAL_LAKE_BASE_URI,
+                is_cloud=False,
+            )
+        backend_id, backend = resolve_capture_backend(repo, backend_key=backend_key, local_root=lake_root)
         client = VLLMClient(base_url, timeout=120.0)
         result = capture_logprob(
             repo=repo,
@@ -127,6 +141,8 @@ def logprob(
         LaneAssertionError,
         VLLMAdapterError,
         IdentityMismatchError,
+        QuotaDeniedError,
+        DurabilityGateError,
     ) as exc:
         typer.secho(f"capture failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
@@ -168,6 +184,11 @@ def replay(
     actor_key: str = typer.Option("owner", help="actor stamped on the run + capture (phase0 Q13)"),
     origin: str | None = typer.Option(None, help="origin stamp (defaults to the hostname)"),
     lake_root: str = typer.Option("./_lake", help="local lake root for parquet + wire spills"),
+    backend_key: str = typer.Option(
+        "local-lake",
+        help="registered storage_backends row to resolve the lake through (GO-D-cost: the ONE row-bound "
+        "resolver; a cloud key must be provisioned via `neuro storage seed` first)",
+    ),
     lane: str = typer.Option(
         "canonical",
         envvar="NEURO_EXPECTED_LANE",
@@ -192,7 +213,13 @@ def replay(
     from ..db.lanes import ConfigurationError, LaneAssertionError
     from ..db.repository import IdentityMismatchError, Repository
     from ..db.session import make_verified_engine
-    from ..registry.backends import LOCAL_LAKE_BACKEND_KEY, LOCAL_LAKE_BASE_URI, make_backend
+    from ..governance.health import DurabilityGateError
+    from ..registry.backends import (
+        LOCAL_LAKE_BACKEND_KEY,
+        LOCAL_LAKE_BASE_URI,
+        resolve_capture_backend,
+    )
+    from ..storage.quota import QuotaDeniedError
 
     try:
         if tokenizer_file is not None:
@@ -206,14 +233,17 @@ def replay(
             )
         engine = make_verified_engine(expected_lane=lane)
         repo = Repository(engine, expected_lane=lane)
-        backend_id = repo.get_or_create_storage_backend(
-            LOCAL_LAKE_BACKEND_KEY,
-            driver="local_fs",
-            lane="artifacts",
-            base_uri=LOCAL_LAKE_BASE_URI,
-            is_cloud=False,
-        )
-        backend = make_backend("local_fs", base_uri=LOCAL_LAKE_BASE_URI, local_root=lake_root)
+        # fold 12: self-bootstrap ONLY the local key; a cloud key is provisioning-seeded (resolver fails
+        # closed on absence — never a side-effect INSERT).
+        if backend_key == LOCAL_LAKE_BACKEND_KEY:
+            repo.get_or_create_storage_backend(
+                LOCAL_LAKE_BACKEND_KEY,
+                driver="local_fs",
+                lane="artifacts",
+                base_uri=LOCAL_LAKE_BASE_URI,
+                is_cloud=False,
+            )
+        backend_id, backend = resolve_capture_backend(repo, backend_key=backend_key, local_root=lake_root)
         client = VLLMClient(base_url, timeout=120.0)
         stamp = origin or socket.gethostname()
 
@@ -249,6 +279,8 @@ def replay(
         VLLMAdapterError,
         IdentityMismatchError,
         DivergenceVerdictError,
+        QuotaDeniedError,
+        DurabilityGateError,
     ) as exc:
         typer.secho(f"replay failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc

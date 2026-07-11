@@ -172,10 +172,12 @@ _PRODUCT_ENV = [
     ),
     (
         "AZURE_STORAGE_CONNECTION_STRING",
-        "The production `AzureBlobBackend` credential path (account-key connection string — the "
-        "accepted Stage-A ADR-0013 deviation; user-delegation SAS via storage/sas.py is an unbuilt "
-        "Stage-B item). Today consumed only by the W1-W8 seam test; unset, the backend falls back to "
-        "the local Azurite emulator string.",
+        "The production cloud credential (account-key connection string — the accepted Stage-A ADR-0013 "
+        "deviation; user-delegation SAS via storage/sas.py is an unbuilt Stage-B item). Consumed by "
+        "registry.backends.make_backend ALONE, which also cross-checks the credential's account endpoint "
+        "host against the registered base_uri; `AzureBlobBackend` itself reads NO env and has NO fallback "
+        "(C5, GO-D-cost) — an azure_blob resolve with this unset and no explicit string FAILS CLOSED, "
+        "never an Azurite fallback write.",
     ),
 ]
 _SECRET_ENV = [
@@ -192,8 +194,8 @@ _TEST_ENV = [
     ),
     (
         "NEURO_TEST_AZURITE",
-        "Azurite connection string for the W1-W8 seam tests (AZURE_STORAGE_CONNECTION_STRING, listed "
-        "under Product, is also honored there).",
+        "Azurite connection string for the W1-W8 seam tests — threaded EXPLICITLY by the test fixtures "
+        "(the backend class reads no env, C5); absent, fixtures use the well-known Azurite default string.",
     ),
     (
         "NEURO_TEST_GPU / NEURO_TEST_API / NEURO_TEST_NETWORK",

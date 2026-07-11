@@ -64,22 +64,28 @@ class LocalFsBackend:
 
 
 class AzureBlobBackend:
-    """azure-artifacts / db-backups lane. In CI this targets Azurite ONLY (never cloud; ADR-0040)."""
+    """azure-artifacts / db-backups lane. In CI this targets Azurite ONLY (never cloud; ADR-0040).
+
+    C5 (GO-D-cost, owner-ruled 2026-07-11): the connection string is REQUIRED — no env read, no Azurite
+    fallback. The class is credential-explicit; the ONE env read (AZURE_STORAGE_CONNECTION_STRING as
+    infrastructure config) lives in registry/backends.py::make_backend, which also runs the endpoint
+    cross-check — so construct THROUGH the factory (a src-scan pins this), and test fixtures pass the
+    Azurite string explicitly (NEURO_TEST_AZURITE / AZURITE_DEFAULT_CONNECTION_STRING)."""
 
     driver = "azure_blob"
 
-    def __init__(self, container: str, connection_string: str | None = None) -> None:
+    def __init__(self, container: str, connection_string: str) -> None:
         # lazy imports keep the module importable without azure installed
         from azure.core.exceptions import ResourceExistsError
         from azure.storage.blob import BlobServiceClient
 
-        conn = (
-            connection_string
-            or os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
-            or os.environ.get("NEURO_TEST_AZURITE")
-            or AZURITE_DEFAULT_CONNECTION_STRING
-        )
-        self._service = BlobServiceClient.from_connection_string(conn)
+        if not connection_string:
+            raise ValueError(
+                "AzureBlobBackend requires an explicit connection string (C5: no env read, no Azurite "
+                "fallback — a misconfigured cloud lane must fail closed, never write to localhost). "
+                "Construct through registry.backends.make_backend."
+            )
+        self._service = BlobServiceClient.from_connection_string(connection_string)
         self._container = self._service.get_container_client(container)
         # R9: suppress ONLY the "container already exists" conflict — any other error propagates.
         with contextlib.suppress(ResourceExistsError):

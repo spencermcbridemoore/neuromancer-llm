@@ -105,9 +105,33 @@ def test_rt_core_modules_read_no_env():
         "bundles/registrar.py",
         "storage/price_pin.py",  # A2-3: an env-overridable price would reintroduce rejected option (b)
         "storage/quota.py",  # A2-3: the R3 $-ceiling split is owner-adjustable DATA, never an env switch
+        "storage/backends.py",  # GO-D-cost C5: the adapter classes are credential-EXPLICIT — the one env
+        #                         read (the conn string, infra config) lives in registry/backends.make_backend;
+        #                         re-adding the Azurite fallback chain here would redden this statically.
     ):
         src = (_SRC / rel).read_text(encoding="utf-8")
         assert "os.environ" not in src and "getenv" not in src, f"{rel} reads an env var (behavior-by-flag?)"
+
+
+def test_rt_azure_backend_constructed_only_by_the_factory():
+    """GO-D-cost C5 (owner-ruled 2026-07-11): `AzureBlobBackend(` is constructed in src/ ONLY inside
+    registry/backends.py::make_backend — the factory that enforces the no-conn-string fail-closed and the
+    credential-host <-> registered-base_uri cross-check. A direct construction elsewhere would bypass both
+    (the 'true only by accident of one callsite' hole the synthesis named); test fixtures construct via the
+    factory/resolver or pass the Azurite string explicitly."""
+    import re
+
+    callsites = []
+    for py in sorted(_SRC.rglob("*.py")):
+        rel = py.relative_to(_SRC).as_posix()
+        src = py.read_text(encoding="utf-8")
+        callsites += [rel for _ in re.finditer(r"(?<!class )AzureBlobBackend\(", src)]
+    # set-compare: the factory module may mention the constructor in its own docstring; what must never
+    # happen is a hit in ANY OTHER module.
+    assert set(callsites) == {"registry/backends.py"}, (
+        f"AzureBlobBackend( constructed outside make_backend: {sorted(set(callsites))} — construct through "
+        "the factory (C5) and update this probe only with a justification"
+    )
 
 
 def test_rt_no_write_path_on_unverified_engine():

@@ -117,16 +117,22 @@ def test_factory_azure_blob_adapter_against_azurite():
 
 def test_capture_write_commands_record_portable_base_uri():
     """§5.2(a) is only fixed if the wedge fix is APPLIED in the capture WRITE commands: cli/capture.py must
-    record the portable LOCAL_LAKE_BASE_URI and build via the factory, NOT a machine-absolute
-    str(Path(lake_root).resolve()). Guards a revert of the rewire (which the repo-layer portability probe
-    alone would NOT catch — it exercises get_or_create_storage_backend directly, never capture.py)."""
+    record the portable LOCAL_LAKE_BASE_URI and build through the ROW-BOUND resolver (GO-D-cost C2 — which
+    itself constructs via the factory, so this is the §5.2(a) guard STRENGTHENED), NOT a machine-absolute
+    str(Path(lake_root).resolve()) or a hand-rolled backend. Guards a revert of either rewire (which the
+    repo-layer portability probe alone would NOT catch — it never exercises capture.py)."""
     import pathlib
 
     from neuromancer_llm import cli
 
     src = (pathlib.Path(cli.__file__).parent / "capture.py").read_text(encoding="utf-8")
     assert "LOCAL_LAKE_BASE_URI" in src, "the capture WRITE commands must register the portable base_uri"
-    assert "make_backend(" in src, "the capture WRITE commands must build the backend via the factory"
+    assert "resolve_capture_backend(" in src, (
+        "the capture WRITE commands must build the backend via the row-bound resolver (GO-D-cost C2)"
+    )
+    assert "make_backend(" not in src, (
+        "no direct factory call in cli/capture.py — the resolver is the ONE production path (C2)"
+    )
     assert "str(Path(lake_root).resolve())" not in src, "the machine-absolute base_uri wedge must be gone"
 
 

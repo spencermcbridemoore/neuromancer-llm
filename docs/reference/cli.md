@@ -43,12 +43,13 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro spend plan` — Record a run_plans justification artifact (required above the budget threshold).
 - `neuro spend reconcile` — Reconcile ACTUAL billed spend against the ledger-predicted total; flag divergence (R4c).
 - `neuro spend report` — Per-run SU/$ + standing spend from the ledger (Jetstream2 renewal evidence).
-- `neuro storage` — Storage: put | mirror-audit | quota | sas-mint | pin.
+- `neuro storage` — Storage: seed | put | mirror-audit | quota | sas-mint | pin.
 - `neuro storage mirror-audit` — STAGE 2 — monthly full-hash audit against the desktop NVMe mirror (ADR-0014).
 - `neuro storage pin` — STAGE 2 — promote bytes to cloud now (ADR-0034).
 - `neuro storage put` — STAGE 2 — put bytes to a registered backend (quota fails closed).
 - `neuro storage quota` — Per-prefix dollar-calibrated storage quota report (fails closed, ADR-0040).
 - `neuro storage sas-mint` — STAGE 2 — mint a user-delegation SAS with surfaced expiry (ADR-0013).
+- `neuro storage seed` — Seed the cost-safety provisioning rows (idempotent; registrar/admin): the storage_backends row and,
 - `neuro workers` — Workers: run | claim | residency | preflight.
 - `neuro workers claim` — STAGE 2 — claim one job (SKIP LOCKED) via the repository.
 - `neuro workers preflight` — STAGE 2 — VRAM preflight: refuse-to-start, not OOM (phase0 Q4).
