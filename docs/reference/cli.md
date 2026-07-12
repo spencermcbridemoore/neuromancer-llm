@@ -31,9 +31,10 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro importer promote` — STAGE 2 — Layer 2 selective promotion (governance trio per row, ADR-0011).
 - `neuro importer scan` — STAGE 2 — Layer 1 faithful external-records upsert (idempotent on the natural key).
 - `neuro importer status` — STAGE 2 — coverage report (mirrored / promoted / derived-by-predecessor).
-- `neuro probe` — Operator probes: run | report.
-- `neuro probe report` — STAGE 2 — emit the latest probe report (system_health + probe_reports).
-- `neuro probe run` — STAGE 2 — run a probe (backup freshness, WAL lag, desktop heartbeat, mirror age).
+- `neuro probe` — Operator probes: run | report | verify-config.
+- `neuro probe report` — Render the operational durability state: every system_health durability row + recent probe reports
+- `neuro probe run` — Run ONE durability producer and record its signal (writer-grade; the systemd timers' ExecStart).
+- `neuro probe verify-config` — Assert the ruling-§3.5 provisioning invariants (retention/staleness/cadence/queue-max consistency)
 - `neuro runs` — Runs: new | adopt | finalize | show.
 - `neuro runs adopt` — STAGE 2 — retroactively label an adhoc/unlabeled run (ADR-0036).
 - `neuro runs finalize` — STAGE 2 — finalize a run.

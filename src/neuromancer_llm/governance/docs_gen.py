@@ -171,6 +171,14 @@ _PRODUCT_ENV = [
         "self-hosted ntfy server. Infrastructure config (which endpoint), never a behavior switch.",
     ),
     (
+        "NEURO_BACKUP_DEST",
+        "The off-cloud backup-mirror destination PATH (A2-16; e.g. D:/neuro-backups on the desktop NVMe) "
+        "consumed by `neuro probe run --key backup_freshness` as a typer envvar option — the driver itself "
+        "is parameter-only (env-free, L13-scanned). The path must pass the ADR-0014 off-cloud guard "
+        "(assert_offcloud_destination: never an Azure shape); the SSH host/user/key travel as an ssh_config "
+        "Host alias, never in this variable and never on argv.",
+    ),
+    (
         "AZURE_STORAGE_CONNECTION_STRING",
         "The production cloud credential (account-key connection string — the accepted Stage-A ADR-0013 "
         "deviation; user-delegation SAS via storage/sas.py is an unbuilt Stage-B item). Consumed by "

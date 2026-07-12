@@ -108,6 +108,10 @@ def test_rt_core_modules_read_no_env():
         "storage/backends.py",  # GO-D-cost C5: the adapter classes are credential-EXPLICIT — the one env
         #                         read (the conn string, infra config) lives in registry/backends.make_backend;
         #                         re-adding the Azurite fallback chain here would redden this statically.
+        "governance/backup_driver.py",  # GO-D-timer: the mirror driver is parameter-only; NEURO_BACKUP_DEST
+        #                                 is read by the CLI layer alone (a typer envvar option)
+        "governance/provisioning_invariants.py",  # GO-D-timer: pins + conf assertions, never env knobs
+        "governance/probe_registry.py",  # GO-D-timer: the key->runner registry carries no env behavior
     ):
         src = (_SRC / rel).read_text(encoding="utf-8")
         assert "os.environ" not in src and "getenv" not in src, f"{rel} reads an env var (behavior-by-flag?)"
