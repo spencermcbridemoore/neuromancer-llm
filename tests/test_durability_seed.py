@@ -38,7 +38,7 @@ from neuromancer_llm.governance.health import (
     DurabilityGateError,
     assert_durability_ok,
 )
-from neuromancer_llm.governance.wal_archiving import WAL_LAG_KEY
+from neuromancer_llm.governance.wal_freshness import WAL_LAG_KEY
 
 _EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC)
 _EIGHT_DAYS = _dt.timedelta(days=8)

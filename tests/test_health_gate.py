@@ -7,10 +7,11 @@ gate fails CLOSED per the pinned contract: row-missing / stale_after-NULL / drif
 DurabilityGateError; a drift/stale transition flips status 'ok'->'blocked' via a guarded CAS and notify()s
 ONCE per transition (no storm); a fresh, provisioned, in-bound signal passes.
 
-GO-D-wal additions: the WAL-arm branches (assert_wal_archiving_ok: row-missing / born-blocked / healthy —
-no gate-side flip/notify by design) and the composed assert_durability_ok cross-arm invariant (a fresh
-backup never vouches for a missing wal_lag signal). Healthy fixtures heal the WAL arm SYNTHETICALLY — the
-archiving-OFF test PG cannot produce a healthy real archiver read.
+GO-D-wal + the signal-staleness follow-on: the WAL-arm branches (assert_wal_archiving_ok: row-missing /
+status!=ok / SIGNAL STALE [now()-measured_at > the 1h repo-constant bound -> guarded-CAS flip + notify
+once-per-transition — the dead-producer close] / healthy) and the composed assert_durability_ok cross-arm
+invariant (a fresh backup never vouches for a missing wal_lag signal). Healthy fixtures heal the WAL arm
+SYNTHETICALLY — the archiving-OFF test PG cannot produce a healthy real archiver read.
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from neuromancer_llm.governance.health import (
 from neuromancer_llm.governance.notify import NotifyError
 from neuromancer_llm.governance.probes import _bump_freshness
 from neuromancer_llm.governance.wal_archiving import _bump_wal_lag
+from neuromancer_llm.governance.wal_freshness import WAL_LAG_KEY
 
 
 class _NotifyRecorder:
@@ -77,11 +79,11 @@ def _exec(engine, sql: str, **params) -> None:
         conn.execute(text(sql), params)
 
 
-def _status(engine) -> str | None:
+def _status(engine, key: str = BACKUP_FRESHNESS_KEY) -> str | None:
     with engine.begin() as conn:
         return conn.execute(
             text("SELECT status FROM neuro.system_health WHERE health_key = :k"),
-            {"k": BACKUP_FRESHNESS_KEY},
+            {"k": key},
         ).scalar_one_or_none()
 
 
@@ -211,7 +213,13 @@ def test_flip_cas_guard_no_clobber_on_stale_read(repo, notify_rec):
     import datetime as _dt
 
     stale_read = _dt.datetime(2000, 1, 1, tzinfo=_dt.UTC)  # a measured_at the current row does NOT have
-    _flip_and_notify(repo.engine, reason="would-be stale alert", detail="x", guard_measured_at=stale_read)
+    _flip_and_notify(
+        repo.engine,
+        key=BACKUP_FRESHNESS_KEY,
+        reason="would-be stale alert",
+        detail="x",
+        guard_measured_at=stale_read,
+    )
     assert _status(repo.engine) == "ok"  # NOT clobbered
     assert notify_rec.messages == []  # NOT alerted
 
@@ -224,7 +232,7 @@ def test_wal_arm_row_missing_blocks(repo, notify_rec):
     # repo truncates system_health -> the wal_lag row is absent (never seeded)
     with pytest.raises(DurabilityGateError, match="wal_lag.*missing"):
         assert_wal_archiving_ok(repo.engine)
-    assert notify_rec.messages == []  # the interim arm has NO gate-side notify by design
+    assert notify_rec.messages == []  # a missing row can't be flipped -> no notify
 
 
 @pytest.mark.pg
@@ -240,6 +248,121 @@ def test_wal_arm_born_blocked_blocks(repo, notify_rec):
 def test_wal_arm_healthy_passes(repo):
     _heal_wal(repo.engine)
     assert assert_wal_archiving_ok(repo.engine) is None
+
+
+# ---- pg: the WAL-arm signal-staleness branch (the dead-producer close, GO-D-wal follow-on) -----------
+# NOTE test_wal_arm_born_blocked_blocks (above) doubles as the ORDERING guard for this branch: a born row
+# (status='blocked', measured_at='epoch') is caught at the status!='ok' branch BEFORE is_stale, so its
+# `notify_rec.messages == []` assertion reddens against any mutant that orders is_stale before the status check.
+
+
+def test_wal_arm_pin_absent_fails_closed(monkeypatch):
+    # the gate resolves the staleness bound BEFORE any DB read; an absent pin fails closed (never an
+    # unpinned pass) — mirrors test_gate_fails_closed_when_pin_absent for the WAL arm.
+    monkeypatch.setattr("neuromancer_llm.governance.wal_freshness.WAL_LAG_STALE_AFTER", None)
+
+    class _NoEngine:
+        def begin(self):
+            raise AssertionError("the gate must resolve the wal_lag bound BEFORE touching the DB")
+
+    with pytest.raises(ConfigurationError):
+        assert_wal_archiving_ok(_NoEngine())
+
+
+@pytest.mark.pg
+def test_wal_stale_flips_notifies_blocks_once(repo, notify_rec):
+    # THE dead-producer close: a stopped archiver probe leaves status='ok' with a frozen measured_at. Aging
+    # measured_at past the 1h bound must flip 'ok'->'blocked' + alert ONCE, then BLOCK silently thereafter.
+    _heal_wal(repo.engine)  # status='ok', measured_at=now()
+    _exec(
+        repo.engine,
+        "UPDATE neuro.system_health SET measured_at = now() - INTERVAL '2 hours' WHERE health_key = :k",
+        k=WAL_LAG_KEY,
+    )
+    with pytest.raises(DurabilityGateError, match="STALE"):
+        assert_wal_archiving_ok(repo.engine)
+    assert _status(repo.engine, WAL_LAG_KEY) == "blocked"  # flipped
+    assert len(notify_rec.messages) == 1 and "stale" in notify_rec.messages[0].lower()
+    # a second consult -> branch 2 (status='blocked') BLOCKs silently, no re-alert (once-per-transition)
+    with pytest.raises(DurabilityGateError):
+        assert_wal_archiving_ok(repo.engine)
+    assert len(notify_rec.messages) == 1
+
+
+@pytest.mark.pg
+def test_wal_stale_recovers_after_a_fresh_probe(repo, notify_rec):
+    # a flipped-blocked wal_lag RECOVERS when the archiver probe records a fresh healthy read (ok + now())
+    _heal_wal(repo.engine)
+    _exec(
+        repo.engine,
+        "UPDATE neuro.system_health SET measured_at = now() - INTERVAL '2 hours' WHERE health_key = :k",
+        k=WAL_LAG_KEY,
+    )
+    with pytest.raises(DurabilityGateError):
+        assert_wal_archiving_ok(repo.engine)
+    _bump_wal_lag(repo.engine, ok=True, detail="archiver recovered")  # a healthy probe -> ok + now()
+    assert assert_wal_archiving_ok(repo.engine) is None
+    assert _status(repo.engine, WAL_LAG_KEY) == "ok"
+
+
+@pytest.mark.pg
+def test_wal_stale_guard_through_gate_no_clobber_on_concurrent_bump(repo, notify_rec, monkeypatch):
+    # Drive the wal staleness branch THROUGH the gate while a concurrent healthy archiver probe advances
+    # measured_at BETWEEN the gate's read and its flip: the measured_at-guarded CAS must MISS -> no false
+    # 'blocked'/alert, yet the gate still BLOCKs on its own stale read. FAILS if the branch drops
+    # guard_measured_at (then the CAS matches on status alone -> clobbers the fresh probe's success).
+    _heal_wal(repo.engine)
+    _exec(
+        repo.engine,
+        "UPDATE neuro.system_health SET measured_at = now() - INTERVAL '2 hours' WHERE health_key = :k",
+        k=WAL_LAG_KEY,
+    )
+
+    def _racing_flip(engine, *, key, reason, detail, guard_measured_at=None):
+        _bump_wal_lag(engine, ok=True, detail="concurrent healthy archiver")  # a fresh probe lands first
+        _flip_and_notify(engine, key=key, reason=reason, detail=detail, guard_measured_at=guard_measured_at)
+
+    monkeypatch.setattr("neuromancer_llm.governance.health._flip_and_notify", _racing_flip)
+    with pytest.raises(DurabilityGateError):  # still fail-closed on the gate's own stale read
+        assert_wal_archiving_ok(repo.engine)
+    assert _status(repo.engine, WAL_LAG_KEY) == "ok"  # the concurrent fresh probe was NOT clobbered
+    assert notify_rec.messages == []  # no false stale alert
+
+
+@pytest.mark.pg
+def test_wal_flip_touches_only_its_own_arm(repo, notify_rec):
+    # the _flip_and_notify key parametrization: a wal_lag staleness flip must touch ONLY the wal_lag row,
+    # never backup_freshness (guards the shared helper against a cross-arm clobber).
+    _seed_fresh(repo.engine)  # BOTH arms fresh + healthy
+    _exec(
+        repo.engine,
+        "UPDATE neuro.system_health SET measured_at = now() - INTERVAL '2 hours' WHERE health_key = :k",
+        k=WAL_LAG_KEY,
+    )
+    with pytest.raises(DurabilityGateError, match="STALE"):
+        assert_wal_archiving_ok(repo.engine)
+    assert _status(repo.engine, WAL_LAG_KEY) == "blocked"  # wal flipped
+    assert _status(repo.engine, BACKUP_FRESHNESS_KEY) == "ok"  # backup UNTOUCHED
+
+
+@pytest.mark.pg
+def test_wal_flip_notify_failure_still_blocks(repo, monkeypatch):
+    # ADR-0019: a broken alert channel must still BLOCK. If notify() raises on a wal staleness flip, the gate
+    # still fails LOUD (the flip persisted BEFORE notify -> once-per-transition holds).
+    _heal_wal(repo.engine)
+    _exec(
+        repo.engine,
+        "UPDATE neuro.system_health SET measured_at = now() - INTERVAL '2 hours' WHERE health_key = :k",
+        k=WAL_LAG_KEY,
+    )
+
+    def _boom(message, *, topic=None):
+        raise NotifyError("ntfy channel down")
+
+    monkeypatch.setattr("neuromancer_llm.governance.health.notify", _boom)
+    with pytest.raises((DurabilityGateError, NotifyError)):
+        assert_wal_archiving_ok(repo.engine)
+    assert _status(repo.engine, WAL_LAG_KEY) == "blocked"  # the flip persisted before the alert failed
 
 
 # ---- pg: assert_durability_ok composes BOTH arms (the stable A2-11b consult entry point) --------------
@@ -285,9 +408,9 @@ def test_stale_guard_through_gate_no_clobber_on_concurrent_bump(repo, notify_rec
         k=BACKUP_FRESHNESS_KEY,
     )
 
-    def _racing_flip(engine, *, reason, detail, guard_measured_at=None):
+    def _racing_flip(engine, *, key, reason, detail, guard_measured_at=None):
         _bump_freshness(engine, ok=True, detail="concurrent verified backup")  # a fresh success lands first
-        _flip_and_notify(engine, reason=reason, detail=detail, guard_measured_at=guard_measured_at)
+        _flip_and_notify(engine, key=key, reason=reason, detail=detail, guard_measured_at=guard_measured_at)
 
     monkeypatch.setattr("neuromancer_llm.governance.health._flip_and_notify", _racing_flip)
     with pytest.raises(DurabilityGateError):  # still fail-closed on the gate's own stale read

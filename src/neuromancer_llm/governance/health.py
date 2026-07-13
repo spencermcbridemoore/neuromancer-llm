@@ -3,14 +3,16 @@
 `assert_backup_fresh(engine)` reads system_health['backup_freshness'] (produced by governance/probes.py,
 A2-10) and RAISES `DurabilityGateError` (fail closed) unless the DB backup is provably fresh.
 `assert_wal_archiving_ok(engine)` reads system_health['wal_lag'] (produced by governance/wal_archiving.py,
-GO-D-wal 2026-07-11) and RAISES unless WAL archiving is provably healthy. `assert_durability_ok(engine)` is
+GO-D-wal 2026-07-11) and RAISES unless WAL archiving is provably healthy AND fresh (the signal-staleness /
+dead-producer branch landed 2026-07-13). `assert_durability_ok(engine)` is
 the STABLE single entry point A2-11b's consult targets — it composes BOTH arms (the callsite never changed
 when the WAL arm landed, exactly as designed), so a caller can refuse a canonical write before it happens.
 
 Doctrine:
-  - The staleness bound is the REPO CONSTANT governance/freshness.py::BACKUP_STALE_AFTER, never the DB column
-    (the guard cannot trust the very DB it protects to hold its own threshold). The system_health.stale_after
-    COLUMN is only a provisioning sentinel + drift-check.
+  - The staleness bound is a REPO CONSTANT per arm (freshness.py::BACKUP_STALE_AFTER for backup;
+    wal_freshness.py::WAL_LAG_STALE_AFTER for wal_lag), never the DB column (the guard cannot trust the very DB
+    it protects to hold its own threshold). For backup, the system_health.stale_after COLUMN is a provisioning
+    sentinel + drift-check; the wal_lag row is bound-less (no sentinel, staleness-only — no drift branch).
   - The staleness comparison runs IN SQL (`now() - measured_at > :bound`) so Postgres does tz-aware
     timestamptz math and a NULL delta is impossible (measured_at is NOT NULL).
   - A drift/stale transition flips status 'ok'->'blocked' via a GUARDED CAS and notify()s ONCE per transition:
@@ -31,7 +33,7 @@ from sqlalchemy import text
 
 from .freshness import BACKUP_FRESHNESS_KEY, resolve_backup_stale_after
 from .notify import notify
-from .wal_archiving import WAL_LAG_KEY
+from .wal_freshness import WAL_LAG_KEY, resolve_wal_lag_stale_after
 
 if TYPE_CHECKING:
     import datetime as _dt
@@ -53,14 +55,16 @@ class DurabilityGateError(RuntimeError):
 
 
 def _flip_and_notify(
-    engine: Engine, *, reason: str, detail: str, guard_measured_at: _dt.datetime | None = None
+    engine: Engine, *, key: str, reason: str, detail: str, guard_measured_at: _dt.datetime | None = None
 ) -> None:
-    """Flip backup_freshness.status 'ok'->'blocked' via a guarded CAS in an AUTONOMOUS txn, then notify() ONCE
-    per transition (only when the CAS actually flipped a row). `guard_measured_at`, when given, pins the flip
-    to the measured_at the gate READ, so a fresh backup that landed between the read and the flip (its bump
-    advanced measured_at) is NOT clobbered into 'blocked' with a false alert — the CAS simply misses."""
+    """Flip the given `key`'s status 'ok'->'blocked' via a guarded CAS in an AUTONOMOUS txn, then
+    notify() ONCE per transition (only when the CAS actually flipped a row). `guard_measured_at`, when given,
+    pins the flip to the measured_at the gate READ, so a fresh signal that landed between the read and the flip
+    (its bump advanced measured_at) is NOT clobbered into 'blocked' with a false alert — the CAS simply misses.
+    `key` selects the arm (backup_freshness or wal_lag) — REQUIRED, no default: a defaulted key would let a new
+    caller silently flip the wrong arm (a fail-open smell)."""
     sql = "UPDATE neuro.system_health SET status='blocked', detail=:d WHERE health_key=:k AND status='ok'"
-    params: dict[str, object] = {"d": detail, "k": BACKUP_FRESHNESS_KEY}
+    params: dict[str, object] = {"d": detail, "k": key}
     if guard_measured_at is not None:
         sql += " AND measured_at=:m"
         params["m"] = guard_measured_at
@@ -106,6 +110,7 @@ def assert_backup_fresh(engine: Engine) -> None:
     if row["stale_after"] != bound:
         _flip_and_notify(
             engine,
+            key=BACKUP_FRESHNESS_KEY,
             reason=(
                 f"neuromancer durability: backup_freshness stale_after {row['stale_after']} != pinned bound "
                 f"{bound} (drift) — BLOCKING canonical writes"
@@ -124,6 +129,7 @@ def assert_backup_fresh(engine: Engine) -> None:
     if row["is_stale"]:
         _flip_and_notify(
             engine,
+            key=BACKUP_FRESHNESS_KEY,
             reason=(
                 f"neuromancer durability: DB backup is STALE (age > pinned bound {bound}) — BLOCKING "
                 "canonical writes"
@@ -138,35 +144,65 @@ def assert_backup_fresh(engine: Engine) -> None:
 
 
 def assert_wal_archiving_ok(engine: Engine) -> None:
-    """Fail-closed gate on the WAL-archiving arm of ADR-0020 (GO-D-wal). Raises DurabilityGateError unless
-    the wal_lag signal is present and healthy. Branch order (fail closed at each step):
+    """Fail-closed gate on the WAL-archiving arm of ADR-0020 (GO-D-wal + the signal-staleness follow-on). Raises
+    DurabilityGateError unless the wal_lag signal is present, healthy, AND fresh. Branch order (fail closed at
+    each step):
 
       1. row missing     -> BLOCK (never seeded)
-      2. status != 'ok'  -> BLOCK (the producer recorded unconfigured/failing archiving — or the born-blocked
-                            state, awaiting the first healthy probe)
-      3. else            -> return (healthy).
+      2. status != 'ok'  -> BLOCK (the producer recorded unconfigured/failing archiving, or the born-blocked
+                            state; NO re-flip/notify -> once-per-transition. A born row [status='blocked',
+                            measured_at='epoch'] is caught HERE, BEFORE the staleness branch, so it never
+                            spuriously alerts.)
+      3. now()-measured_at > bound (IN SQL) -> guarded-CAS flip 'ok'->'blocked' + notify-if-transition + BLOCK
+                            (the DEAD-PRODUCER close: a stopped A2-16 archiver-probe timer leaves a stale 'ok'
+                            the gate would otherwise trust forever; the producer advances measured_at only on a
+                            healthy read, so a frozen measured_at with status still 'ok' means the probe stopped)
+      4. else            -> return (healthy: provisioned, status ok, within the bound).
 
-    NO flip/notify here — a deliberate asymmetry from assert_backup_fresh: the backup gate flips+alerts for
-    faults IT detects that its producer cannot (sentinel drift, age staleness); the interim WAL arm has no
-    gate-detected fault — it only reads a status the producer set (and the producer already raised loud at
-    probe time), and a missing row has nothing to flip. The gate-detected fault this arm WILL have — the
-    signal going stale because the producer stopped running — is the deferred numeric-threshold follow-on,
-    which adds the flip + notify() when it lands."""
+    The staleness bound is the REPO CONSTANT wal_freshness.py::WAL_LAG_STALE_AFTER (never a DB column — the
+    wal_lag row is bound-less, D2). The comparison runs IN SQL over a NOT-NULL measured_at (born 'epoch'), and
+    the flip is pinned to the measured_at the gate READ so a concurrent healthy probe advancing measured_at is
+    not clobbered — the same guarded-CAS/autonomous-txn/once-per-transition mechanism assert_backup_fresh uses
+    (shared via _flip_and_notify). This arm carries no sentinel-drift branch (bound-less), only staleness."""
+    bound = resolve_wal_lag_stale_after()  # repo-constant bound; ConfigurationError if the pin is absent
     with engine.begin() as conn:
-        status = conn.execute(
-            text("SELECT status FROM neuro.system_health WHERE health_key = :k"), {"k": WAL_LAG_KEY}
-        ).scalar_one_or_none()
-    if status is None:
+        row = (
+            conn.execute(
+                text(
+                    "SELECT status, measured_at, (now() - measured_at) > :bound AS is_stale "
+                    "FROM neuro.system_health WHERE health_key = :k"
+                ),
+                {"bound": bound, "k": WAL_LAG_KEY},
+            )
+            .mappings()
+            .one_or_none()
+        )
+    if row is None:
         raise DurabilityGateError(
             "durability BLOCK: system_health['wal_lag'] row is missing (never seeded). Seed it "
             "(`neuro db durability seed`, registrar/admin) at provisioning before a canonical write."
         )
-    if status != "ok":
+    if row["status"] != "ok":
         raise DurabilityGateError(
-            f"durability BLOCK: wal_lag.status is {status!r} (not 'ok') — WAL archiving is unconfigured, "
+            f"durability BLOCK: wal_lag.status is {row['status']!r} (not 'ok') — WAL archiving is unconfigured, "
             "failing, or the first archiver probe has not run (governance/wal_archiving.py)."
         )
-    return None  # healthy: provisioned and the last archiver probe classified ok
+    if row["is_stale"]:
+        _flip_and_notify(
+            engine,
+            key=WAL_LAG_KEY,
+            reason=(
+                f"neuromancer durability: WAL-archiver signal STALE (age > pinned bound {bound}) — the archiver "
+                "probe has stopped; BLOCKING canonical writes"
+            ),
+            detail=f"wal_lag stale: now() - measured_at > {bound}",
+            guard_measured_at=row["measured_at"],
+        )
+        raise DurabilityGateError(
+            f"durability BLOCK: wal_lag signal is STALE (now() - measured_at > the pinned bound {bound}) — the "
+            "archiver probe has stopped (dead producer)."
+        )
+    return None  # healthy: provisioned, the last archiver probe classified ok, and the signal is fresh
 
 
 def assert_durability_ok(engine: Engine) -> None:

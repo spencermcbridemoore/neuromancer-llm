@@ -33,7 +33,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from .freshness import BACKUP_FRESHNESS_KEY, resolve_backup_stale_after
-from .wal_archiving import WAL_LAG_KEY
+from .wal_freshness import WAL_LAG_KEY
 
 
 @dataclass(frozen=True)

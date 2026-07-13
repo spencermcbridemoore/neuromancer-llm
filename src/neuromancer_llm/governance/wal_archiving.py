@@ -4,12 +4,13 @@ The second arm of the ADR-0020 durability gate (the first is backup AGE, freshne
 `run_wal_archiver_probe` reads the cluster's WAL-archiving health and records it into the shared signal:
 system_health['wal_lag'] (the machine snapshot health.assert_wal_archiving_ok reads) + a probe_reports audit
 row. The row itself is provisioned by governance/durability.py (WAL_LAG_ROW — bound-less, born fail-closed);
-the gate branch is the CONSUMER (health.py). notify() belongs to the gate side, not here — and the interim arm
-deliberately has NO gate-side notify: until A2-16 schedules this producer, the arm's only effect is the
-fail-closed born-'blocked' row (stated, not silent).
+the gate branch is the CONSUMER (health.py). notify() belongs to the gate side, not here: this PRODUCER emits
+no notify itself. The CONSUMER (health.assert_wal_archiving_ok) flips 'ok'->'blocked' and notify()s once-per-
+transition on signal-staleness (the dead-producer close, landed 2026-07-13); a born-'blocked' row simply BLOCKs.
 
-The interim policy (owner-ruled GO-inputs, 2026-07-11; NO numeric lag threshold — that calibration plus the
-signal-staleness check that comes with it is a named deferred follow-on):
+The producer's classification policy (owner-ruled GO-inputs, 2026-07-11; NO numeric lag threshold in the
+PRODUCER — the archiver-error rule below. The signal-staleness gate branch that flips on a stale measured_at
+LANDED 2026-07-13 as a consumer-side follow-on: health.py + wal_freshness.py::WAL_LAG_STALE_AFTER):
   (A) archiving must be CONFIGURED — `archive_mode != 'off'` ('on' and 'always' both count) AND a mechanism
       set (`archive_command` or `archive_library` non-empty). A fresh PG reports failed_count=0 with archiving
       fully off, so any failure-count rule alone reads "no archiving at all" as healthy — this check is the
@@ -30,9 +31,9 @@ PG18 (guc_tables.c — no GUC_SUPERUSER_ONLY flag), so the producer needs no pg_
 
 Named deferred obligations (Deferred-Obligation Register; recorded 2026-07-11): the queue-drop/WAL-continuity
 gap (`archive-push-queue-max` overflow drops WAL and reports SUCCESS — invisible to any archiver-error rule;
-needs an archived-segment-continuity check; revisit before capture at volume) and the signal-staleness /
-dead-producer gap (a stopped A2-16 timer leaves a stale 'ok' the interim gate trusts; owned by the deferred
-numeric-threshold follow-on, which adds the gate-side flip+notify).
+needs an archived-segment-continuity check; revisit before capture at volume) STAYS OPEN. The signal-staleness
+/ dead-producer gap (a stopped A2-16 timer leaving a stale 'ok') is now CLOSED — the consumer-side
+WAL_LAG_STALE_AFTER staleness branch landed 2026-07-13 (health.assert_wal_archiving_ok flips + notifies).
 """
 
 from __future__ import annotations
@@ -45,16 +46,14 @@ from typing import TYPE_CHECKING
 from sqlalchemy import text
 
 from .probes import _record_probe_report
+from .wal_freshness import WAL_LAG_KEY
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
 
-# The shared health_key (one constant imported by the durability registry, the producer here, and the A2-11a
-# gate branch — the BACKUP_FRESHNESS_KEY idiom). NOTE a deviation from the backup arm's layout (GO-D-wal
-# fold 7): the key lives in this producer module, not a neutral contract module — a bound-less arm has no
-# pin/resolver to house separately. When the numeric-threshold repo-constant lands (the deferred follow-on),
-# carve its freshness.py-style contract home and move the key there.
-WAL_LAG_KEY = "wal_lag"
+# WAL_LAG_KEY now lives in the neutral contract module governance/wal_freshness.py (fold 7 DISCHARGED by the
+# signal-staleness follow-on, 2026-07-13): the CONSUMER (health.py) imports the key from a leaf, not from this
+# producer. Re-exported into this module's namespace above so producer code (and its tests) keep referencing it.
 
 # The literal string PostgreSQL's show_archive_command hook substitutes for archive_command on EVERY display
 # path while archiving is inactive (xlog.c, REL_18_STABLE) — non-empty, so never a configured mechanism.

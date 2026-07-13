@@ -28,7 +28,6 @@ from sqlalchemy import text
 
 from neuromancer_llm.governance.durability import WAL_LAG_ROW, seed_row
 from neuromancer_llm.governance.wal_archiving import (
-    WAL_LAG_KEY,
     ArchiverSnapshot,
     WalArchiverProbeError,
     _bump_wal_lag,
@@ -36,6 +35,7 @@ from neuromancer_llm.governance.wal_archiving import (
     read_pg_stat_archiver,
     run_wal_archiver_probe,
 )
+from neuromancer_llm.governance.wal_freshness import WAL_LAG_KEY
 
 _EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC)
 _T1 = _dt.datetime(2026, 7, 10, 12, 0, 0, tzinfo=_dt.UTC)

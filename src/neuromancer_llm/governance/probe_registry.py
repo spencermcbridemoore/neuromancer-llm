@@ -20,7 +20,8 @@ from typing import TYPE_CHECKING
 from ..db.lanes import ConfigurationError
 from .freshness import BACKUP_FRESHNESS_KEY
 from .probes import BackupDriver, run_backup_probe
-from .wal_archiving import WAL_LAG_KEY, run_wal_archiver_probe
+from .wal_archiving import run_wal_archiver_probe
+from .wal_freshness import WAL_LAG_KEY
 
 if TYPE_CHECKING:
     from sqlalchemy import Engine
