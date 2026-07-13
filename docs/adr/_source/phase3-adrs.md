@@ -150,9 +150,11 @@ In Phase 4 these split into `docs/adr/NNNN-*.md` with a generated index (`neuro 
 ## Group 5 — Escalation outcomes & retrofit seams
 
 ### ADR-0025 — No restricted-flag day one; taint-query retrofit path
-**Status:** Accepted · **Source:** phase0 Q3.
+**Status:** Superseded by ADR-0049 (2026-07-12) · **Source:** phase0 Q3.
 **Decision.** No `restricted` flag in the day-one schema; access control is roles/credentials. Because every export/payload/derived artifact carries lineage to its prompt set, restriction is retroactively computable (one migration + one taint query). Soft rule: exam-derived raw text is never posted publicly. Content-hash identity for prompt sets stays regardless.
 **Consequences.** This ADR *is* the recorded retrofit path. Lineage completeness (ADR-0043's `lineage_edges`) is what makes the taint query possible later.
+
+**Superseded 2026-07-12 by ADR-0049 (owner-ruled withdrawal of the taint-query retrofit obligation; the retrofit path remains technically open via ADR-0043 lineage).**
 
 ### ADR-0026 — Tracker-emit default OFF; post-finalize emitter seam
 **Status:** Reserved-seam · **Source:** phase0 Q12; checkpoint.
@@ -221,7 +223,7 @@ In Phase 4 these split into `docs/adr/NNNN-*.md` with a generated index (`neuro 
 
 ### ADR-0043 — Lineage as relationship-edges-only
 **Status:** Accepted · **Source:** phase0 Q15 KEEP; phase1 d1.
-**Decision.** `lineage_edges` holds **relationship edges only** (src/dst typed-entity references + edge_kind); identities are evicted to typed tables. Edges survive for curation, annotation, derived-set provenance (paraphrase→source links), and the taint-query reserve (ADR-0025).
+**Decision.** `lineage_edges` holds **relationship edges only** (src/dst typed-entity references + edge_kind); identities are evicted to typed tables. Edges survive for curation, annotation, derived-set provenance (paraphrase→source links), and the taint-query reserve (ADR-0025; obligation withdrawn by ADR-0049).
 **Consequences.** No identity data hides in a generic graph. Generative-inference derived sets (phase0 Q1) get content-hash identity + lineage edges to source set and generating run.
 
 ### ADR-0044 — `AUTHOR-DISCRETION`: no pgvector day-one
@@ -254,6 +256,12 @@ In Phase 4 these split into `docs/adr/NNNN-*.md` with a generated index (`neuro 
 **Decision.** `get_or_create_actor` / `get_or_create_campaign` return the existing row by key with NO comparison — a campaign re-created under the same `campaign_key` with a different `actor_id` silently keeps the old owner. ACCEPTED as-is under single-user credentials; the Phase-5 probe DOCUMENTS the current behavior (it does not assert a fix). The obligation is registered in TWO layers in the Deferred-Obligation Register: (a) the trivial drift-guard code fix (raise-on-drift + `ON CONFLICT`, matching the sibling registries), and (b) the deeper owner-scoped-key namespacing design.
 **Reasons.** The real bite is NOT single-user careless reuse (low today) but TWO users colliding on a shared human-readable key, which silently reassigns ownership/lineage. That bite only exists once multi-user credentials OR the importer land — which is also exactly when the fix is cheap to land with its proper key-namespacing design rather than a hasty guard now.
 **Consequences.** Trigger = multi-user creds OR the importer. Until then the single-user behavior is pinned by a probe so a regression (or the arrival of the trigger) is visible.
+
+### ADR-0049 — Taint-query retrofit obligation withdrawn (supersedes ADR-0025)
+**Status:** Accepted · **Source:** owner ruling 2026-07-12.
+**Decision.** The ADR-0025 retrofit OBLIGATION — "restriction is retroactively computable (one migration + one taint query)" as a committed path — is WITHDRAWN. The CAPABILITY is not: taint stays computable over what the built lane records (prompt identity inside `fingerprints.semantic_config` + the verbatim `capture_events.request_text`, per the 2026-07-02 conformance audit, plus the typed-FK lineage that exists independently of `lineage_edges` — `run_inputs` stimulus rows, `prompt_sets.derived_from_run_id`, NOT-NULL `capture_events.run_id`), and the `lineage_edges` DDL COMMENT ("Enables ADR-0025 taint retrofit") deliberately stays — with its frozen-DDL mirror in `tests/reference/phase3-ddl.sql` — as a true capability statement (editing the COMMENT would itself be a schema change). The taint-query reserve on ADR-0043's edges is now NON-OBLIGATORY: no compliance promise rides on edge completeness. Supersession, not rewrite: ADR numbers are permanent, ADR-0003/ADR-0043 and the DDL COMMENT cross-reference ADR-0025's text, and the withdrawal is a new decision carrying its own residual and revival trigger.
+**Reasons.** Risk-honesty, not "the institution covers it": the retrofit promise was the largest dangling risk left from the original design — an unenforced compliance guarantee whose coverage nothing requires and whose failure is silent. Recorded edges are integrity-protected (INSERT-only grants, UNIQUE) but COVERAGE is unenforced: src/dst are free-text and un-FK'd by design (ADR-0043), every producer is a Stage-2 stub, nothing reads the table, and no mechanism requires an edge to exist — so the retroactive query is FALSE-NEGATIVE-BIASED (anything with a lineage gap reads "clean"), the worst shape for a compliance control. The existing, real security for most if not all data of this kind is what we already have: storage in a non-publicly-accessible database behind role-based credentials (ADR-0007) — an operative control whose real perimeter includes every copy (desktop mirror, Azure `db-backups`, restore-drill clones, the future blob lake). We stop promising a capability no mechanism enforces; the access boundary is the operative control.
+**Consequences.** What survives, explicitly: the soft rule (exam-derived raw text is never posted publicly); ADR-0028's exam-text-never-to-any-third-party-API ban; content-hash identity for prompt sets; and ADR-0043 in full — edge-writing discipline is DECOUPLED from the withdrawn obligation (edges keep being written for curation, annotation, and derived-set provenance; ADR-0043's "derived sets get content-hash identity + lineage edges to source set and generating run" consequence is unaffected). The accepted residual, named honestly: post-incident triage of exam-content exposure from any copy would have needed the taint query and now has no mechanism; and since retroactive taint is only as good as contemporaneously written edges, the withdrawal is effectively ONE-WAY. Revival trigger (ADR-0048 idiom): the first Stage-B publication/export surface (ADR-0034 pin-at-publication) OR multi-user credentials — re-evaluate BEFORE crossing either. The Deferred-Obligation Register was checked 2026-07-12 and carries no taint-premised entry.
 
 ---
 

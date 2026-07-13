@@ -28,7 +28,7 @@ Split from `docs/adr/_source/phase3-adrs.md` by `neuro docs build`. ADR numbers 
 | [ADR-0022](0022-prompt-spill-path-condition-11.md) | Prompt spill path (condition 11) | Accepted |
 | [ADR-0023](0023-mcq-stimulus-family-stays-in-pg-condition-12.md) | MCQ stimulus family stays in PG (condition 12) | Accepted |
 | [ADR-0024](0024-ci-branch-protection-precondition-condition-13-e14.md) | CI / branch-protection precondition (condition 13 + E14) | Accepted |
-| [ADR-0025](0025-no-restricted-flag-day-one-taint-query-retrofit-path.md) | No restricted-flag day one; taint-query retrofit path | Accepted |
+| [ADR-0025](0025-no-restricted-flag-day-one-taint-query-retrofit-path.md) | No restricted-flag day one; taint-query retrofit path | Superseded by ADR-0049 (2026-07-12) |
 | [ADR-0026](0026-tracker-emit-default-off-post-finalize-emitter-seam.md) | Tracker-emit default OFF; post-finalize emitter seam | Reserved-seam |
 | [ADR-0027](0027-ndif-documented-seam-only.md) | NDIF documented seam only | Reserved-seam |
 | [ADR-0028](0028-neuronpedia-deferred-to-workflow-4.md) | Neuronpedia deferred to workflow 4 | Reserved-seam |
@@ -52,3 +52,4 @@ Split from `docs/adr/_source/phase3-adrs.md` by `neuro docs build`. ADR numbers 
 | [ADR-0046](0046-read-committed-isolation-targeted-row-locking-for-contended-paths.md) | `READ COMMITTED` isolation + targeted row-locking for contended paths | OPEN — direction recorded; point-fixes are the regression net |
 | [ADR-0047](0047-record-divergence-is-keep-first-on-conflict.md) | `record_divergence` is keep-first on conflict | Accepted — no code change (ADR-accept #3) |
 | [ADR-0048](0048-actor-campaign-key-drift-accepted-now-owner-scoped-keys-deferred.md) | `actor`/`campaign` key-drift accepted now; owner-scoped keys deferred | Accepted now (single-user) — two-layer obligation deferred (ADR-accept #5) |
+| [ADR-0049](0049-taint-query-retrofit-obligation-withdrawn-supersedes-adr-0025.md) | Taint-query retrofit obligation withdrawn (supersedes ADR-0025) | Accepted |

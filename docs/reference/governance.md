@@ -24,7 +24,7 @@ Boundary (C3): GPU/remote workers connect as `neuro_writer` (operational INSERT 
 
 ## ADR status inventory
 
-_48 ADRs._
+_49 ADRs._
 
 - Accepted: 28
 - Accepted (from pole A): 2
@@ -40,3 +40,4 @@ _48 ADRs._
 - Signed-deviation (ADR-2): 1
 - Signed-deviation (ADR-3): 1
 - Signed-deviation (ADR-4): 1
+- Superseded by ADR-0049 (2026-07-12): 1

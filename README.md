@@ -26,7 +26,7 @@ SELECT-only role by notebooks, DuckDB, and chat agents.
 The design is **Postgres-only** (ADR-0039 Reconsidered 2026-06-17); the schema is owned by Alembic
 migrations against real Postgres and is never created with `metadata.create_all`.
 
-The design of record, in-repo: [docs/adr/](docs/adr/index.md) (48 ADRs, generated from
+The design of record, in-repo: [docs/adr/](docs/adr/index.md) (49 ADRs, generated from
 `docs/adr/_source/phase3-adrs.md`) and `tests/reference/phase3-ddl.sql` (the byte-identical in-repo
 copy of the canonical frozen DDL that the migration parity test builds against). The full engagement
 corpus (capture contract, module layout, importer spec, phase checkpoints) lives outside this repo.
