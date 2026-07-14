@@ -144,33 +144,93 @@ class Repository:
     def get_or_create_actor(
         self, actor_key: str, *, kind: str = "agent", display_name: str | None = None
     ) -> int:
+        """Register-first, fail-loud on IDENTITY drift (ADR-0048 layer (a); Deferred-Obligation Register —
+        trigger = multi-user creds OR the importer, now arriving).
+
+        IDENTITY = (`actor_key`, `kind`). Re-registering an actor_key under a DIFFERENT kind raises
+        IdentityMismatchError — one human-readable key colliding across kinds (e.g. an `importer` key hitting
+        an existing `agent`) is exactly the silent misattribution this closes.
+
+        `display_name` is a mutable human LABEL, not identity: it is deliberately NOT compared, and the
+        EXISTING row's label is KEPT (no last-writer-wins). The column is NOT NULL and the INSERT coerces
+        `display_name or actor_key`, so there is no stored "unspecified" state to compare against; and the
+        registrar holds NO UPDATE on `actors` (grants.sql), so raising on a label would be unrecoverable
+        in-role. Relabeling is an admin act.
+
+        Bare ON CONFLICT (no arbiter) + re-SELECT also closes the concurrent-first-creation race (the
+        BLOCK-1/1b class): `actors` carries exactly ONE non-PK unique (`actor_key`).
+        """
         with self.engine.begin() as conn:
-            existing = conn.execute(
-                text("SELECT actor_id FROM neuro.actors WHERE actor_key = :k"), {"k": actor_key}
-            ).scalar_one_or_none()
-            if existing is not None:
-                return existing
-            return conn.execute(
+            inserted = conn.execute(
                 text(
                     "INSERT INTO neuro.actors (actor_key, kind, display_name) "
-                    "VALUES (:k, :kind, :dn) RETURNING actor_id"
+                    "VALUES (:k, :kind, :dn) ON CONFLICT DO NOTHING RETURNING actor_id"
                 ),
                 {"k": actor_key, "kind": kind, "dn": display_name or actor_key},
-            ).scalar_one()
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            existing = (
+                conn.execute(
+                    text("SELECT actor_id, kind FROM neuro.actors WHERE actor_key = :k"),
+                    {"k": actor_key},
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if existing is None:  # actor_key is the ONLY non-PK unique -> a conflict must be findable
+                raise IdentityMismatchError(
+                    f"actor {actor_key!r} could not be created and does not exist (fail loud)."
+                )
+            if existing["kind"] != kind:
+                raise IdentityMismatchError(
+                    f"actor {actor_key!r} is already registered with kind {existing['kind']!r}, not "
+                    f"{kind!r} — refusing to bind one actor_key to two kinds (register-first, fail-loud; "
+                    "ADR-0048 layer (a))."
+                )
+            return existing["actor_id"]
 
     def get_or_create_campaign(self, campaign_key: str, actor_id: int) -> int:
+        """Register-first, fail-loud on OWNERSHIP drift (ADR-0048 layer (a); the headline bite).
+
+        The campaign's owner (`actor_id`) IS identity-bearing. Previously this returned the existing row by
+        key with NO comparison, so re-creating a campaign_key under a DIFFERENT actor_id silently KEPT the
+        old owner — a silent ownership/lineage reassignment (harmless single-user; the real bite is two
+        owners colliding on a shared human-readable key, which the importer makes reachable at scale). It
+        now raises IdentityMismatchError.
+
+        Bare ON CONFLICT + re-SELECT also closes the concurrent-first-creation race; `campaigns` carries
+        exactly ONE non-PK unique (`campaign_key`).
+        """
         with self.engine.begin() as conn:
-            existing = conn.execute(
-                text("SELECT campaign_id FROM neuro.campaigns WHERE campaign_key = :k"), {"k": campaign_key}
-            ).scalar_one_or_none()
-            if existing is not None:
-                return existing
-            return conn.execute(
+            inserted = conn.execute(
                 text(
-                    "INSERT INTO neuro.campaigns (campaign_key, actor_id) VALUES (:k, :a) RETURNING campaign_id"
+                    "INSERT INTO neuro.campaigns (campaign_key, actor_id) VALUES (:k, :a) "
+                    "ON CONFLICT DO NOTHING RETURNING campaign_id"
                 ),
                 {"k": campaign_key, "a": actor_id},
-            ).scalar_one()
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            existing = (
+                conn.execute(
+                    text("SELECT campaign_id, actor_id FROM neuro.campaigns WHERE campaign_key = :k"),
+                    {"k": campaign_key},
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if existing is None:  # campaign_key is the ONLY non-PK unique -> a conflict must be findable
+                raise IdentityMismatchError(
+                    f"campaign {campaign_key!r} could not be created and does not exist (fail loud)."
+                )
+            if existing["actor_id"] != actor_id:
+                raise IdentityMismatchError(
+                    f"campaign {campaign_key!r} is already owned by actor_id {existing['actor_id']}, not "
+                    f"{actor_id} — refusing to silently reassign ownership/lineage (register-first, "
+                    "fail-loud; ADR-0048 layer (a))."
+                )
+            return existing["campaign_id"]
 
     def get_or_create_run(
         self,
@@ -563,12 +623,16 @@ class Repository:
 
     # --- MEASURED determinism: method registry + replicate links + divergence (ADR-0004/0011) ----
     def register_method_version(
-        self, *, method_key: str, semver: str, code_sha: bytes, set_active: bool = True
+        self, *, method_key: str, semver: str, code_sha: bytes, set_active: bool
     ) -> int:
         """Register-first, fail-loud a method version (ADR-0011 registry/runtime parity). The method is
         ensured first; the version is INSERT-only by (method_id, semver). On conflict the recorded code_sha
         must MATCH — a same-semver re-register with a DIFFERENT implementation hash raises (bump the semver
-        when the code changes). Optionally points methods.active_version_id at this version."""
+        when the code changes). A recorded NULL code_sha is UNVERIFIABLE and can never be adopted (see below).
+
+        `set_active` is REQUIRED (no default): it repoints methods.active_version_id, and a defaulted True
+        made EVERY call a silent last-write-wins repoint of the registry's active pointer. Callers state
+        intent."""
         with self.engine.begin() as conn:
             method_id = conn.execute(
                 text(
@@ -600,7 +664,18 @@ class Repository:
                     .mappings()
                     .one()
                 )
-                if existing["code_sha"] is not None and bytes(existing["code_sha"]) != code_sha:
+                # A recorded NULL code_sha is UNVERIFIABLE: the old guard short-circuited on it
+                # (`is not None and ...`), so such a row was silently ADOPTED against ANY incoming hash —
+                # permanently defeating ADR-0011 parity for that method_key@semver, and every promotions row
+                # FK'd to it would then carry an unverifiable governance stamp. Fail closed instead.
+                if existing["code_sha"] is None:
+                    raise IdentityMismatchError(
+                        f"method {method_key}@{semver} is recorded with a NULL code_sha — an UNVERIFIABLE "
+                        "version cannot be adopted (a NULL sha would match ANY implementation, silently "
+                        "defeating ADR-0011 registry/runtime parity). Re-register it with its real code_sha "
+                        "or bump the semver."
+                    )
+                if bytes(existing["code_sha"]) != code_sha:
                     raise IdentityMismatchError(
                         f"method {method_key}@{semver} already registered with a different code_sha "
                         f"(ADR-0011 registry/runtime parity) — bump the semver when the implementation changes."

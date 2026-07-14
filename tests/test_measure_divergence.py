@@ -187,7 +187,9 @@ def test_assert_meets_expected_bitwise_and_tolerance():
 @pytest.mark.pg
 def test_register_method_version_sets_active_and_detects_drift(repo):
     sha_a = b"\xaa" * 32
-    mv1 = repo.register_method_version(method_key="logprob_divergence", semver="1.0.0", code_sha=sha_a)
+    mv1 = repo.register_method_version(
+        method_key="logprob_divergence", semver="1.0.0", code_sha=sha_a, set_active=True
+    )
     with repo.engine.connect() as conn:
         active = conn.execute(
             text("SELECT active_version_id FROM neuro.methods WHERE method_key = 'logprob_divergence'")
@@ -195,13 +197,20 @@ def test_register_method_version_sets_active_and_detects_drift(repo):
     assert active == mv1
     # idempotent: same semver + same sha -> same id
     assert (
-        repo.register_method_version(method_key="logprob_divergence", semver="1.0.0", code_sha=sha_a) == mv1
+        repo.register_method_version(
+            method_key="logprob_divergence", semver="1.0.0", code_sha=sha_a, set_active=True
+        )
+        == mv1
     )
     # drift: same semver, DIFFERENT sha -> raises (ADR-0011 registry/runtime parity)
     with pytest.raises(IdentityMismatchError):
-        repo.register_method_version(method_key="logprob_divergence", semver="1.0.0", code_sha=b"\xbb" * 32)
+        repo.register_method_version(
+            method_key="logprob_divergence", semver="1.0.0", code_sha=b"\xbb" * 32, set_active=True
+        )
     # a new semver coexists
-    mv2 = repo.register_method_version(method_key="logprob_divergence", semver="1.1.0", code_sha=b"\xcc" * 32)
+    mv2 = repo.register_method_version(
+        method_key="logprob_divergence", semver="1.1.0", code_sha=b"\xcc" * 32, set_active=True
+    )
     assert mv2 != mv1
 
 
@@ -268,7 +277,9 @@ def test_record_divergence_idempotent(seeded):
     repo = seeded["repo"]
     r1, r2 = _two_runs_same_fp(seeded)
     link = repo.link_replicate(original_run_id=r1, replicate_run_id=r2)
-    mv = repo.register_method_version(method_key="logprob_divergence", semver="1.0.0", code_sha=b"\x01" * 32)
+    mv = repo.register_method_version(
+        method_key="logprob_divergence", semver="1.0.0", code_sha=b"\x01" * 32, set_active=True
+    )
     common = dict(
         replicate_link_id=link,
         method_version_id=mv,

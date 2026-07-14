@@ -51,5 +51,5 @@ Split from `docs/adr/_source/phase3-adrs.md` by `neuro docs build`. ADR numbers 
 | [ADR-0045](0045-content-addressed-wire-spill-seam-shard-storage-keys.md) | Content-addressed wire-spill + seam shard storage keys | Accepted — Phase 5 red-team correction (FIX #1 + #7) |
 | [ADR-0046](0046-read-committed-isolation-targeted-row-locking-for-contended-paths.md) | `READ COMMITTED` isolation + targeted row-locking for contended paths | OPEN — direction recorded; point-fixes are the regression net |
 | [ADR-0047](0047-record-divergence-is-keep-first-on-conflict.md) | `record_divergence` is keep-first on conflict | Accepted — no code change (ADR-accept #3) |
-| [ADR-0048](0048-actor-campaign-key-drift-accepted-now-owner-scoped-keys-deferred.md) | `actor`/`campaign` key-drift accepted now; owner-scoped keys deferred | Accepted now (single-user) — two-layer obligation deferred (ADR-accept #5) |
+| [ADR-0048](0048-actor-campaign-key-drift-accepted-now-owner-scoped-keys-deferred.md) | `actor`/`campaign` key-drift accepted now; owner-scoped keys deferred | Layer (a) BUILT 2026-07-14 (drift-guard landed); layer (b) owner-scoped keys still deferred (ADR-accept #5) |
 | [ADR-0049](0049-taint-query-retrofit-obligation-withdrawn-supersedes-adr-0025.md) | Taint-query retrofit obligation withdrawn (supersedes ADR-0025) | Accepted |

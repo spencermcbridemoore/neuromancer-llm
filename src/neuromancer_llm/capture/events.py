@@ -739,7 +739,10 @@ def replicate_and_measure(
     """
     # register-first: the divergence method version must exist before any divergence row references it.
     method_version_id = repo.register_method_version(
-        method_key=DIVERGENCE_METHOD_KEY, semver=method_semver, code_sha=divergence_method_code_sha()
+        method_key=DIVERGENCE_METHOD_KEY,
+        semver=method_semver,
+        code_sha=divergence_method_code_sha(),
+        set_active=True,  # explicit (no default): this repoints methods.active_version_id
     )
     link_id = repo.link_replicate(original_run_id=original.run_id, replicate_run_id=replicate.run_id)
     divergence = compare(original.sample, replicate.sample)

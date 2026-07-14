@@ -5,11 +5,16 @@ Probes that the identity registries refuse to adopt a divergent or caller-truste
   * FIX #8 / L-SB — storage_backend identity is register-first/immutable (no DO UPDATE repoint).
   * FIX #9 — register_model_identity derives tokenizer_id FROM tokenizer_hash (no id/hash split).
   * L5 / L11 GAP probes — drift on the other identity dimensions raises (guards present, untested).
-  * #5 (ADR-accept) — get_or_create_actor/campaign key-drift is accepted single-user; this DOCUMENTS the
-    current behavior + cites the deferred obligation (it does not assert a fix).
+  * ADR-0048 layer (a) — get_or_create_actor/campaign key-drift now RAISES (2026-07-14). These probes
+    formerly DOCUMENTED the accepted-now bug; the recorded trigger ("multi-user creds OR the importer") is
+    arriving, layer (a) is BUILT, and they now assert the FIX. Layer (b) (owner-scoped keys) stays deferred.
+  * ADR-0011 — a recorded NULL code_sha is UNVERIFIABLE and must never be adopted; set_active is explicit.
 """
 
 from __future__ import annotations
+
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from sqlalchemy import text
@@ -127,9 +132,11 @@ def test_rt_model_identity_no_tokenizer_split(repo):
 def test_rt_method_version_code_sha_drift(repo):
     """L5 GAP: same (method_key, semver) re-registered with a DIFFERENT code_sha raises (bump the semver
     when the implementation changes; ADR-0011 registry/runtime parity)."""
-    repo.register_method_version(method_key="m_probe", semver="1.0.0", code_sha=b"\xaa" * 32)
+    repo.register_method_version(method_key="m_probe", semver="1.0.0", code_sha=b"\xaa" * 32, set_active=True)
     with pytest.raises(IdentityMismatchError):
-        repo.register_method_version(method_key="m_probe", semver="1.0.0", code_sha=b"\xbb" * 32)
+        repo.register_method_version(
+            method_key="m_probe", semver="1.0.0", code_sha=b"\xbb" * 32, set_active=True
+        )
 
 
 # --- L11 GAP: get_or_create_run drift on the OTHER immutable fields ---------------------------------
@@ -168,22 +175,123 @@ def test_rt_get_or_create_run_invocation_id_drift(seeded):
         repo.get_or_create_run("c-test/iv/v1", **base, invocation_id=_uuid.uuid4())
 
 
-# --- #5 (ADR-accept): actor/campaign key-drift is accepted single-user (DOCUMENTS, not a fix) -------
-def test_rt_actor_campaign_keydrift_accepted_now(seeded):
-    """#5 ADR-accept + DEFERRED-OBLIGATION: get_or_create_campaign returns the EXISTING row by key with NO
-    comparison — a campaign re-created under the same campaign_key but a different actor_id silently keeps
-    the old owner. Accepted under single-user creds; the real bite (two users colliding on a shared key ->
-    silent ownership/lineage reassignment) is a deferred obligation (trigger = multi-user creds OR the
-    importer; see the Deferred-Obligation Register). This probe PINS the current single-user behavior so a
-    future change is visible."""
+# --- ADR-0048 layer (a): actor/campaign key-drift now RAISES (the importer trigger is arriving) -----
+# ⚠ HISTORY (2026-07-14): this probe formerly ASSERTED the BROKEN behavior ("the deferred guard would raise
+# here"). Its recorded trigger — "multi-user creds OR the importer" — is arriving; layer (a) is now BUILT and
+# the probe asserts the RAISE. Do NOT "fix" the code to make an accepted-now assertion pass again: that would
+# RE-INTRODUCE the silent ownership/lineage reassignment. Layer (b) (owner-scoped keys) remains deferred.
+def test_rt_campaign_owner_drift_raises(seeded):
+    """ADR-0048 layer (a) — THE OWNERSHIP BITE. A campaign re-created under the SAME campaign_key but a
+    DIFFERENT actor_id previously returned the existing row and SILENTLY kept the old owner. It now raises,
+    and ownership is provably unchanged."""
     repo, aid = seeded["repo"], seeded["actor_id"]
     other = repo.get_or_create_actor("other-owner", kind="agent")
     assert other != aid
     cid = repo.get_or_create_campaign("shared-key", aid)
-    # re-create under the SAME key with a DIFFERENT actor -> the OLD row is returned (no drift guard today)
-    assert repo.get_or_create_campaign("shared-key", other) == cid
+    assert repo.get_or_create_campaign("shared-key", aid) == cid  # idempotent for the SAME owner
+    with pytest.raises(IdentityMismatchError, match="already owned by"):
+        repo.get_or_create_campaign("shared-key", other)
     with repo.engine.connect() as conn:
         owner = conn.execute(
             text("SELECT actor_id FROM neuro.campaigns WHERE campaign_id = :c"), {"c": cid}
         ).scalar_one()
-    assert owner == aid  # ownership did NOT change (accepted now; the deferred guard would raise here)
+    assert owner == aid  # ownership NOT reassigned
+
+
+def test_rt_actor_kind_drift_raises(seeded):
+    """ADR-0048 layer (a): identity is (actor_key, kind). One actor_key bound to two kinds — e.g. an
+    'importer' key colliding with an existing 'agent' — is the misattribution this closes."""
+    repo = seeded["repo"]
+    a1 = repo.get_or_create_actor("drift-key", kind="agent")
+    assert repo.get_or_create_actor("drift-key", kind="agent") == a1  # idempotent
+    with pytest.raises(IdentityMismatchError, match="already registered with kind"):
+        repo.get_or_create_actor("drift-key", kind="human")
+
+
+def test_rt_actor_display_name_is_not_identity(seeded):
+    """display_name is a mutable LABEL, not identity, and is deliberately NOT compared: the column is
+    NOT NULL and coerced to actor_key on INSERT (so there is no 'unspecified' state the C10 convention could
+    key on), and the registrar holds NO UPDATE on actors — a raise here would be unrecoverable in-role. A
+    re-register with a different label must NOT raise, and the EXISTING label is KEPT (no last-writer-wins)."""
+    repo = seeded["repo"]
+    aid = repo.get_or_create_actor("label-key", kind="agent", display_name="First Label")
+    assert repo.get_or_create_actor("label-key", kind="agent", display_name="Second Label") == aid
+    assert repo.get_or_create_actor("label-key", kind="agent") == aid  # omitted label: no false drift
+    with repo.engine.connect() as conn:
+        label = conn.execute(
+            text("SELECT display_name FROM neuro.actors WHERE actor_id = :a"), {"a": aid}
+        ).scalar_one()
+    assert label == "First Label"  # kept, not overwritten
+
+
+_RACE_WAIT = 15.0
+# A single 2-thread attempt only LOSES the race ~1/3 of the time (the BLOCK-1 200-trial hammer finding), so
+# one round would be a FLAKY revert-RED. Loop it (the FIX-A looped-probe idiom) so the non-vacuity is reliable.
+_RACE_ROUNDS = 16
+
+
+def _race_two(call):
+    """Release two threads SIMULTANEOUSLY on a Barrier (the house primitive — test_rt_concurrency._race_two).
+    An exception in EITHER thread propagates out of .result(), so a lost race fails the test loudly."""
+    barrier = threading.Barrier(2)
+
+    def _run():
+        barrier.wait(timeout=_RACE_WAIT)
+        return call()
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1, f2 = ex.submit(_run), ex.submit(_run)
+        return [f1.result(timeout=30), f2.result(timeout=30)]
+
+
+def test_rt_actor_concurrent_first_creation_one_row(seeded):
+    """Bare ON CONFLICT + re-SELECT also closes the concurrent-first-creation race (the BLOCK-1/1b class):
+    two threads released SIMULTANEOUSLY on the SAME new key yield ONE row and no IntegrityError — the old
+    SELECT-then-INSERT loses this race (both SELECT empty, both INSERT, one gets a unique violation)."""
+    repo = seeded["repo"]
+    for i in range(_RACE_ROUNDS):
+        key = f"race-key-{i}"
+        got = _race_two(lambda k=key: repo.get_or_create_actor(k, kind="agent"))
+        assert got[0] == got[1]  # both threads agree on ONE row; an IntegrityError would have propagated
+
+
+# --- ADR-0011: a recorded NULL code_sha is UNVERIFIABLE and must never be adopted -------------------
+def test_rt_method_version_null_code_sha_not_adopted(repo):
+    """The old guard read `if existing["code_sha"] is not None and ...`, so a recorded NULL sha
+    SHORT-CIRCUITED it and was silently adopted against ANY incoming hash — permanently defeating ADR-0011
+    parity for that method_key@semver (and every promotions row FK'd to it would then carry an unverifiable
+    governance stamp). A NULL sha must fail CLOSED."""
+    with repo.engine.begin() as conn:
+        mid = conn.execute(
+            text("INSERT INTO neuro.methods (method_key) VALUES ('m_null') RETURNING method_id")
+        ).scalar_one()
+        conn.execute(
+            text(
+                "INSERT INTO neuro.method_versions (method_id, semver, code_sha) VALUES (:m, '1.0.0', NULL)"
+            ),
+            {"m": mid},
+        )
+    with pytest.raises(IdentityMismatchError, match="NULL code_sha"):
+        repo.register_method_version(
+            method_key="m_null", semver="1.0.0", code_sha=b"\xaa" * 32, set_active=False
+        )
+
+
+def test_rt_method_version_set_active_is_explicit(repo):
+    """set_active is REQUIRED (no default) AND mechanically load-bearing: with set_active=False the
+    registry's active pointer must NOT move (the defaulted True made every call a silent last-write-wins
+    repoint of methods.active_version_id)."""
+    v1 = repo.register_method_version(
+        method_key="m_active", semver="1.0.0", code_sha=b"\x11" * 32, set_active=True
+    )
+    v2 = repo.register_method_version(
+        method_key="m_active", semver="2.0.0", code_sha=b"\x22" * 32, set_active=False
+    )
+    assert v1 != v2
+    with repo.engine.connect() as conn:
+        active = conn.execute(
+            text("SELECT active_version_id FROM neuro.methods WHERE method_key = 'm_active'")
+        ).scalar_one()
+    assert active == v1  # NOT repointed by the set_active=False registration
+    with pytest.raises(TypeError):  # the default is gone — callers must state intent
+        repo.register_method_version(method_key="m_active", semver="3.0.0", code_sha=b"\x33" * 32)  # type: ignore[call-arg]

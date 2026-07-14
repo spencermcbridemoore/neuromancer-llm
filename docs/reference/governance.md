@@ -30,10 +30,10 @@ _49 ADRs._
 - Accepted (from pole A): 2
 - Accepted (from pole A, resize NOT adopted): 1
 - Accepted (schema) / Reserved-seam (code): 1
-- Accepted now (single-user) — two-layer obligation deferred (ADR-accept #5): 1
 - Accepted — Phase 5 red-team correction (FIX #1 + #7): 1
 - Accepted — no code change (ADR-accept #3): 1
 - Author-discretion — **RESOLVED 2026-06-16, owner ACCEPTED** (no longer an open DoF): 2
+- Layer (a) BUILT 2026-07-14 (drift-guard landed); layer (b) owner-scoped keys still deferred (ADR-accept #5): 1
 - OPEN — direction recorded; point-fixes are the regression net: 1
 - Reserved-seam: 6
 - Signed-deviation (ADR-1): 1

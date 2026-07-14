@@ -379,7 +379,9 @@ def test_rt_record_divergence_keep_first_not_last_wins(seeded, rt):
         fingerprint_id=fp,
     )
     link = repo.link_replicate(original_run_id=r1, replicate_run_id=r2)
-    mv = repo.register_method_version(method_key="logprob_divergence", semver="1.0.0", code_sha=b"\x01" * 32)
+    mv = repo.register_method_version(
+        method_key="logprob_divergence", semver="1.0.0", code_sha=b"\x01" * 32, set_active=True
+    )
     first = repo.record_divergence(
         replicate_link_id=link,
         method_version_id=mv,
