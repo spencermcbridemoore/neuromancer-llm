@@ -862,6 +862,11 @@ class ExternalRecord(Base):
         Index(
             "external_records_kind_idx", text("(payload_jsonb ->> 'kind')")
         ),  # functional JSON index — HERE ONLY
+        # D1 confidentiality closed vocab (importer rank 5, migration 0002) — the DB itself refuses an
+        # out-of-vocab grade (a second belt under the ingress choke point; ADR-0049 Addendum "gap reads DIRTY").
+        CheckConstraint(
+            "confidentiality IN ('exam_restricted', 'open')", name="external_records_confidentiality_vocab"
+        ),
         {"schema": "neuro"},
     )
     external_record_id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
@@ -874,6 +879,10 @@ class ExternalRecord(Base):
     payload_text: Mapped[str] = mapped_column(Text, nullable=False)  # byte-exact (phase0 Q11)
     payload_jsonb: Mapped[dict | None] = mapped_column(JSONB)  # sidecar only (ADR-0003 exception)
     imported_at: Mapped[_dt.datetime] = _ts()
+    # D1 per-record stamp (migration 0002, owner ruling 2026-07-15 option B): NOT NULL so the DB refuses an
+    # unstamped row. NO server_default — a defaulted confidentiality would be the "defaulted-clean" D1 fail-open.
+    confidentiality: Mapped[str] = mapped_column(Text, nullable=False)  # grade from the batch handle (D1)
+    derived_by_predecessor: Mapped[bool] = mapped_column(Boolean, nullable=False)  # per-record marking (D1)
 
 
 class Promotion(Base):

@@ -204,7 +204,10 @@ _45 tables, 13 enum types._
 | `payload_text` | `TEXT` | NOT NULL |  |
 | `payload_jsonb` | `JSONB` |  |  |
 | `imported_at` | `TIMESTAMP WITH TIME ZONE` | NOT NULL | now() |
+| `confidentiality` | `TEXT` | NOT NULL |  |
+| `derived_by_predecessor` | `BOOLEAN` | NOT NULL |  |
 
+- CHECK `external_records_confidentiality_vocab`: confidentiality IN ('exam_restricted', 'open')
 - FOREIGN KEY: (import_batch_id) -> neuro.import_batches.import_batch_id
 - PRIMARY KEY: external_record_id
 - UNIQUE: source_system, source_table, source_pk

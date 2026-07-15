@@ -62,8 +62,9 @@ class SourceSystem(StrEnum):
 
 
 class ImporterIngressError(RuntimeError):
-    """The batch-open gate REFUSED (fail closed): an absent/invalid confidentiality or source_system stamp. Distinct
-    from the re-raised DurabilityGateError so a caller can tell 'bad stamp' from 'durability gate blocked'."""
+    """The importer REFUSED (fail closed): an absent/invalid confidentiality or source_system stamp at batch-open, OR a
+    non-text/NUL payload or an invalid handle/marking at the Layer-1 write (importer/external_records.py). Distinct from
+    the re-raised DurabilityGateError so a caller can tell an importer-side refusal from 'durability gate blocked'."""
 
 
 @dataclass(frozen=True)

@@ -71,3 +71,20 @@ def test_rt_importer_ingress_carries_the_durability_consult():
         "importer/ingress.py must CALL assert_durability_ok(...) — the ADR-0020 durability consult on the canonical "
         "lane (a docstring mention does not count)"
     )
+
+
+def test_rt_external_records_writer_has_no_durability_consult():
+    """The rank-5 Layer-1 writer must NOT re-consult the ADR-0020 durability gate per row — the rank-4 batch-open gate
+    (open_import_batch) consulted it ONCE per batch (readiness §4·3; assert_durability_ok opens two txns per call). AST-
+    based (counts Call nodes, so the module docstring's prose mention of assert_durability_ok does not satisfy it); a
+    per-row consult reddens this the moment it is added."""
+    tree = ast.parse((_IMPORTER / "external_records.py").read_text(encoding="utf-8"))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "assert_durability_ok"
+    ]
+    assert calls == [], (
+        "importer/external_records.py must NOT call assert_durability_ok — the durability consult is once-per-batch at "
+        "open_import_batch (rank 4), never per external_records row (readiness §4·3)"
+    )
