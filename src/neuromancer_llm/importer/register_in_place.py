@@ -22,13 +22,18 @@ Contract:
   * D1 CONFIDENTIALITY (owner ruling 2026-07-15, discipline-for-v1): `artifacts` has NO confidentiality column, so
     `handle.confidentiality` is NOT persisted here. A register-in-place binary's D1 grade lives SOLELY on its PAIRED
     rank-5 `external_records` manifest (mechanically stamped through the rank-4 choke point) tied by a rank-7
-    `derived_from` edge — a mapper DISCIPLINE, not a mechanism on the artifact. The handle is a disciplinary token (it
-    ties the register to a durability-consulted batch); its stamp payload is discarded. No reader may treat the handle
-    requirement as D1 coverage on the artifact.
+    **`annotates`** edge — `external_record:M annotates artifact:N`, the manifest as `src` and this binary as `dst`
+    (edge kind + direction ruled 2026-07-16; written by `importer/lineage.py::link_registered_artifact`, which is where
+    the entity-reference grammar lives). It is `annotates`, NOT `derived_from`: the manifest DESCRIBES the binary rather
+    than being a transformation of it. That edge is a mapper DISCIPLINE, not a mechanism on the artifact — an absent
+    edge does NOT mean an unstamped binary, and edge presence must never be read as coverage. The handle is likewise a
+    disciplinary token (it ties the register to a durability-consulted batch); its stamp payload is discarded. No reader
+    may treat the handle requirement as D1 coverage on the artifact.
 
 NOT here: no `table_manifests` row (its `run_id` is NOT NULL ⇒ a promoted run ⇒ Layer 2 / rank 8); no `lineage_edges`
-edge (rank 7); no bundle (bundle_id NULL); no copy; no per-row durability re-consult (once per batch at
-`open_import_batch`). PRECONDITION: part of the admin-DSN importer flow.
+edge — that is rank 7, now BUILT: the mapper calls `importer/lineage.py::link_registered_artifact` with the
+`artifact_id` this function returns; no bundle (bundle_id NULL); no copy; no per-row durability re-consult (once per
+batch at `open_import_batch`). PRECONDITION: part of the admin-DSN importer flow.
 """
 
 from __future__ import annotations
