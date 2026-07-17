@@ -39,6 +39,7 @@ def test_rt_importer_performs_no_cloud_put():
         "register_in_place.py",
         "lineage.py",
         "promote.py",
+        "mcq.py",
     }, (
         f"the D3 scan did not glob the importer modules — did _IMPORTER move? It scanned: {[p.name for p in scanned]} "
         "(an empty/wrong glob would make the offenders assertion below vacuously GREEN)"
@@ -276,4 +277,102 @@ def test_rt_promote_registers_the_method_once_per_batch_not_per_row():
         f"register_method_version is called from {sorted(set(offenders))} — it must be called ONLY by "
         "register_promotion_method (batch scope, ruling C). Per-row registration fires an unconditional "
         "methods.active_version_id UPDATE per promoted row (repository.py:684) and costs 2 extra round-trips per row."
+    )
+
+
+def test_rt_mcq_has_no_durability_consult():
+    """The rank-8b MCQ mapper must NOT re-consult the ADR-0020 durability gate per question — the rank-4 batch-open
+    gate consulted it ONCE per batch (readiness 4.3). The FIFTH consecutive rank to carry this pin (5/6/7/8a above),
+    which is what makes "the consult is once-per-batch, never per row" a MECHANISM rather than prose repeated in six
+    docstrings. AST-based (Call nodes), so a docstring mention does not satisfy it."""
+    tree = ast.parse((_IMPORTER / "mcq.py").read_text(encoding="utf-8"))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "assert_durability_ok"
+    ]
+    assert calls == [], (
+        "importer/mcq.py must NOT call assert_durability_ok — the durability consult is once-per-batch at "
+        "open_import_batch (rank 4), never per mapped question (readiness 4.3)"
+    )
+
+
+def test_rt_mcq_never_mints_a_promotion_method():
+    """RULING C at the NEW site. The existing ruling-C pin (test_rt_promote_registers_the_method_once_per_batch_not
+    _per_row) parses ONLY promote.py, so a per-question `register_promotion_method(repo)` inside the mapper's loop
+    would fire N registrations and redden NOTHING. Rank 8b RECEIVES the token from its caller and must mint none:
+    it may call neither `register_promotion_method` nor `register_method_version`.
+
+    AST-based on the Call nodes, so the module docstring's prose about batch-scoped registration cannot satisfy it.
+    A row-count probe cannot pin this — registration is idempotent, so the method_versions count stays 1 either way
+    while every row pays two extra round-trips and an unconditional methods.active_version_id UPDATE."""
+    tree = ast.parse((_IMPORTER / "mcq.py").read_text(encoding="utf-8"))
+    offenders = sorted(
+        {
+            n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Call)
+            and (
+                (
+                    isinstance(n.func, ast.Name)
+                    and n.func.id in {"register_promotion_method", "register_method_version"}
+                )
+                or (
+                    isinstance(n.func, ast.Attribute)
+                    and n.func.attr in {"register_promotion_method", "register_method_version"}
+                )
+            )
+        }
+    )
+    assert offenders == [], (
+        f"importer/mcq.py calls {offenders} — the promotion method is registered ONCE PER BATCH by the caller and "
+        "passed in (ruling C). The mapper must never mint one."
+    )
+
+
+def test_rt_stimulus_family_inserts_are_scoped_to_mcq_py():
+    """Within importer/**, `mcq.py` is the ONLY writer of the four stimulus-family tables — so the ruled
+    content_hash rule, the item_ordinal binding, the refusal filter and the raise-on-drift guards cannot be
+    bypassed by a second importer writer. Rank 8b is the FIRST producer of all four (grep-verified: zero INSERTs
+    existed in src before it), so this is the unit that owes the pin — the rank-7 lineage / rank-8a promotions
+    precedent.
+
+    DELIBERATE CARVE-OUT, matching those two: scoped to importer/** via `_IMPORTER`, NOT src-wide. `grants.sql`
+    GRANTs neuro_registrar INSERT on the stimulus family, so a legitimate future non-importer producer (a capture
+    lane registering a first-class prompt_set — the deferred registry named in capture/events.py) must not falsely
+    redden this and be pressured to route through the importer's admin-DSN module.
+
+    Matches the FULL literal as a substring (NOT a regex — the unescaped `.` would be a wildcard). `set(sites) ==
+    {...}` is a NON-EMPTY equality, so a mis-resolved glob reddens by construction; no separate non-emptiness pin
+    is needed (unlike the D3 scan above, whose assertion is `offenders == []`)."""
+    for table in ("prompt_sets", "prompt_items", "mcq_items", "mcq_options"):
+        sites = sorted(
+            {
+                py.relative_to(_SRC).as_posix()
+                for py in _IMPORTER.rglob("*.py")
+                if f"INSERT INTO neuro.{table}" in py.read_text(encoding="utf-8")
+            }
+        )
+        assert sites == ["importer/mcq.py"], (
+            f"neuro.{table} is written from {sites} — the stimulus cascade must have exactly ONE importer writer "
+            "(update this probe only with a justification; non-importer producers are out of scope by design)"
+        )
+
+
+def test_rt_mcq_never_writes_the_deferred_stimulus_tables():
+    """mcq_permutations is DEFERRED with the runs (VERIFIED: the stimulus corpus records no permutations — they are
+    run output, a deterministic function of a strategy), stimulus_structures is DEFERRED (ADR-0023
+    reserve-until-consumed), and mcq_responses is DELIBERATELY ABSENT FROM THE SCHEMA and must NEVER be created
+    (ADR-0011 / C1). Without this pin those three deferrals are prose in a docstring."""
+    offenders = sorted(
+        {
+            f"{py.relative_to(_SRC).as_posix()}: {table}"
+            for py in _IMPORTER.rglob("*.py")
+            for table in ("mcq_permutations", "stimulus_structures", "mcq_responses")
+            if f"INSERT INTO neuro.{table}" in py.read_text(encoding="utf-8")
+        }
+    )
+    assert offenders == [], (
+        f"the importer writes a DEFERRED/FORBIDDEN stimulus table: {offenders} — mcq_permutations rides with the "
+        "runs, stimulus_structures is ADR-0023 reserve-until-consumed, and mcq_responses must never exist"
     )

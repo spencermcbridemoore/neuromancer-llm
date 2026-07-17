@@ -21,13 +21,24 @@ def sha256_bytes(data: bytes) -> bytes:
     return hashlib.sha256(data).digest()
 
 
-def _canonical(obj: Any) -> bytes:
+def canonical_bytes(obj: Any) -> bytes:
+    """THE ONE canonical serialization every content hash is taken over (sorted keys, no insignificant whitespace).
+
+    Public — not because a caller may want a *variant*, but so a producer that must STORE the very bytes it hashes
+    (the importer's Layer-1 mirror, importer/mcq.py) cannot fork the convention by hand-rolling a second
+    `json.dumps(...)`. One implementation per concept (binding constraint); a divergent `ensure_ascii` would mint a
+    different hash for the same object.
+    """
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
 def content_hash(obj: Any) -> bytes:
-    """Content-hash identity for prompt sets / derived sets (phase0 Q1/Q3)."""
-    return sha256_bytes(_canonical(obj))
+    """Content-hash identity for prompt sets / derived sets (phase0 Q1/Q3).
+
+    This is `prompt_sets.content_hash`'s named producer — the column's DDL comment cites the same phase0 Q1/Q3
+    (tests/reference/phase3-ddl.sql:489 / db/orm.py:712). Any writer of that column MUST come through here.
+    """
+    return sha256_bytes(canonical_bytes(obj))
 
 
 def model_identity_hash(
