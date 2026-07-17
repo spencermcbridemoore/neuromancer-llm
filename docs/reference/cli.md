@@ -28,7 +28,7 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro docs` — Generated docs (schema/CLI/env/governance) — docs cannot rot.
 - `neuro docs build` — Regenerate the docs from the live models/CLI. With --check, fail loudly on any drift (byte-stable).
 - `neuro importer` — Appendix-A importer: scan | promote | status.
-- `neuro importer promote` — STAGE 2 — Layer 2 selective promotion (governance trio per row, ADR-0011).
+- `neuro importer promote` — STAGE 2 — Layer 2 selective promotion (importer/promote.py: a batch-scoped governance stamp; ADR-0011's trio does not attach to the stimulus family).
 - `neuro importer scan` — STAGE 2 — Layer 1 faithful external-records upsert (idempotent on the natural key).
 - `neuro importer status` — STAGE 2 — coverage report (mirrored / promoted / derived-by-predecessor).
 - `neuro probe` — Operator probes: run | report | verify-config.

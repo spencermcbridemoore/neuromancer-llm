@@ -19,8 +19,12 @@ RULE 1 — FORMAT / CANONICAL FORM: `<entity-noun>:<pk>`, matched by `_REF_RE` w
 RULE 2 — THE NOUN: the ORM CLASS NAME in snake_case (equivalently: the singularized `__tablename__`).
     ***NEVER THE PK-COLUMN STEM.*** The rule is total and collision-free across all 45 ORM classes and reproduces every
     case where the two derivations agree (`Run`→`run`, `Artifact`→`artifact`, `ExternalRecord`→`external_record`,
-    matching the frozen DDL's seeded `'run:1234'`). SIX tables DISCRIMINATE — these are exactly what a future extender
-    gets wrong, so they are pinned here:
+    matching the frozen DDL's seeded `'run:1234'`). NINE classes discriminate; the SIX REFERENCEABLE ones are pinned
+    below — these are exactly what a future extender gets wrong. The other three are INEXPRESSIBLE under RULE 1's
+    `[1-9][0-9]*` pk group and must NEVER be added to ENTITY_KINDS: `database_identity` (pk `only_row`, Boolean),
+    `job_dependencies` (COMPOSITE pk), `system_health` (pk `health_key`, Text). ⚠ `job_dependencies` is the live trap:
+    its pk stem is `job_id`, so a naive stem-derivation mints `job:5` — which PASSES `_REF_RE` while denoting a `runs`-
+    adjacent `jobs` row, NOT a `job_dependencies` row. The six referenceable discriminators:
 
         table (PK column)                          ✅ noun                              ❌ NOT
         model_identities (model_id)                model_identity:88                   model:88
@@ -45,8 +49,10 @@ RULE 3 — THE DIRECTION: A ROW READS AS THE ENGLISH SENTENCE `src <edge_kind> d
 
     One worked example per directional family:
         `external_record:M annotates artifact:N`            — the manifest annotates the binary  (THIS module, rank 7)
-        `model_identity:N promoted_from external_record:M`  — the native row was promoted FROM the record  (rank 8)
-    Note the second is NOT `external_record promoted_from model_identity`: a rank-8 mapper that copied rank 7's
+        `mcq_item:N promoted_from external_record:M`        — the native row was promoted FROM the record  (rank 8a)
+        `model_identity:N promoted_from external_record:M`  — a FUTURE promotion; D5 defers model-identity promotion
+                                                              out of v1, so nothing writes this today
+    Note neither `promoted_from` example is `external_record promoted_from <native>`: a mapper that copied rank 7's
     src-position instead of the sentence rule would write it backwards. Corroborated by the typed-FK precedent
     `prompt_sets.derived_from_run_id` — the derived party holds the pointer to its source, i.e. src→dst.
 
@@ -56,14 +62,16 @@ ENTITY_KINDS is LOAD-BEARING, not advisory: `parse_entity_ref` (and therefore `w
 noun, so a typo (`extenral_record:1`), a plural table name (`artifacts:45` — the mistake RULE 2 forbids), or a ref to a
 forbidden table (`mcq_responses:9`) cannot reach the DB. The map is FROZEN (`MappingProxyType`), so the vocabulary
 cannot be widened at a distance either — a caller doing `ENTITY_KINDS['run'] = 'runs'` in its own module gets a
-TypeError, not a silent new noun. Rank 7 seeds ONLY the Layer-1 nouns it references; a Layer-2 noun (`run`,
-`model_identity`, `prompt_set`, `campaign`, `actor`, `mcq_item`, …) is a DELIBERATE one-line addition HERE at rank 8
-under RULE 2 — never a guess at a call site.
+TypeError, not a silent new noun. Rank 7 seeded ONLY the Layer-1 nouns; rank 8a added `mcq_item` (its promotion
+target). Further nouns (`run`, `model_identity`, `prompt_set`, `campaign`, `actor`, …) arrive the same way — a
+DELIBERATE one-line addition HERE, under RULE 2, one per noun — never a guess at a call site. The exact-equality test
+on this map is the no-front-run mechanism: it must never be loosened to a subset check.
 
 NAMESPACE: `promotions.promoted_kind` (un-CHECKed text: 'model_identity' | 'mcq_stimulus' | 'run_summary') is a
-DIFFERENT namespace that encodes a similar relationship. A rank-8 `promoted_from` edge references the CONCRETE NATIVE
-ROW (`model_identity:{promoted_pk} promoted_from external_record:{M}`), NEVER the `promoted_kind` string;
-'mcq_stimulus'/'run_summary' have no entity noun until their table exists.
+DIFFERENT namespace that encodes a similar relationship. A `promoted_from` edge references the CONCRETE NATIVE ROW
+(`mcq_item:{promoted_pk} promoted_from external_record:{M}` — rank 8a's shipped instance), NEVER the `promoted_kind`
+string; 'mcq_stimulus'/'run_summary' have no entity noun (there is no `McqStimulus` class and no `mcq_stimuli` table
+— rank 8a BRIDGES the kind to a DIFFERENT noun in `importer/promote.py`, it does not make the kind a noun).
 
 IDEMPOTENCY = PURE KEEP-FIRST (ADR-0047; ruled 2026-07-16). A re-write of an existing `(edge_kind, src, dst)` triple
 with a different `method_version_id` or `note` KEEPS THE FIRST — it does not raise and does not update. That is a real
@@ -111,6 +119,7 @@ ENTITY_KINDS: Mapping[str, str] = MappingProxyType(
     {
         "external_record": "external_records",
         "artifact": "artifacts",
+        "mcq_item": "mcq_items",  # rank 8a — the FIRST Layer-2 noun (McqItem -> mcq_item; RULE 2, both derivations agree)
     }
 )
 

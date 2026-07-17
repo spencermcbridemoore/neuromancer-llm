@@ -17,7 +17,7 @@ def scan() -> None:
 
 @app.command()
 def promote() -> None:
-    """STAGE 2 — Layer 2 selective promotion (governance trio per row, ADR-0011)."""
+    """STAGE 2 — Layer 2 selective promotion (importer/promote.py: a batch-scoped governance stamp; ADR-0011's trio does not attach to the stimulus family)."""
     stage2("importer promote")
 
 

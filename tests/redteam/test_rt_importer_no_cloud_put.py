@@ -38,6 +38,7 @@ def test_rt_importer_performs_no_cloud_put():
         "external_records.py",
         "register_in_place.py",
         "lineage.py",
+        "promote.py",
     }, (
         f"the D3 scan did not glob the importer modules — did _IMPORTER move? It scanned: {[p.name for p in scanned]} "
         "(an empty/wrong glob would make the offenders assertion below vacuously GREEN)"
@@ -174,4 +175,105 @@ def test_rt_importer_lineage_insert_is_scoped_to_lineage_py():
         f"lineage_edges is written from more than one importer site: {sorted(set(sites))} — the grammar + keep-first "
         "must not be bypassable (update this probe only with a justification; non-importer producers are out of scope "
         "by design, see the docstring)"
+    )
+
+
+def test_rt_promote_has_no_durability_consult():
+    """The rank-8a promotion writer must NOT re-consult the ADR-0020 durability gate per promotion — the rank-4
+    batch-open gate consulted it ONCE per batch (readiness §4·3). The fourth consecutive rank to carry this pin (5/6/7
+    above), which is what makes "the consult is once-per-batch, never per row" a MECHANISM rather than prose repeated in
+    five docstrings. AST-based (Call nodes), so a docstring mention does not satisfy it."""
+    tree = ast.parse((_IMPORTER / "promote.py").read_text(encoding="utf-8"))
+    calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "assert_durability_ok"
+    ]
+    assert calls == [], (
+        "importer/promote.py must NOT call assert_durability_ok — the durability consult is once-per-batch at "
+        "open_import_batch (rank 4), never per promotion (readiness §4·3)"
+    )
+
+
+def test_rt_promotion_method_token_is_unforgeable():
+    """The PromotionMethod token is constructed ONLY in importer/promote.py (mirrors the ImportBatchHandle scan above),
+    so a caller cannot fabricate a governance stamp. Forging `PromotionMethod(method_version_id=999)` would FK the
+    promotions row to a version that did NOT perform the promotion — a silently false ADR-0011 stamp that satisfies the
+    NOT-NULL FK and reads clean. This is the mechanism behind fork B's "the module mints it, never a raw
+    method_version_id": without the scan, the token is only a convention.
+
+    Scoped src-wide (like ImportBatchHandle, not like the importer-scoped INSERT scans): there is no grant-sanctioned
+    non-importer producer of this token — it is this module's own type. `promote.py` is the ALLOWED site, so unlike
+    `ImportBatchHandle(` it may name the constructor. The `(?<!class )` lookbehind excludes the dataclass definition;
+    `PromotionResult(` cannot false-match (the `R` intervenes)."""
+    callsites: list[str] = []
+    for py in sorted(_SRC.rglob("*.py")):
+        rel = py.relative_to(_SRC).as_posix()
+        src = py.read_text(encoding="utf-8")
+        callsites += [rel for _ in re.finditer(r"(?<!class )PromotionMethod\(", src)]
+    assert set(callsites) == {"importer/promote.py"}, (
+        f"PromotionMethod( constructed outside importer/promote.py: {sorted(set(callsites))} — the governance stamp "
+        "must be minted only by register_promotion_method (update this probe only with a justification)"
+    )
+
+
+def test_rt_promotions_insert_is_scoped_to_promote_py():
+    """Within importer/**, `promote.py` is the ONLY promotions INSERT site — so the closed PromotedKind vocabulary
+    cannot be bypassed. WITHOUT this, promote.py's "D5 by construction" is a FALSE NORMATIVE CLAIM: the enum refuses
+    `model_identity` only for CALLERS of promote_external_record, and nothing makes that the only writer. A future
+    appendix_a mapper (which inherits the D3 + lineage scans by rglob, and by omission would learn promotions is
+    unconstrained) could raw-SQL `INSERT INTO neuro.promotions (..., 'model_identity', ...)` and every gate would stay
+    GREEN: promoted_kind is un-CHECKed text (phase3-ddl.sql:628), the importer runs on the admin DSN (GRANT ALL), and
+    the edge cannot backstop it (an absent edge means nothing to a reader — rank 7's honest register).
+
+    DELIBERATE CARVE-OUT — scoped to importer/** (matching the lineage scan above), NOT src-wide: grants.sql:50-52
+    sanctions `neuro_registrar` INSERT on promotions, so a src-wide pin would falsely redden a legitimate future
+    non-importer producer and pressure its builder to route through the importer's admin-DSN module.
+
+    Matches the FULL literal as a substring (NOT a regex — the unescaped `.` would be a wildcard). The `Promotion(`
+    half is forward insurance against a `session.add(Promotion(...))` ORM insert; the `(?<!class )` lookbehind is
+    load-bearing against `class Promotion(Base)` in db/orm.py (out of this scan's scope anyway) and `PromotionResult(`
+    / `PromotionMethod(` cannot false-match (the `R`/`M` intervenes). `set(sites) == {...}` is a NON-EMPTY equality, so
+    a mis-resolved glob reddens by construction — no separate non-emptiness pin needed."""
+    sites: list[str] = []
+    for py in sorted(_IMPORTER.rglob("*.py")):
+        rel = py.relative_to(_SRC).as_posix()
+        src = py.read_text(encoding="utf-8")
+        if "INSERT INTO neuro.promotions" in src:
+            sites.append(rel)
+        sites += [rel for _ in re.finditer(r"(?<!class )Promotion\(", src)]
+    assert set(sites) == {"importer/promote.py"}, (
+        f"promotions is written from more than one importer site: {sorted(set(sites))} — the closed PromotedKind "
+        "vocabulary (and D5 with it) must not be bypassable (update this probe only with a justification)"
+    )
+
+
+def test_rt_promote_registers_the_method_once_per_batch_not_per_row():
+    """RULING C (owner, 2026-07-16): the promotion method is registered at BATCH scope, never per promoted row.
+
+    THIS is the mechanism for that ruling — a row-count probe CANNOT pin it, because register_method_version is
+    idempotent: a per-row re-registration would return the same id and leave the method_versions count at 1, so the
+    count stays GREEN while every row pays an INSERT...ON CONFLICT + a re-SELECT AND fires repository.py:684's
+    `if set_active:` (which sits OUTSIDE the newly-inserted branch, so it runs on EVERY call) — N unconditional UPDATEs
+    writing an unchanging value to one shared `methods` row, serializing a bulk import on that row-lock and leaving a
+    dead tuple per promotion.
+
+    AST-based: `register_method_version` may be called ONLY inside `register_promotion_method`, never inside
+    `promote_external_record`. Moving the call back into the per-row path reddens this."""
+    tree = ast.parse((_IMPORTER / "promote.py").read_text(encoding="utf-8"))
+    offenders: list[str] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for n in ast.walk(fn):
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "register_method_version"
+            ):
+                offenders.append(fn.name)
+    assert set(offenders) == {"register_promotion_method"}, (
+        f"register_method_version is called from {sorted(set(offenders))} — it must be called ONLY by "
+        "register_promotion_method (batch scope, ruling C). Per-row registration fires an unconditional "
+        "methods.active_version_id UPDATE per promoted row (repository.py:684) and costs 2 extra round-trips per row."
     )

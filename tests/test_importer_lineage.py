@@ -14,6 +14,7 @@ the other's probe.
 
 from __future__ import annotations
 
+import re
 from typing import cast
 
 import pytest
@@ -142,9 +143,38 @@ def test_entity_ref_refuses_unknown_kind():
 
 
 def test_entity_kinds_maps_noun_to_table():
-    """The registry is a noun→table map so a reader resolving a ref gets the table for free. Rank 7 seeds ONLY the
-    Layer-1 nouns (no Layer-2 front-run)."""
-    assert ENTITY_KINDS == {"external_record": "external_records", "artifact": "artifacts"}
+    """The registry is a noun→table map so a reader resolving a ref gets the table for free. Rank 7 seeded ONLY the
+    Layer-1 nouns; rank 8a added EXACTLY ONE Layer-2 noun (`mcq_item`, its promotion target).
+
+    ⚠ THE EXACT EQUALITY IS THE MECHANISM — never loosen it to a subset/membership check. It is the only thing that
+    makes a new noun a DELIBERATE, reviewed act: loosened, a future rank could slip in `model_identity` (D5) or
+    `run_summary` (the ADR-0048 watch-point) with nothing reddening."""
+    assert ENTITY_KINDS == {
+        "external_record": "external_records",
+        "artifact": "artifacts",
+        "mcq_item": "mcq_items",
+    }
+
+
+def test_entity_kinds_values_obey_rule_2():
+    """RULE 2 as a MECHANISM, not a docstring: every noun→table entry must equal snake_case(ORM class name) for the
+    class owning that table. The exact-equality test above pins the KEYSET; without this, the VALUE side is unpinned
+    (nothing in src reads a value — the writer only tests membership), so a typo like {'mcq_item': 'mcq_item'} would
+    pass every other probe. Derived from the ORM registry so it cannot drift from the schema."""
+    from neuromancer_llm.db.orm import Base
+
+    by_table = {
+        m.class_.__tablename__: m.class_.__name__
+        for m in Base.registry.mappers
+        if hasattr(m.class_, "__tablename__")
+    }
+    for noun, table in ENTITY_KINDS.items():
+        assert table in by_table, f"ENTITY_KINDS[{noun!r}] names {table!r}, which is not an ORM table"
+        expected = re.sub(r"(?<!^)(?=[A-Z])", "_", by_table[table]).lower()
+        assert noun == expected, (
+            f"RULE 2: the noun for {table!r} must be snake_case(ORM class {by_table[table]!r}) = {expected!r}, "
+            f"not {noun!r} (never the PK-column stem)"
+        )
 
 
 # --- the generic writer --------------------------------------------------------------------------

@@ -62,17 +62,29 @@ class SourceSystem(StrEnum):
 
 
 class ImporterIngressError(RuntimeError):
-    """The importer REFUSED (fail closed): an absent/invalid confidentiality or source_system stamp at batch-open, OR a
-    non-text/NUL payload or an invalid handle/marking at the Layer-1 write (importer/external_records.py). Distinct from
-    the re-raised DurabilityGateError so a caller can tell an importer-side refusal from 'durability gate blocked'."""
+    """The importer REFUSED (fail closed) — the shared refusal type across every importer writer: an absent/invalid
+    confidentiality or source_system stamp at batch-open (here); a non-text/NUL payload or an invalid handle/marking
+    at the Layer-1 write (external_records.py); a bad handle/kind/retention/shape or an unreadable path at
+    register-in-place (register_in_place.py); an unknown edge_kind or a non-canonical/unknown-noun entity ref
+    (lineage.py); an invalid handle/method/kind or a promoted_pk naming no live row (promote.py). Distinct from the
+    re-raised DurabilityGateError so a caller can tell an importer-side refusal from 'durability gate blocked', and
+    from IdentityMismatchError, which is reserved for DRIFT (a divergent claim about an already-keyed object)."""
 
 
 @dataclass(frozen=True)
 class ImportBatchHandle:
-    """The capability token minted ONLY by open_import_batch, after the stamp + durability checks pass. Rank 5's
-    external_records writer requires one (not a raw id), and external_records.import_batch_id is a NOT NULL FK, so
-    routing through the gate is structural. Construction is pinned to this module by
-    tests/redteam/test_rt_importer_no_cloud_put.py — the token cannot be forged to bypass the gate."""
+    """The capability token minted ONLY by open_import_batch, after the stamp + durability checks pass. Construction
+    is pinned to this module by tests/redteam/test_rt_importer_no_cloud_put.py — the token cannot be forged to bypass
+    the gate.
+
+    ⚠ THE COVERAGE IT BUYS DIFFERS BY CONSUMER — do not generalize from rank 5. For rank 5's external_records writer
+    the routing is STRUCTURAL: external_records.import_batch_id is a NOT NULL FK, so a persisted record proves its
+    batch passed this gate. For every OTHER consumer the token is DISCIPLINARY ONLY — artifacts (rank 6),
+    lineage_edges (rank 7) and promotions (rank 8a) have NO import_batch_id column, so nothing about the batch is
+    persisted on those rows and NO READER MAY TREAT the handle requirement as ADR-0020 gate coverage on them. What it
+    still forces on every path is the once-per-batch consult itself: assert_durability_ok is on no Repository path
+    (only bundles/registrar.py + capture/events.py), so holding a token is the only thing that makes an importer
+    writer route through a gate at all."""
 
     import_batch_id: int
     source_system: SourceSystem
