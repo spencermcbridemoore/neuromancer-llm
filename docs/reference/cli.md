@@ -28,9 +28,9 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro docs` — Generated docs (schema/CLI/env/governance) — docs cannot rot.
 - `neuro docs build` — Regenerate the docs from the live models/CLI. With --check, fail loudly on any drift (byte-stable).
 - `neuro importer` — Appendix-A importer: scan | promote | status.
-- `neuro importer promote` — STAGE 2 — Layer 2 selective promotion (importer/promote.py: a batch-scoped governance stamp; ADR-0011's trio does not attach to the stimulus family).
-- `neuro importer scan` — STAGE 2 — Layer 1 faithful external-records upsert (idempotent on the natural key).
-- `neuro importer status` — STAGE 2 — coverage report (mirrored / promoted / derived-by-predecessor).
+- `neuro importer promote` — Import the MOSART MCQ corpus in one pass: mirror EVERY question (Layer 1) and promote the promotable (Layer 2); refusals are reported, never hidden.
+- `neuro importer scan` — STAGE 2 — reserved for a future Layer-1-only mirror pass; today Layer 1 runs as part of `neuro importer promote`.
+- `neuro importer status` — STAGE 2 — a persisted coverage report (deferred; `neuro importer promote` already reports coverage + refusals from the live result).
 - `neuro probe` — Operator probes: run | report | verify-config.
 - `neuro probe report` — Render the operational durability state: every system_health durability row + recent probe reports
 - `neuro probe run` — Run ONE durability producer and record its signal (writer-grade; the systemd timers' ExecStart).
