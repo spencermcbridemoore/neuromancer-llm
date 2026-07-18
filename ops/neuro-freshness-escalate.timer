@@ -1,0 +1,15 @@
+[Unit]
+Description=neuro persistent-block escalation cadence (daily)
+
+[Timer]
+# OnCalendar + Persistent=true — DELIBERATELY NOT the A2-16 monotonic OnUnitActiveSec-only shape, which never
+# fires and goes dormant after a reboot (the A2-16 v2 CRITICAL fold). A wall-clock daily fire, and
+# Persistent=true replays a run missed while the VM was down — so a persistent block cannot escape the daily
+# re-alert just because the box rebooted. Cadence grounds: DAILY matches neuro-verify-config; a persistent
+# off-cloud-mirror block re-alerts once per day (loud enough to be seen, not a storm), which is the whole
+# point of the mirror-arm hardening (the two once-per-cycle pings were delivered and missed, log:214/§D).
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

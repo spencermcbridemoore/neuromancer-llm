@@ -49,6 +49,24 @@ def resolve_backup_stale_after() -> _dt.timedelta:
     return BACKUP_STALE_AFTER
 
 
+def resolve_backup_block_escalate_after() -> _dt.timedelta:
+    """The persistent-block ESCALATION onset (mirror-arm hardening, 2026-07-17): how long
+    `backup_freshness` may read 'blocked' before governance/escalation.py re-alerts a human. This is a
+    SEPARATE concern from BACKUP_STALE_AFTER (the >8d gate bound that BLOCKS writes) — escalation only
+    re-alerts, never blocks.
+
+    Onset = one BASE_BACKUP_INTERVAL, BY REFERENCE (never a second pinned number — one-implementation-per-
+    concept): a healthy signal advances `measured_at` every backup cycle, so a 'blocked' status older than
+    one interval means at least one full cycle passed with no successful off-cloud backup, and one interval
+    is the SOONEST a block is detectable (the first failed backup run). Stated honestly (fold 4): this fires
+    the day after ANY failed backup cycle and daily thereafter — loud by design, not only multi-cycle blocks.
+    Fail-closed: it inherits `resolve_base_backup_interval`'s ConfigurationError-on-absent-pin (the pin idiom).
+    """
+    from .provisioning_invariants import resolve_base_backup_interval  # function-local: no import cycle
+
+    return resolve_base_backup_interval()
+
+
 def seed_backup_freshness(conn: Connection) -> bool:
     """Seed the `backup_freshness` row ONCE, registrar/admin at provisioning (the writer holds no INSERT on
     system_health — grants.sql:48). Idempotent (ON CONFLICT DO NOTHING) and FAIL-CLOSED at birth so the gate

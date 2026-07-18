@@ -1,17 +1,18 @@
-"""`neuro probe` — run | report | verify-config. The A2-16 timers' entry points (ADR-0015/0020).
+"""`neuro probe` — run | report | verify-config | escalate. The A2-16 timers' entry points (ADR-0015/0020).
 
 `run` drives ONE registered durability producer (the registry lives in governance/probe_registry.py, keyed
 by the same constants as DURABILITY_ROWS — a future arm is a one-surface append); `report` is the
 SELECT-only operational rendering (system_health + the last N probe_reports); `verify-config` is the
 ruling-§3.5 provisioning-invariant assertion over the REAL pgbackrest config (+ the installed timer when
---timer-file is passed). All thin delegates (GO-D-timer, owner GO 2026-07-11).
+--timer-file is passed); `escalate` re-alerts on a PERSISTENT backup_freshness block (mirror-arm hardening,
+2026-07-17). All thin delegates (GO-D-timer, owner GO 2026-07-11; escalate = the mirror-arm follow-on).
 """
 
 from __future__ import annotations
 
 import typer
 
-app = typer.Typer(no_args_is_help=True, help="Operator probes: run | report | verify-config.")
+app = typer.Typer(no_args_is_help=True, help="Operator probes: run | report | verify-config | escalate.")
 
 
 @app.command()
@@ -153,3 +154,48 @@ def verify_config(
             "verify-config timer must pass it",
             fg=typer.colors.YELLOW,
         )
+
+
+@app.command()
+def escalate(
+    lane: str = typer.Option(
+        "canonical",
+        envvar="NEURO_EXPECTED_LANE",
+        help="expected DB lane verified before the read (fail closed)",
+    ),
+    escalate_after_hours: float | None = typer.Option(
+        None,
+        help="override the pinned escalation onset (BASE_BACKUP_INTERVAL) for THIS call only — an explicit "
+        "operator/diagnostic knob; the daily timer passes none (pin-governed). e.g. 0 to alert on any "
+        "current block (the induced-failure test).",
+    ),
+) -> None:
+    """Re-alert on a PERSISTENT backup_freshness block (the daily escalation the per-cycle OnFailure ping lacks).
+
+    Fires an ntfy alert when backup_freshness has read 'blocked' longer than the pinned onset
+    (BASE_BACKUP_INTERVAL), with a message stating the CONSEQUENCE + ACTION rather than the failed unit name.
+    READ-ONLY against system_health; a no-op (exit 0, prints its decision) when not blocked or still within the
+    onset. The daily timer's ExecStart."""
+    import datetime as _dt
+
+    from ..db.lanes import ConfigurationError, LaneAssertionError
+    from ..db.session import make_verified_engine
+    from ..governance.escalation import evaluate_backup_block_escalation
+    from ..governance.notify import notify
+
+    try:
+        override = _dt.timedelta(hours=escalate_after_hours) if escalate_after_hours is not None else None
+        engine = make_verified_engine(expected_lane=lane)
+        message = evaluate_backup_block_escalation(engine, escalate_after=override)
+    except (ConfigurationError, LaneAssertionError) as exc:
+        typer.secho(f"probe escalate failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    if message is None:
+        typer.echo(
+            f"probe escalate (lane={lane}): backup_freshness is not in a persistent-block state — no alert."
+        )
+        return
+    # notify() is fail-LOUD (ADR-0019): a broken channel raises -> non-zero exit -> the unit's OnFailure=
+    # neuro-alert@ fires as the fallback ping. The alert IS the record; escalation writes nothing to the DB.
+    notify(message)
+    typer.secho(f"probe escalate (lane={lane}): ESCALATED — {message}", fg=typer.colors.YELLOW)

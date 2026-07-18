@@ -1,0 +1,18 @@
+[Unit]
+# Off-cloud backup persistent-block escalation (mirror-arm hardening, 2026-07-17; log:214/§D).
+# Re-alerts while system_health['backup_freshness'] stays 'blocked' longer than the pinned onset
+# (governance/freshness.py::resolve_backup_block_escalate_after == BASE_BACKUP_INTERVAL). Complements — does
+# NOT replace — the per-cycle OnFailure ping on neuro-backup.service (that one is infra-level and correct;
+# this one is the human-actionable consequence-and-action alert, sent daily until the block clears).
+Description=neuro off-cloud backup persistent-block escalation
+# A notify()-delivery failure exits non-zero -> this fallback fires the generic ping (belt on the alert).
+OnFailure=neuro-alert@%n.service
+
+[Service]
+Type=oneshot
+User=postgres
+EnvironmentFile=/etc/neuro/env
+TimeoutStartSec=120
+# `neuro probe escalate` is READ-ONLY against system_health + notify(); no --escalate-after-hours here, so
+# the onset is the pinned BASE_BACKUP_INTERVAL (automated escalation is pin-governed, fail-closed).
+ExecStart=/home/ubuntu/neuromancer-llm/.venv/bin/neuro probe escalate --lane canonical
