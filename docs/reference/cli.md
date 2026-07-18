@@ -40,7 +40,7 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro runs adopt` — STAGE 2 — retroactively label an adhoc/unlabeled run (ADR-0036).
 - `neuro runs finalize` — STAGE 2 — finalize a run.
 - `neuro runs new` — STAGE 2 — mint a labeled run via the composer.
-- `neuro runs show` — STAGE 2 — show a run + its inputs/metrics.
+- `neuro runs show` — Show one run's DB-resident provenance read-only: identity, model, counts, inputs, metrics, lake pointers.
 - `neuro spend` — Spend governance: report | plan | reconcile.
 - `neuro spend plan` — Record a run_plans justification artifact (required above the budget threshold).
 - `neuro spend reconcile` — Reconcile ACTUAL billed spend against the ledger-predicted total; flag divergence (R4c).
