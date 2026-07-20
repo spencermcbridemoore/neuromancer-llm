@@ -1,18 +1,22 @@
-"""`neuro probe` — run | report | verify-config | escalate. The A2-16 timers' entry points (ADR-0015/0020).
+"""`neuro probe` — run | report | verify-config | escalate | disk. The A2-16 timers' entry points (ADR-0015/0020).
 
 `run` drives ONE registered durability producer (the registry lives in governance/probe_registry.py, keyed
 by the same constants as DURABILITY_ROWS — a future arm is a one-surface append); `report` is the
 SELECT-only operational rendering (system_health + the last N probe_reports); `verify-config` is the
-ruling-§3.5 provisioning-invariant assertion over the REAL pgbackrest config (+ the installed timer when
---timer-file is passed); `escalate` re-alerts on a PERSISTENT backup_freshness block (mirror-arm hardening,
-2026-07-17). All thin delegates (GO-D-timer, owner GO 2026-07-11; escalate = the mirror-arm follow-on).
+ruling-§3.5 provisioning-invariant assertion over the REAL pgbackrest config (+ the installed backup and
+archiver-probe timer cadences when --timer-file / --archiver-timer-file are passed — the latter is wal D4);
+`escalate` re-alerts on a PERSISTENT backup_freshness block (mirror-arm hardening, 2026-07-17); `disk` alarms
+on /pgdata disk pressure (the automated `df` watch, A2-8 follow-on). All thin delegates (GO-D-timer, owner GO
+2026-07-11; escalate + disk are the mirror-arm-precedent follow-ons).
 """
 
 from __future__ import annotations
 
 import typer
 
-app = typer.Typer(no_args_is_help=True, help="Operator probes: run | report | verify-config | escalate.")
+app = typer.Typer(
+    no_args_is_help=True, help="Operator probes: run | report | verify-config | escalate | disk."
+)
 
 
 @app.command()
@@ -125,13 +129,19 @@ def verify_config(
         "pinned BASE_BACKUP_INTERVAL (omit only for the pre-install provisioning run; the daily timer "
         "always passes it)",
     ),
+    archiver_timer_file: str | None = typer.Option(
+        None,
+        help="the installed neuro-archiver-probe.timer unit file (wal D4) — when given, its OnUnitActiveSec "
+        "must EQUAL the pinned ARCHIVER_PROBE_INTERVAL (the 15-min cadence WAL_LAG_STALE_AFTER is derived "
+        "from); omit only pre-install; the daily verify-config timer always passes it",
+    ),
     legacy_conf: str = typer.Option(
         "/etc/pgbackrest.conf", help="the legacy file-form path that must NOT shadow the real config"
     ),
 ) -> None:
     """Assert the ruling-§3.5 provisioning invariants (retention/staleness/cadence/queue-max consistency)
-    against the REAL pgbackrest config. Fail-loud, REDACTION-safe (the config holds the Azure key — no
-    failure message ever echoes file content)."""
+    against the REAL pgbackrest config, plus the installed backup + archiver-probe timer cadences (wal D4).
+    Fail-loud, REDACTION-safe (the config holds the Azure key — no failure message ever echoes file content)."""
     from pathlib import Path
 
     from ..db.lanes import ConfigurationError
@@ -139,18 +149,36 @@ def verify_config(
 
     try:
         timer_text = Path(timer_file).read_text(encoding="utf-8") if timer_file else None
-        report = verify_pgbackrest_config(conf, timer_unit_text=timer_text, legacy_conf_path=legacy_conf)
+        archiver_text = Path(archiver_timer_file).read_text(encoding="utf-8") if archiver_timer_file else None
+        report = verify_pgbackrest_config(
+            conf,
+            timer_unit_text=timer_text,
+            archiver_timer_unit_text=archiver_text,
+            legacy_conf_path=legacy_conf,
+        )
     except (ConfigurationError, OSError) as exc:
         typer.secho(f"verify-config FAILED: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
 
     days = ", ".join(f"repo{k}={v}d" for k, v in sorted(report.retention_days.items()))
     typer.echo(f"verify-config OK: repos {list(report.repos)}; retention {days}")
-    if report.timer_checked:
-        typer.echo("timer cadence checked: OnUnitActiveSec == BASE_BACKUP_INTERVAL")
+    _echo_cadence(report.timer_checked, "backup timer", "BASE_BACKUP_INTERVAL", "--timer-file")
+    _echo_cadence(
+        report.archiver_timer_checked,
+        "archiver-probe timer",
+        "ARCHIVER_PROBE_INTERVAL",
+        "--archiver-timer-file",
+    )
+
+
+def _echo_cadence(checked: bool, label: str, pin: str, flag: str) -> None:
+    """Render one timer's cadence-check line: confirmed, or a LOUD not-checked warning (acceptable only
+    pre-install — the daily verify-config timer passes every --*-timer-file)."""
+    if checked:
+        typer.echo(f"{label} cadence checked: OnUnitActiveSec == {pin}")
     else:
         typer.secho(
-            "timer cadence NOT checked (no --timer-file) — acceptable ONLY pre-install; the daily "
+            f"{label} cadence NOT checked (no {flag}) — acceptable ONLY pre-install; the daily "
             "verify-config timer must pass it",
             fg=typer.colors.YELLOW,
         )
@@ -199,3 +227,37 @@ def escalate(
     # neuro-alert@ fires as the fallback ping. The alert IS the record; escalation writes nothing to the DB.
     notify(message)
     typer.secho(f"probe escalate (lane={lane}): ESCALATED — {message}", fg=typer.colors.YELLOW)
+
+
+@app.command()
+def disk(
+    path: str = typer.Option(
+        "/pgdata", help="the filesystem path to check (holds the PG data dir + the repo1 backup tree)"
+    ),
+    threshold: float | None = typer.Option(
+        None,
+        help="override the pinned usage-fraction threshold for THIS call only (0-1; e.g. 0.0 to force the "
+        "alarm — the induced-failure test). The daily timer passes none (pin-governed, fail-closed).",
+    ),
+) -> None:
+    """Alarm on /pgdata disk pressure (the automated `df` watch) — a READ-ONLY, notify()-only check.
+
+    Fires an actionable ntfy alert when the filesystem is at/over the pinned usage threshold; a no-op (exit 0,
+    prints its decision) otherwise. No DB, no lane (a pure statvfs). The daily neuro-disk-pressure.timer's
+    ExecStart."""
+    from ..db.lanes import ConfigurationError
+    from ..governance.disk_pressure import evaluate_disk_pressure
+    from ..governance.notify import notify
+
+    try:
+        message = evaluate_disk_pressure(path, threshold=threshold)
+    except ConfigurationError as exc:
+        typer.secho(f"probe disk failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    if message is None:
+        typer.echo(f"probe disk: {path} is within the usage threshold — no alert.")
+        return
+    # notify() is fail-LOUD (ADR-0019): a broken channel raises -> non-zero exit -> the unit's OnFailure=
+    # neuro-alert@ fires as the fallback ping. The alert IS the record; the disk check writes nothing.
+    notify(message)
+    typer.secho(f"probe disk: ALARM — {message}", fg=typer.colors.YELLOW)

@@ -35,10 +35,13 @@ WAL_LAG_KEY = "wal_lag"
 
 # The A2-16 archiver-probe cadence of record (the neuro-archiver-probe systemd timer's OnUnitActiveSec=15min,
 # owner-ruled GO-D-timer 2026-07-11). The signal-staleness bound below is derived from it — a dead producer is
-# only detectable after several missed cycles. This is a REFERENCE/derivation constant; the LIVE
-# archiver-timer-cadence machine-check (the verify_pgbackrest_config assertion-5 analog) is a named DEFERRED
-# follow-on (owner ruling D4, 2026-07-13) and is NOT enforced here.
-ARCHIVER_PROBE_INTERVAL: _dt.timedelta = _dt.timedelta(minutes=15)
+# only detectable after several missed cycles. GRADUATED from a pure REFERENCE constant to a GATING pin when
+# the verify_pgbackrest_config archiver-timer-cadence machine-check (wal D4) landed 2026-07-19: that check
+# asserts the INSTALLED archiver timer's OnUnitActiveSec == this pin (the assertion-5 analog), resolving it
+# fail-closed via resolve_archiver_probe_interval below exactly as assertion 5 resolves BASE_BACKUP_INTERVAL.
+# `None` therefore means "no cadence pinned" and resolution FAILS CLOSED (never a compare-against-None); a
+# change is an auditable commit (the freshness.py / provisioning_invariants.py pin idiom).
+ARCHIVER_PROBE_INTERVAL: _dt.timedelta | None = _dt.timedelta(minutes=15)
 
 # The missed-cycle / slack budget (the PROVISIONING_MARGIN idiom: the bound must clear interval + margin so a
 # merely-late probe does not false-flip). 15min interval + 30min margin = 45min <= the 1h bound (15min slack).
@@ -62,3 +65,18 @@ def resolve_wal_lag_stale_after() -> _dt.timedelta:
             "bound; a change is an auditable commit."
         )
     return WAL_LAG_STALE_AFTER
+
+
+def resolve_archiver_probe_interval() -> _dt.timedelta:
+    """The single archiver-probe-cadence resolution point (resolve_wal_lag_stale_after / resolve_base_backup_interval
+    idiom): the pinned archiver-probe timer interval, or ConfigurationError if it is absent. Load-bearing since the
+    verify_pgbackrest_config archiver-timer-cadence machine-check (wal D4, 2026-07-19) — the check resolves it here
+    fail-closed, exactly as assertion 5 resolves BASE_BACKUP_INTERVAL, so an unpinned interval refuses to certify
+    the installed timer rather than comparing a cadence against None."""
+    if ARCHIVER_PROBE_INTERVAL is None:
+        raise ConfigurationError(
+            "archiver-probe cadence pin is absent (governance/wal_freshness.py ARCHIVER_PROBE_INTERVAL is None) — "
+            "refusing to certify the installed archiver-probe timer cadence on an unpinned interval (fail closed). "
+            "A change is an auditable commit."
+        )
+    return ARCHIVER_PROBE_INTERVAL

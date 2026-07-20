@@ -1,0 +1,17 @@
+[Unit]
+# /pgdata disk-pressure alarm (A2-8 deferred follow-on; the automated `df -h /pgdata` watch). Built 2026-07-19.
+# READ-ONLY: `neuro probe disk` notify()s an actionable alert when the filesystem holding /pgdata (the
+# PostgreSQL data dir AND the repo1 pgbackrest backup tree) crosses the pinned usage threshold — a full volume
+# STOPS both PostgreSQL and pgbackrest. Distinct from the ADR-0020 durability gate: this alarms, never blocks.
+Description=neuro /pgdata disk-pressure alarm
+# a notify()-delivery failure exits non-zero -> this fires the generic ping (belt on the alert).
+OnFailure=neuro-alert@%n.service
+
+[Service]
+Type=oneshot
+User=postgres
+EnvironmentFile=/etc/neuro/env
+TimeoutStartSec=60
+# no --threshold here: the onset is the pinned DISK_PRESSURE_THRESHOLD (automated alarming is pin-governed,
+# fail-closed). --path defaults to /pgdata.
+ExecStart=/home/ubuntu/neuromancer-llm/.venv/bin/neuro probe disk

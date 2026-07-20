@@ -1,0 +1,14 @@
+[Unit]
+# The existing A2-16 verify-config cadence, committed to ops/ 2026-07-19 alongside the wal-D4 service change so
+# the service+timer pair lives in version control (the mirror-arm precedent). UNCHANGED behaviour. This is the
+# SAFE A2-16 monotonic form: OnBootSec is present, so — unlike the OnUnitActiveSec-only shape the A2-16 v2 fold
+# caught — it fires after a reboot. (New timers this sweep adds use OnCalendar+Persistent, e.g.
+# neuro-disk-pressure.timer; an EXISTING timer keeps its established, already-correct form.)
+Description=neuro verify-config cadence (ruled daily)
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1d
+
+[Install]
+WantedBy=timers.target

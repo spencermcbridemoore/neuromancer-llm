@@ -1,0 +1,19 @@
+[Unit]
+# neuro provisioning-invariant + timer-cadence check (A2-16 GO-D-timer). Committed to ops/ 2026-07-19 with the
+# wal-D4 change: verify-config now asserts BOTH installed timers' OnUnitActiveSec against their pins —
+# neuro-backup.timer == BASE_BACKUP_INTERVAL (assertion 5) AND neuro-archiver-probe.timer ==
+# ARCHIVER_PROBE_INTERVAL (assertion 7 / wal D4). The 15-min archiver cadence is what WAL_LAG_STALE_AFTER=1h is
+# derived from, so an unchecked archiver-cadence drift silently false-flips the WAL durability gate — the
+# config-drift blind spot this closes.
+Description=neuro provisioning-invariant check (daily)
+# a raising check exits non-zero -> the generic alert ping fires (belt over the loud failure).
+OnFailure=neuro-alert@%n.service
+
+[Service]
+Type=oneshot
+User=postgres
+EnvironmentFile=/etc/neuro/env
+TimeoutStartSec=120
+# --conf / --legacy-conf default to the real + legacy paths; BOTH installed timer files are passed so both
+# cadence equalities are asserted on every daily run (a pre-install run omits them and warns loudly).
+ExecStart=/home/ubuntu/neuromancer-llm/.venv/bin/neuro probe verify-config --timer-file /etc/systemd/system/neuro-backup.timer --archiver-timer-file /etc/systemd/system/neuro-archiver-probe.timer

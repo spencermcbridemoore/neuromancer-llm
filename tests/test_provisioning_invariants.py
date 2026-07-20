@@ -66,6 +66,10 @@ repo2-azure-key={_SECRET}
 TIMER_OK = (
     "[Unit]\nDescription=neuro base backup\n[Timer]\nOnBootSec=15min\nOnUnitActiveSec=2d\nPersistent=true\n"
 )
+# the installed neuro-archiver-probe.timer (wal D4): OnUnitActiveSec must == ARCHIVER_PROBE_INTERVAL (15min).
+TIMER_ARCHIVER_OK = (
+    "[Unit]\nDescription=neuro archiver probe\n[Timer]\nOnBootSec=5min\nOnUnitActiveSec=15min\n"
+)
 
 
 @pytest.fixture
@@ -137,8 +141,10 @@ def test_legacy_shadow_conf_fails(conf, tmp_path):
 
 
 def test_timer_drift_fails(conf, tmp_path):
-    with pytest.raises(ConfigurationError, match="OnUnitActiveSec"):
+    with pytest.raises(ConfigurationError, match="OnUnitActiveSec") as ei:
         _verify(conf, tmp_path, timer_unit_text=TIMER_OK.replace("2d", "3d"))
+    # the drift message NAMES the authoritative constant + renders the pin compactly (not a verbose timedelta)
+    assert "BASE_BACKUP_INTERVAL" in str(ei.value) and "2d" in str(ei.value)
 
 
 def test_timer_without_cadence_line_fails(conf, tmp_path):
@@ -225,3 +231,90 @@ def test_span_parses(span, expected):
 def test_span_fails_closed(bad):
     with pytest.raises(ConfigurationError):
         _parse_systemd_span(bad)
+
+
+# ---- GO-D-timer hardening #3: case-sensitive span parse (systemd `M`=months, `m`=minutes) ---------------
+
+
+@pytest.mark.parametrize("cased", ["15MIN", "2D", "1H", "1M"])
+def test_span_is_case_sensitive_fails_closed(cased):
+    # systemd units are case-sensitive; the parser matches verbatim rather than lowercasing, so an uppercased
+    # form (which systemd itself rejects) fails closed. In particular `1M` (systemd = one MONTH) can no longer
+    # be silently lowercased to `1m` and mis-read as one minute — the mis-parse this hardening kills.
+    with pytest.raises(ConfigurationError):
+        _parse_systemd_span(cased)
+
+
+# ---- assertion 7 (wal D4): the archiver-probe timer cadence == ARCHIVER_PROBE_INTERVAL -----------------
+
+
+def test_archiver_timer_checked_and_passes(conf, tmp_path):
+    report = _verify(conf, tmp_path, archiver_timer_unit_text=TIMER_ARCHIVER_OK)
+    assert report.archiver_timer_checked is True
+    assert report.timer_checked is False  # the backup timer was not supplied in this call
+
+
+def test_archiver_timer_drift_fails(conf, tmp_path):
+    with pytest.raises(ConfigurationError, match="archiver-probe") as ei:
+        _verify(conf, tmp_path, archiver_timer_unit_text=TIMER_ARCHIVER_OK.replace("15min", "30min"))
+    assert "ARCHIVER_PROBE_INTERVAL" in str(ei.value) and "15min" in str(ei.value)
+
+
+def test_archiver_timer_without_cadence_line_fails(conf, tmp_path):
+    with pytest.raises(ConfigurationError, match="archiver-probe"):
+        _verify(conf, tmp_path, archiver_timer_unit_text="[Timer]\nOnCalendar=daily\n")
+
+
+def test_archiver_pin_absent_fails_closed(conf, tmp_path, monkeypatch):
+    # the machine-check resolves ARCHIVER_PROBE_INTERVAL fail-closed (the assertion-5 analog): an unpinned
+    # cadence refuses to certify the installed timer rather than comparing against None.
+    monkeypatch.setattr("neuromancer_llm.governance.wal_freshness.ARCHIVER_PROBE_INTERVAL", None)
+    with pytest.raises(ConfigurationError, match="pin is absent"):
+        _verify(conf, tmp_path, archiver_timer_unit_text=TIMER_ARCHIVER_OK)
+
+
+def test_both_timers_checked_together(conf, tmp_path):
+    report = _verify(conf, tmp_path, timer_unit_text=TIMER_OK, archiver_timer_unit_text=TIMER_ARCHIVER_OK)
+    assert report.timer_checked is True and report.archiver_timer_checked is True
+
+
+# ---- GO-D-timer hardening #3: systemd honors the LAST OnUnitActiveSec (last-assignment-wins) -----------
+
+
+def test_last_onunitactivesec_wins(conf, tmp_path):
+    # systemd runs the LAST assignment of a repeated directive; a first-match reader would (wrongly) read 3d.
+    text = "[Timer]\nOnUnitActiveSec=3d\nOnUnitActiveSec=2d\n"  # systemd runs 2d (== BASE) -> passes
+    assert _verify(conf, tmp_path, timer_unit_text=text).timer_checked is True
+
+
+def test_last_onunitactivesec_wrong_fails(conf, tmp_path):
+    text = "[Timer]\nOnUnitActiveSec=2d\nOnUnitActiveSec=3d\n"  # systemd runs 3d (!= BASE) -> fails
+    with pytest.raises(ConfigurationError, match="OnUnitActiveSec"):
+        _verify(conf, tmp_path, timer_unit_text=text)
+
+
+# ---- GO-D-timer hardening #4: a failed shape-check on a conf value never echoes the raw value ----------
+
+
+def test_queue_max_shape_failure_does_not_echo_value(conf, tmp_path):
+    # the config holds the account-wide Azure key; a shape-failed value is untrusted, so the message names the
+    # OPTION only and never echoes the raw value (reverting the redaction re-adds the value -> this reddens).
+    sentinel = "SHAPEFAILSENTINEL_notasize"
+    conf.write_text(VERBATIM_CONF.replace("32GiB", sentinel), encoding="utf-8")
+    with pytest.raises(ConfigurationError) as ei:
+        _verify(conf, tmp_path)
+    msg = str(ei.value)
+    assert "archive-push-queue-max" in msg  # the option IS named
+    assert sentinel not in msg  # the raw shape-failed value is NOT echoed (#4)
+
+
+def test_retention_shape_failure_does_not_echo_value(conf, tmp_path):
+    sentinel = "SHAPEFAILRETENTION"
+    conf.write_text(
+        VERBATIM_CONF.replace("repo1-retention-full=30 ", f"repo1-retention-full={sentinel}  "),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError) as ei:
+        _verify(conf, tmp_path)
+    msg = str(ei.value)
+    assert "repo1-retention-full" in msg and sentinel not in msg

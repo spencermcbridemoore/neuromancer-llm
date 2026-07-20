@@ -18,6 +18,7 @@ from neuromancer_llm.governance.wal_freshness import (
     ARCHIVER_PROBE_INTERVAL,
     WAL_LAG_KEY,
     WAL_LAG_MARGIN,
+    resolve_archiver_probe_interval,
     resolve_wal_lag_stale_after,
 )
 
@@ -40,4 +41,16 @@ def test_wal_lag_bound_absent_fails_closed(monkeypatch):
 def test_wal_lag_bound_clears_cadence_plus_margin():
     # the mis-pin floor (the PROVISIONING_MARGIN inequality analog): the staleness bound must exceed the
     # archiver-probe cadence + the slack margin, so a merely-late probe never false-flips the gate.
-    assert resolve_wal_lag_stale_after() >= ARCHIVER_PROBE_INTERVAL + WAL_LAG_MARGIN
+    assert resolve_wal_lag_stale_after() >= resolve_archiver_probe_interval() + WAL_LAG_MARGIN
+
+
+def test_archiver_probe_interval_resolves():
+    assert resolve_archiver_probe_interval() == _dt.timedelta(minutes=15) == ARCHIVER_PROBE_INTERVAL
+
+
+def test_archiver_probe_interval_absent_fails_closed(monkeypatch):
+    # graduated to a GATING pin by wal D4 (verify_pgbackrest_config assertion 7): an unpinned cadence raises
+    # rather than silently defaulting (the resolve_wal_lag_stale_after / resolve_base_backup_interval idiom).
+    monkeypatch.setattr("neuromancer_llm.governance.wal_freshness.ARCHIVER_PROBE_INTERVAL", None)
+    with pytest.raises(ConfigurationError, match="pin is absent"):
+        resolve_archiver_probe_interval()

@@ -4,7 +4,7 @@ Four retention/cadence/staleness policies are hand-set in different places (the 
 systemd timer, this repo's constants). Independently edited, they rot into the ruling-§3.4 failure class
 (a repo pruned below the gate's promise; a cadence the 8-day bound can never see). This module makes their
 CONSTRAINTS one computable, fail-loud check (`verify_pgbackrest_config`, the `neuro probe verify-config`
-delegate) that reads the ACTUAL pgbackrest config + the ACTUAL installed timer and asserts:
+delegate) that reads the ACTUAL pgbackrest config + the ACTUAL installed timers and asserts:
 
   (1) for EVERY repo:  retention-full-type PRESENT and == 'time'  — pgbackrest DEFAULTS to 'count', so a
       dropped type line silently converts "30" from 30 days to 30 backups (a fail-open at any cadence
@@ -18,7 +18,19 @@ delegate) that reads the ACTUAL pgbackrest config + the ACTUAL installed timer a
       a cadence change = one commit + the unit edit, and this equality keeps the two from drifting — the
       stale_after two-edit trap closed structurally);
   (6) the configured conf path EXISTS and no legacy file-form `/etc/pgbackrest.conf` shadows it (the
-      VM-rebuild trap: the PGDG package restores the legacy file and pgbackrest silently prefers it).
+      VM-rebuild trap: the PGDG package restores the legacy file and pgbackrest silently prefers it);
+  (7) the installed ARCHIVER-PROBE timer's OnUnitActiveSec == wal_freshness.ARCHIVER_PROBE_INTERVAL (wal D4,
+      the assertion-5 analog for the WAL arm). The signal-staleness bound WAL_LAG_STALE_AFTER=1h is DERIVED
+      from that 15-min cadence (~4 missed cycles); if the installed archiver timer drifts to a slower cadence,
+      a merely-late probe false-flips the 1h gate — the config-drift blind spot this closes. Checked only when
+      the archiver timer text is supplied (the daily verify-config timer passes both timer files).
+
+GO-D-timer hardenings folded here (a2-16-timers-buildgo §7): (#3) `_parse_systemd_span` is CASE-SENSITIVE like
+systemd — it no longer lowercases, so systemd's `M` (months) can never be silently mis-read as `m` (minutes);
+and the OnUnitActiveSec extraction takes the LAST assignment (systemd honors the last of a repeated directive),
+not the first. (#4) a FAILED shape-check on a conf-derived value names the OPTION only and never echoes the raw
+value (the config holds the account-wide Azure key; a shape-failed value is untrusted) — timer-derived cadence
+values ARE echoed (the timer files hold no secret and the operator needs to see what drifted).
 
 REDACTION CONTRACT (§8 fold 4): the parsed file holds the account-wide Azure key (`repo2-azure-key`), so NO
 failure path may echo raw file content — every message is built from OPTION NAMES + parsed non-secret
@@ -41,6 +53,7 @@ from pathlib import Path
 
 from ..db.lanes import ConfigurationError
 from .freshness import resolve_backup_stale_after
+from .wal_freshness import resolve_archiver_probe_interval
 
 # The base-backup cadence of record (owner-ruled 2026-07-11, GO-D-timer GO-input 2). The systemd timer's
 # OnUnitActiveSec must EQUAL this (assertion 5) — the constant is the authority, the unit is the mirror.
@@ -80,11 +93,15 @@ def resolve_provisioning_margin() -> _dt.timedelta:
 
 @dataclass(frozen=True)
 class ProvisioningReport:
-    """The verify-config result: the repos discovered, their retention days, and the checked cadence."""
+    """The verify-config result: the repos discovered, their retention days, and which timer cadences were
+    checked (`timer_checked` = the backup timer, assertion 5; `archiver_timer_checked` = the archiver-probe
+    timer, assertion 7 / wal D4). A False means its timer text was not supplied (a pre-install run), never
+    that the check passed."""
 
     repos: tuple[int, ...]
     retention_days: dict[int, int]
     timer_checked: bool
+    archiver_timer_checked: bool = False
 
 
 def _parse_conf(conf_path: Path) -> ConfigParser:
@@ -133,15 +150,17 @@ def verify_pgbackrest_config(
     conf_path: str | Path,
     *,
     timer_unit_text: str | None = None,
+    archiver_timer_unit_text: str | None = None,
     legacy_conf_path: str | Path = "/etc/pgbackrest.conf",
 ) -> ProvisioningReport:
-    """Assert the §3.5 provisioning invariants against the REAL pgbackrest config (+ the installed backup
-    timer when its unit text is supplied). Raises ConfigurationError (fail loud, REDACTION-safe) on the
-    first violation; returns a ProvisioningReport on success.
+    """Assert the §3.5 provisioning invariants against the REAL pgbackrest config (+ the installed backup and
+    archiver-probe timers when their unit text is supplied). Raises ConfigurationError (fail loud,
+    REDACTION-safe) on the first violation; returns a ProvisioningReport on success.
 
-    `timer_unit_text` is the neuro-backup.timer unit file content (the CLI reads it via --timer-file); when
-    None the cadence-equality check is SKIPPED — the caller must surface that loudly (provisioning runs
-    pre-install without it; the daily verify-config timer always passes it)."""
+    `timer_unit_text` is the neuro-backup.timer unit content (CLI --timer-file); `archiver_timer_unit_text` is
+    the neuro-archiver-probe.timer unit content (CLI --archiver-timer-file, wal D4). When either is None its
+    cadence-equality check is SKIPPED — the caller must surface that loudly (provisioning runs pre-install
+    without them; the daily verify-config timer always passes both)."""
     bound = resolve_backup_stale_after()  # fail closed before any file read (the pin order idiom)
     interval = resolve_base_backup_interval()
     margin = resolve_provisioning_margin()
@@ -169,8 +188,8 @@ def verify_pgbackrest_config(
     queue_max = opts.get("archive-push-queue-max")
     if not queue_max or not _SIZE_RE.match(queue_max):
         raise ConfigurationError(
-            f"archive-push-queue-max is missing or not a size literal (parsed {queue_max!r}) — the §0.1 "
-            "queue cap must be present and parseable (fail loud)."
+            "archive-push-queue-max is missing or not a valid pgbackrest size literal — the §0.1 queue cap "
+            "must be present and parseable (fail loud; value not shown — the config holds a secret)."
         )
 
     # discover repos DYNAMICALLY (never a hardcoded {1,2} — a future repo3 must join min())
@@ -188,14 +207,15 @@ def verify_pgbackrest_config(
         rtype = opts.get(f"repo{repo}-retention-full-type")
         if rtype != "time":
             raise ConfigurationError(
-                f"repo{repo}-retention-full-type is {rtype!r}, not 'time' — pgbackrest DEFAULTS to 'count', "
-                f"so repo{repo}'s retention number would silently mean BACKUPS not DAYS (fail closed; "
-                "assert the type line exists)."
+                f"repo{repo}-retention-full-type is not 'time' — pgbackrest DEFAULTS to 'count', so "
+                f"repo{repo}'s retention number would silently mean BACKUPS not DAYS (fail closed; value not "
+                "shown — the config holds a secret; assert the type line exists)."
             )
         raw = opts.get(f"repo{repo}-retention-full")
         if raw is None or not raw.isdigit():
             raise ConfigurationError(
-                f"repo{repo}-retention-full is missing or non-numeric (parsed {raw!r}) — fail loud."
+                f"repo{repo}-retention-full is missing or non-numeric — fail loud (value not shown; the "
+                "config holds a secret)."
             )
         retention_days[repo] = int(raw)
     floor_days = (bound + interval + margin).days
@@ -215,26 +235,67 @@ def verify_pgbackrest_config(
             "(fail loud; retune the pins together)."
         )
 
-    # (5) the installed timer's cadence == the constant (when supplied)
+    # (5) the installed BACKUP timer's cadence == BASE_BACKUP_INTERVAL (when supplied)
     timer_checked = False
     if timer_unit_text is not None:
-        m = re.search(r"^\s*OnUnitActiveSec\s*=\s*(\S+)\s*$", timer_unit_text, re.MULTILINE)
-        if not m:
-            raise ConfigurationError(
-                "the backup timer unit has no OnUnitActiveSec= line — the runbook pins the cadence with a "
-                "monotonic timer so it is machine-comparable to BASE_BACKUP_INTERVAL (fail loud)."
-            )
-        if _parse_systemd_span(m.group(1)) != interval:
-            raise ConfigurationError(
-                f"the installed backup timer's OnUnitActiveSec={m.group(1)} != the pinned "
-                f"BASE_BACKUP_INTERVAL ({interval.days}d) — the constant is the authority; a cadence change "
-                "is one commit + the unit edit together (fail loud)."
-            )
+        _assert_installed_cadence(
+            timer_unit_text, expected=interval, pin_name="BASE_BACKUP_INTERVAL", timer_label="backup"
+        )
         timer_checked = True
 
+    # (7) the installed ARCHIVER-PROBE timer's cadence == ARCHIVER_PROBE_INTERVAL (wal D4; when supplied). The
+    # pin is resolved fail-closed HERE, the assertion-5 analog — an unpinned interval refuses to certify.
+    archiver_timer_checked = False
+    if archiver_timer_unit_text is not None:
+        _assert_installed_cadence(
+            archiver_timer_unit_text,
+            expected=resolve_archiver_probe_interval(),
+            pin_name="ARCHIVER_PROBE_INTERVAL",
+            timer_label="archiver-probe",
+        )
+        archiver_timer_checked = True
+
     return ProvisioningReport(
-        repos=tuple(sorted(repos)), retention_days=retention_days, timer_checked=timer_checked
+        repos=tuple(sorted(repos)),
+        retention_days=retention_days,
+        timer_checked=timer_checked,
+        archiver_timer_checked=archiver_timer_checked,
     )
+
+
+def _compact_span(td: _dt.timedelta) -> str:
+    """Render a cadence timedelta in the compact systemd form the operator edits (e.g. '2d', '15min', '1w'),
+    not the verbose default str ('2 days, 0:00:00'). Whole-unit cadences only — the pins always are."""
+    secs = int(td.total_seconds())
+    for unit, n in (("w", 604800), ("d", 86400), ("h", 3600), ("min", 60)):
+        if secs >= n and secs % n == 0:
+            return f"{secs // n}{unit}"
+    return f"{secs}s"
+
+
+def _assert_installed_cadence(
+    timer_unit_text: str, *, expected: _dt.timedelta, pin_name: str, timer_label: str
+) -> None:
+    """Assert an installed systemd timer's OnUnitActiveSec == the pinned cadence, or raise (fail loud). Shared
+    by assertion 5 (backup) and assertion 7 (archiver-probe). systemd honors the LAST assignment of a repeated
+    directive, so this reads the LAST OnUnitActiveSec line, not the first (GO-D-timer hardening #3 last-match);
+    the span parse is case-sensitive (hardening #3 case). On drift the message NAMES the authoritative constant
+    (`pin_name`) and echoes both the installed value and the pin in compact form — a timer unit holds no secret
+    and the operator needs to see what drifted AND which constant is the authority (unlike the conf, §8 fold 4
+    redaction)."""
+    matches = re.findall(r"^\s*OnUnitActiveSec\s*=\s*(\S+)\s*$", timer_unit_text, re.MULTILINE)
+    if not matches:
+        raise ConfigurationError(
+            f"the {timer_label} timer unit has no OnUnitActiveSec= line — the runbook pins the cadence with a "
+            "monotonic timer so it is machine-comparable to the pinned interval (fail loud)."
+        )
+    value = matches[-1]  # systemd last-assignment-wins for a repeated directive
+    if _parse_systemd_span(value) != expected:
+        raise ConfigurationError(
+            f"the installed {timer_label} timer's OnUnitActiveSec={value} != the pinned {pin_name} "
+            f"({_compact_span(expected)}) — the constant is the authority; a cadence change is one commit + "
+            "the unit edit together (fail loud)."
+        )
 
 
 _SPAN_UNIT = {
@@ -263,11 +324,16 @@ _SPAN_UNIT = {
 
 def _parse_systemd_span(value: str) -> _dt.timedelta:
     """Parse the simple systemd time-span forms the runbook uses (e.g. '2d', '15min', '1h 30m'). An
-    unrecognized form fails CLOSED — better a loud parse refusal than a mis-read cadence equality."""
+    unrecognized form fails CLOSED — better a loud parse refusal than a mis-read cadence equality.
+
+    CASE-SENSITIVE (GO-D-timer hardening #3): systemd's units are case-sensitive — `M` is MONTHS while `m` is
+    MINUTES — so this matches `unit` verbatim against the (lowercase) whitelist rather than lowercasing it. A
+    lowercasing parse would silently read `1M` (systemd = one month) as one minute; here any form outside the
+    whitelist (including an uppercased one systemd would itself reject) fails closed."""
     total = 0.0
     matched = False
     for num, unit in re.findall(r"(\d+(?:\.\d+)?)\s*([a-zA-Z]+)", value):
-        factor = _SPAN_UNIT.get(unit.lower())
+        factor = _SPAN_UNIT.get(unit)
         if factor is None:
             raise ConfigurationError(
                 f"unrecognized systemd time-span unit {unit!r} in {value!r} (fail closed)."

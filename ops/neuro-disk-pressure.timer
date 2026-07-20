@@ -1,0 +1,14 @@
+[Unit]
+# OnCalendar + Persistent=true — the mirror-arm precedent (ops/neuro-freshness-escalate.timer), DELIBERATELY
+# NOT the A2-16 monotonic OnUnitActiveSec-only shape that never fires and goes dormant after a reboot. A
+# wall-clock daily fire, and Persistent=true replays a run missed while the VM was down — so a filling /pgdata
+# cannot escape the daily check just because the box rebooted. DAILY matches neuro-freshness-escalate (loud
+# enough to be seen once it is over threshold, not an hourly storm); the check itself is a trivial statvfs.
+Description=neuro /pgdata disk-pressure alarm cadence (daily)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

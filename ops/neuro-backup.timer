@@ -1,0 +1,13 @@
+[Unit]
+# The A2-16 base-backup cadence, committed to ops/ 2026-07-19 so verify-config assertion 5's ASSERTED cadence
+# lives in version control beside the checker (neuro-verify-config.service asserts OnUnitActiveSec ==
+# BASE_BACKUP_INTERVAL). UNCHANGED behaviour. SAFE A2-16 monotonic form (OnBootSec present, so it fires after a
+# reboot — not the OnUnitActiveSec-only never-fires shape).
+Description=neuro backup cadence (OnUnitActiveSec MUST equal BASE_BACKUP_INTERVAL - verify-config asserts it)
+
+[Timer]
+OnBootSec=30min
+OnUnitActiveSec=2d
+
+[Install]
+WantedBy=timers.target

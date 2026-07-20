@@ -1,0 +1,14 @@
+[Unit]
+# The A2-16 archiver-probe cadence, committed to ops/ 2026-07-19 so wal D4's ASSERTED cadence lives in version
+# control beside the checker (neuro-verify-config.service asserts OnUnitActiveSec == ARCHIVER_PROBE_INTERVAL).
+# UNCHANGED behaviour. The 15-min value here is what WAL_LAG_STALE_AFTER=1h is derived from (~4 missed cycles);
+# a drift between this file and the pin is exactly what verify-config assertion 7 now catches. SAFE A2-16
+# monotonic form (OnBootSec present, so it fires after a reboot — not the OnUnitActiveSec-only never-fires shape).
+Description=neuro archiver probe cadence (ruled 15min)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

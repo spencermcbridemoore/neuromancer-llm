@@ -169,3 +169,91 @@ def test_verify_config_cli_fails_loud_on_violation(tmp_path):
         ["probe", "verify-config", "--conf", str(conf), "--legacy-conf", str(tmp_path / "legacy.conf")],
     )
     assert r.exit_code == 1 and "FAILED" in r.output
+
+
+def test_verify_config_cli_checks_archiver_timer(tmp_path):
+    conf = tmp_path / "pgbackrest.conf"
+    conf.write_text(_MINIMAL_CONF, encoding="utf-8")
+    archiver = tmp_path / "neuro-archiver-probe.timer"
+    archiver.write_text("[Timer]\nOnBootSec=5min\nOnUnitActiveSec=15min\n", encoding="utf-8")
+    r = _runner.invoke(
+        app,
+        [
+            "probe",
+            "verify-config",
+            "--conf",
+            str(conf),
+            "--archiver-timer-file",
+            str(archiver),
+            "--legacy-conf",
+            str(tmp_path / "legacy.conf"),
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    assert "archiver-probe timer cadence checked" in r.output
+
+
+def test_verify_config_cli_fails_on_archiver_drift(tmp_path):
+    conf = tmp_path / "pgbackrest.conf"
+    conf.write_text(_MINIMAL_CONF, encoding="utf-8")
+    archiver = tmp_path / "neuro-archiver-probe.timer"
+    archiver.write_text("[Timer]\nOnUnitActiveSec=30min\n", encoding="utf-8")  # != the pinned 15min
+    r = _runner.invoke(
+        app,
+        [
+            "probe",
+            "verify-config",
+            "--conf",
+            str(conf),
+            "--archiver-timer-file",
+            str(archiver),
+            "--legacy-conf",
+            str(tmp_path / "legacy.conf"),
+        ],
+    )
+    assert r.exit_code == 1 and "FAILED" in r.output and "archiver-probe" in r.output
+
+
+# ---- disk (the /pgdata disk-pressure alarm; the assertion logic is tests/test_disk_pressure.py) --------
+
+
+def _script_disk_usage(monkeypatch, used_frac: float) -> None:
+    import shutil
+    from types import SimpleNamespace
+
+    total = 100 * 1024**3
+    used = int(total * used_frac)
+    monkeypatch.setattr(
+        shutil, "disk_usage", lambda _p: SimpleNamespace(total=total, used=used, free=total - used)
+    )
+
+
+def test_disk_cli_no_alert_when_under_threshold(monkeypatch):
+    _script_disk_usage(monkeypatch, 0.40)
+    r = _runner.invoke(app, ["probe", "disk", "--path", "/pgdata"])
+    assert r.exit_code == 0 and "within the usage threshold" in r.output
+
+
+def test_disk_cli_alarms_and_notifies_when_over(monkeypatch):
+    _script_disk_usage(monkeypatch, 0.95)
+    sent: list[str] = []
+    monkeypatch.setattr("neuromancer_llm.governance.notify.notify", lambda m, **kw: sent.append(m))
+    r = _runner.invoke(app, ["probe", "disk", "--path", "/pgdata"])
+    assert r.exit_code == 0, r.output
+    assert "ALARM" in r.output
+    assert sent and "DISK PRESSURE" in sent[0]  # the alert actually reached notify()
+
+
+def test_disk_cli_threshold_override_forces_alarm(monkeypatch):
+    _script_disk_usage(monkeypatch, 0.10)  # well under the pin -> only the 0.0 override fires it
+    sent: list[str] = []
+    monkeypatch.setattr("neuromancer_llm.governance.notify.notify", lambda m, **kw: sent.append(m))
+    r = _runner.invoke(app, ["probe", "disk", "--path", "/pgdata", "--threshold", "0.0"])
+    assert r.exit_code == 0 and "ALARM" in r.output and sent
+
+
+def test_disk_cli_fails_closed_on_absent_pin(monkeypatch):
+    _script_disk_usage(monkeypatch, 0.95)
+    monkeypatch.setattr("neuromancer_llm.governance.disk_pressure.DISK_PRESSURE_THRESHOLD", None)
+    r = _runner.invoke(app, ["probe", "disk", "--path", "/pgdata"])
+    assert r.exit_code == 1 and "failed" in r.output
