@@ -67,6 +67,19 @@ def test_notify_transport_error_raises(monkeypatch: pytest.MonkeyPatch) -> None:
         notify("hello", topic="sekret-topic")
 
 
+def test_notify_timeout_raises_typed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """(precedent-wide timeout-typing pass, with vllm.py) a bare read-timeout is a TimeoutError, NOT a
+    urllib.error.URLError subclass — without the dedicated arm it escapes both handlers UNTYPED. Assert it maps
+    to NotifyError (fail-loud AND typed). pytest.raises(NotifyError) also proves it is not the bare TimeoutError."""
+
+    def _raise_timeout(req: urllib.request.Request, timeout: float | None = None) -> object:
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _raise_timeout)
+    with pytest.raises(NotifyError, match="timed out after"):
+        notify("hello", topic="sekret-topic")
+
+
 def test_notify_2xx_posts_exact_url_and_body(monkeypatch: pytest.MonkeyPatch) -> None:
     """(d) a 2xx posts to the EXACT topic-derived URL with the message as the POST body (pinned, not
     merely assert-called-once)."""

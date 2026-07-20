@@ -53,7 +53,10 @@ def notify(message: str, *, topic: str | None = None) -> None:
     except urllib.error.HTTPError as exc:  # non-2xx — surface the server body, never swallow it
         detail = exc.read().decode("utf-8", "replace")
         raise NotifyError(f"ntfy push -> HTTP {exc.code}: {detail}") from exc
+    except TimeoutError as exc:  # a bare read-timeout is NOT a urllib.error.URLError subclass, so without
+        # this arm it would escape both handlers untyped. This IS the precedent-wide timeout-typing pass,
+        # landed WITH vllm.py so notify.py does not diverge from the precedent it mirrors — still fail-LOUD
+        # (ADR-0019), now TYPED. socket.timeout is an alias of TimeoutError since 3.10, so this covers both.
+        raise NotifyError(f"ntfy push to {base_url} timed out after {_TIMEOUT_S}s") from exc
     except urllib.error.URLError as exc:  # transport failure (DNS, connection refused, TLS)
-        # A bare read-timeout is a TimeoutError (NOT a URLError subclass) -> propagates uncaught: still
-        # fail-LOUD, never swallowed, but untyped. Deferred precedent-wide timeout-typing pass (with vllm.py).
         raise NotifyError(f"ntfy push to {base_url} failed: {exc}") from exc

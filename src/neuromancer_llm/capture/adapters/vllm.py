@@ -132,6 +132,8 @@ class VLLMClient:
         try:
             with urllib.request.urlopen(req, timeout=timeout or self.timeout) as resp:  # noqa: S310
                 return json.loads(resp.read().decode("utf-8"))
+        except TimeoutError as exc:  # a read-timeout is NOT a URLError subclass -> would escape untyped
+            raise VLLMAdapterError(f"GET {path} timed out after {timeout or self.timeout}s") from exc
         except urllib.error.URLError as exc:
             raise VLLMAdapterError(f"GET {path} failed: {exc}") from exc
 
@@ -155,6 +157,8 @@ class VLLMClient:
         except urllib.error.HTTPError as exc:  # surface the server's error body, don't swallow it
             detail = exc.read().decode("utf-8", "replace")
             raise VLLMAdapterError(f"POST {path} -> HTTP {exc.code}: {detail}") from exc
+        except TimeoutError as exc:  # a read-timeout is NOT a URLError subclass -> would escape untyped
+            raise VLLMAdapterError(f"POST {path} timed out after {timeout or self.timeout}s") from exc
         except urllib.error.URLError as exc:
             raise VLLMAdapterError(f"POST {path} failed: {exc}") from exc
         return json.loads(raw.decode("utf-8")), body, raw, status, content_type
