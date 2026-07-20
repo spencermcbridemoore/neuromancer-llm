@@ -1,0 +1,26 @@
+[Unit]
+# B-7 blob-lake mirror (2026-07-20): the daily catalog-driven Azure->desktop-NVMe mirror of artifacts-prod +
+# its freshness signal (governance/lake_mirror.py). The forward-looking HARD GATE before the first
+# NON-recomputable capture (ADR-0014; Stage-A local captures are recomputable per ADR-0034). NOTIFY-ONLY:
+# records lake_mirror_freshness + alarms on failure; it NEVER blocks a canonical write (the owner fork ruling —
+# the lake key is not in health.GATE_CONSULTED_KEYS).
+Description=neuro blob-lake mirror (artifacts-prod -> desktop NVMe, ADR-0014)
+# a mirror-run FAILURE exits non-zero -> the generic ping fires (belt); the daily neuro-lake-mirror-escalate is
+# the human-actionable consequence+action alert for a PERSISTENT block.
+OnFailure=neuro-alert@%n.service
+
+[Service]
+Type=oneshot
+User=postgres
+EnvironmentFile=/etc/neuro/env
+# The OUTER hang belt: RuntimeMaxSec is a NO-OP on Type=oneshot (the a2-16 fold), so the wall-clock bound is
+# TimeoutStartSec. The per-step timeouts (LAKE_MIRROR_AZURE_READ_TIMEOUT_S 300s, LAKE_SFTP_TIMEOUT_S 3600s)
+# already convert a hung Azure/sftp op into a fail-closed ok=False -> status 'blocked' -> the escalation fires;
+# this finite outer bound catches any hang that escapes them so the unit enters 'failed' (-> the OnFailure ping)
+# rather than wedging silently in 'activating' forever. Generous for the greenfield lake scale; an at-volume
+# follow-on tunes it alongside batched pushes.
+TimeoutStartSec=7200
+# --key selects the lake producer; the off-cloud desktop path arrives as NEURO_LAKE_MIRROR_DEST from
+# /etc/neuro/env (a typer envvar, validated by the off-cloud guard); --ssh-alias defaults to neuro-desktop and
+# --lane-backend-key to artifacts-prod (the prod-only ruling). The Azure conn string also lives in the env file.
+ExecStart=/home/ubuntu/neuromancer-llm/.venv/bin/neuro probe run --key lake_mirror_freshness --lane canonical

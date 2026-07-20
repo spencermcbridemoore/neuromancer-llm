@@ -8,7 +8,7 @@ from __future__ import annotations
 import contextlib
 import os
 import pathlib
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 # The well-known Azurite account (devstoreaccount1). NOT a secret — Azurite's published default.
 AZURITE_DEFAULT_CONNECTION_STRING = (
@@ -74,7 +74,7 @@ class AzureBlobBackend:
 
     driver = "azure_blob"
 
-    def __init__(self, container: str, connection_string: str) -> None:
+    def __init__(self, container: str, connection_string: str, *, read_timeout: float | None = None) -> None:
         # lazy imports keep the module importable without azure installed
         from azure.core.exceptions import ResourceExistsError
         from azure.storage.blob import BlobServiceClient
@@ -85,7 +85,12 @@ class AzureBlobBackend:
                 "fallback — a misconfigured cloud lane must fail closed, never write to localhost). "
                 "Construct through registry.backends.make_backend."
             )
-        self._service = BlobServiceClient.from_connection_string(connection_string)
+        # read_timeout (opt-in; default None -> the SDK default, byte-identical to prior behavior) bounds each
+        # socket read so a network partition cannot hang readall() forever. B-7's lake mirror opts in
+        # (LAKE_MIRROR_AZURE_READ_TIMEOUT_S) so a hung Azure fetch becomes a fail-closed outcome, not a silently
+        # wedged oneshot unit; capture/importer callers pass nothing and are unaffected.
+        extra: dict[str, Any] = {"read_timeout": read_timeout} if read_timeout is not None else {}
+        self._service = BlobServiceClient.from_connection_string(connection_string, **extra)
         self._container = self._service.get_container_client(container)
         # R9: suppress ONLY the "container already exists" conflict — any other error propagates.
         with contextlib.suppress(ResourceExistsError):

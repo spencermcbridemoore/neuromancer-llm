@@ -31,9 +31,10 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro importer promote` — Import the MOSART MCQ corpus in one pass: mirror EVERY question (Layer 1) and promote the promotable (Layer 2); refusals are reported, never hidden.
 - `neuro importer scan` — STAGE 2 — reserved for a future Layer-1-only mirror pass; today Layer 1 runs as part of `neuro importer promote`.
 - `neuro importer status` — STAGE 2 — a persisted coverage report (deferred; `neuro importer promote` already reports coverage + refusals from the live result).
-- `neuro probe` — Operator probes: run | report | verify-config | escalate | disk.
+- `neuro probe` — Operator probes: run | report | verify-config | escalate | lake-escalate | disk.
 - `neuro probe disk` — Alarm on /pgdata disk pressure (the automated `df` watch) — a READ-ONLY, notify()-only check.
 - `neuro probe escalate` — Re-alert on a PERSISTENT backup_freshness block (the daily escalation the per-cycle OnFailure ping lacks).
+- `neuro probe lake-escalate` — Re-alert on a PERSISTENT lake_mirror_freshness block (the daily escalation the per-run OnFailure ping lacks).
 - `neuro probe report` — Render the operational durability state: every system_health durability row + recent probe reports
 - `neuro probe run` — Run ONE durability producer and record its signal (writer-grade; the systemd timers' ExecStart).
 - `neuro probe verify-config` — Assert the ruling-§3.5 provisioning invariants (retention/staleness/cadence/queue-max consistency)

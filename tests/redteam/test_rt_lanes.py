@@ -112,6 +112,13 @@ def test_rt_core_modules_read_no_env():
         #                                 is read by the CLI layer alone (a typer envvar option)
         "governance/provisioning_invariants.py",  # GO-D-timer: pins + conf assertions, never env knobs
         "governance/probe_registry.py",  # GO-D-timer: the key->runner registry carries no env behavior
+        # B-7 blob-lake mirror: the transport primitive + driver/producer + freshness leaf + escalation are all
+        # parameter-only; NEURO_LAKE_MIRROR_DEST is read by the CLI layer alone (a typer envvar option), and the
+        # Azure conn string is read by registry/backends.make_backend, never here.
+        "governance/sftp_transport.py",
+        "governance/lake_mirror.py",
+        "governance/lake_freshness.py",
+        "governance/lake_escalation.py",
     ):
         src = (_SRC / rel).read_text(encoding="utf-8")
         assert "os.environ" not in src and "getenv" not in src, f"{rel} reads an env var (behavior-by-flag?)"

@@ -1,4 +1,4 @@
-"""`neuro probe` — run | report | verify-config | escalate | disk. The A2-16 timers' entry points (ADR-0015/0020).
+"""`neuro probe` — run | report | verify-config | escalate | lake-escalate | disk. The timers' entry points (ADR-0015/0020).
 
 `run` drives ONE registered durability producer (the registry lives in governance/probe_registry.py, keyed
 by the same constants as DURABILITY_ROWS — a future arm is a one-surface append); `report` is the
@@ -15,13 +15,16 @@ from __future__ import annotations
 import typer
 
 app = typer.Typer(
-    no_args_is_help=True, help="Operator probes: run | report | verify-config | escalate | disk."
+    no_args_is_help=True,
+    help="Operator probes: run | report | verify-config | escalate | lake-escalate | disk.",
 )
 
 
 @app.command()
 def run(
-    key: str = typer.Option(..., help="the durability row to produce: backup_freshness | wal_lag"),
+    key: str = typer.Option(
+        ..., help="the durability row to produce: backup_freshness | wal_lag | lake_mirror_freshness"
+    ),
     lane: str = typer.Option(
         "canonical",
         envvar="NEURO_EXPECTED_LANE",
@@ -33,6 +36,12 @@ def run(
         help="off-cloud mirror destination PATH (backup_freshness only; the desktop-side path, e.g. "
         "D:/neuro-backups — validated by the off-cloud guard before the driver runs)",
     ),
+    lake_dest: str | None = typer.Option(
+        None,
+        envvar="NEURO_LAKE_MIRROR_DEST",
+        help="off-cloud lake-mirror destination PATH (lake_mirror_freshness only; the desktop-side path, "
+        "e.g. D:/neuro-lake — validated by the off-cloud guard before the driver runs)",
+    ),
     ssh_alias: str = typer.Option(
         "neuro-desktop",
         help="ssh_config Host alias carrying the desktop host/user/key (the credential never rides argv)",
@@ -41,6 +50,10 @@ def run(
         "/pgdata/pgbackrest", help="the LOCAL pgbackrest repo tree the mirror pushes from"
     ),
     stanza: str = typer.Option("neuro", help="pgbackrest stanza"),
+    lane_backend_key: str = typer.Option(
+        "artifacts-prod",
+        help="the storage_backends lane the lake mirror pushes (lake_mirror_freshness only; prod-only ruling)",
+    ),
 ) -> None:
     """Run ONE durability producer and record its signal (writer-grade; the systemd timers' ExecStart).
     Fails loud (non-zero) when the probe records a blocked signal — OnFailure= alerting keys on this."""
@@ -48,9 +61,16 @@ def run(
     from ..db.session import make_verified_engine
     from ..governance.backup_driver import make_pgbackrest_mirror_driver
     from ..governance.freshness import BACKUP_FRESHNESS_KEY
+    from ..governance.lake_freshness import LAKE_MIRROR_FRESHNESS_KEY
+    from ..governance.lake_mirror import (
+        LAKE_MIRROR_AZURE_READ_TIMEOUT_S,
+        LakeMirrorProbeError,
+        make_lake_mirror_driver,
+    )
     from ..governance.probe_registry import PROBE_RUNNERS, ProbeContext
     from ..governance.probes import BackupProbeError
     from ..governance.wal_archiving import WalArchiverProbeError
+    from ..registry.backends import make_backend
 
     try:
         runner = PROBE_RUNNERS.get(key)
@@ -70,9 +90,41 @@ def run(
                 ),
                 destination=dest,
             )
+        elif key == LAKE_MIRROR_FRESHNESS_KEY:
+            if not lake_dest:
+                raise ConfigurationError(
+                    "lake_mirror_freshness requires a destination (--lake-dest / NEURO_LAKE_MIRROR_DEST) — "
+                    "fail closed."
+                )
+
+            def _source_backend_for(driver: str, base_uri: str):
+                # the read-only Azure source, built through the C5 factory (never a raw AzureBlobBackend);
+                # connection_string=None -> make_backend reads AZURE_STORAGE_CONNECTION_STRING (infra config).
+                # The read_timeout bounds each Azure socket read so a hang fails the mirror closed.
+                return make_backend(
+                    driver,
+                    base_uri=base_uri,
+                    connection_string=None,
+                    read_timeout=LAKE_MIRROR_AZURE_READ_TIMEOUT_S,
+                )
+
+            ctx = ProbeContext(
+                lake_mirror_driver=make_lake_mirror_driver(
+                    source_backend_for=_source_backend_for,
+                    ssh_alias=ssh_alias,
+                    lane_backend_key=lane_backend_key,
+                ),
+                destination=lake_dest,
+            )
         engine = make_verified_engine(expected_lane=lane)
         runner(engine, ctx)
-    except (ConfigurationError, LaneAssertionError, BackupProbeError, WalArchiverProbeError) as exc:
+    except (
+        ConfigurationError,
+        LaneAssertionError,
+        BackupProbeError,
+        WalArchiverProbeError,
+        LakeMirrorProbeError,
+    ) as exc:
         typer.secho(f"probe {key} failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
     typer.echo(f"probe {key} (lane={lane}): recorded ok")
@@ -227,6 +279,52 @@ def escalate(
     # neuro-alert@ fires as the fallback ping. The alert IS the record; escalation writes nothing to the DB.
     notify(message)
     typer.secho(f"probe escalate (lane={lane}): ESCALATED — {message}", fg=typer.colors.YELLOW)
+
+
+@app.command("lake-escalate")
+def lake_escalate(
+    lane: str = typer.Option(
+        "canonical",
+        envvar="NEURO_EXPECTED_LANE",
+        help="expected DB lane verified before the read (fail closed)",
+    ),
+    escalate_after_hours: float | None = typer.Option(
+        None,
+        help="override the pinned escalation onset (LAKE_MIRROR_STALE_AFTER) for THIS call only — an explicit "
+        "operator/diagnostic knob; the daily timer passes none (pin-governed). e.g. 0 to alert on any "
+        "current block (the induced-failure test).",
+    ),
+) -> None:
+    """Re-alert on a PERSISTENT lake_mirror_freshness block (the daily escalation the per-run OnFailure ping lacks).
+
+    Fires an ntfy alert when lake_mirror_freshness has read 'blocked' longer than the pinned onset, with a
+    message stating the CONSEQUENCE + ACTION rather than the failed unit name. READ-ONLY against system_health;
+    a no-op (exit 0, prints its decision) when not blocked or still within the onset. The daily
+    neuro-lake-mirror-escalate.timer's ExecStart. NOTIFY-ONLY: the lake mirror never gates a canonical write."""
+    import datetime as _dt
+
+    from ..db.lanes import ConfigurationError, LaneAssertionError
+    from ..db.session import make_verified_engine
+    from ..governance.lake_escalation import evaluate_lake_mirror_block_escalation
+    from ..governance.notify import notify
+
+    try:
+        override = _dt.timedelta(hours=escalate_after_hours) if escalate_after_hours is not None else None
+        engine = make_verified_engine(expected_lane=lane)
+        message = evaluate_lake_mirror_block_escalation(engine, escalate_after=override)
+    except (ConfigurationError, LaneAssertionError) as exc:
+        typer.secho(f"probe lake-escalate failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    if message is None:
+        typer.echo(
+            f"probe lake-escalate (lane={lane}): lake_mirror_freshness is not in a persistent-block state — "
+            "no alert."
+        )
+        return
+    # notify() is fail-LOUD (ADR-0019): a broken channel raises -> non-zero exit -> the unit's OnFailure=
+    # neuro-alert@ fires as the fallback ping. The alert IS the record; escalation writes nothing to the DB.
+    notify(message)
+    typer.secho(f"probe lake-escalate (lane={lane}): ESCALATED — {message}", fg=typer.colors.YELLOW)
 
 
 @app.command()

@@ -1,0 +1,13 @@
+[Unit]
+Description=neuro blob-lake mirror persistent-block escalation cadence (daily)
+
+[Timer]
+# OnCalendar + Persistent=true — the mirror-arm precedent, DELIBERATELY NOT the A2-16 monotonic
+# OnUnitActiveSec-only shape (never fires, dormant after a reboot). A daily wall-clock re-alert on a persistent
+# lake-mirror block (loud enough to be seen, not a storm); Persistent=true replays a run missed while the VM was
+# down — so a persistent block cannot escape the daily re-alert just because the box rebooted.
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -108,6 +108,82 @@ def test_run_backup_wires_driver_and_destination(repo, monkeypatch):
     assert status == "ok"
 
 
+@pytest.mark.pg
+def test_run_lake_mirror_requires_destination(repo):
+    _seed(repo.engine)
+    r = _runner.invoke(app, ["probe", "run", "--key", "lake_mirror_freshness", "--lane", "test"])
+    assert r.exit_code == 1 and "destination" in r.output
+
+
+@pytest.mark.pg
+def test_run_lake_mirror_wires_driver_and_destination(repo, monkeypatch):
+    _seed(repo.engine)
+    from neuromancer_llm.governance.lake_mirror import LakeMirrorOutcome
+
+    seen: dict[str, str] = {}
+
+    def _fake_factory(**kw):
+        seen["ssh_alias"] = kw["ssh_alias"]
+        seen["lane_backend_key"] = kw["lane_backend_key"]
+
+        def driver(engine, destination: str) -> LakeMirrorOutcome:
+            seen["destination"] = destination
+            return LakeMirrorOutcome(
+                ok=True, detail="scripted mirror ok", checked=1, pushed=1, deleted=0, verified=1
+            )
+
+        return driver
+
+    monkeypatch.setattr("neuromancer_llm.governance.lake_mirror.make_lake_mirror_driver", _fake_factory)
+    r = _runner.invoke(
+        app,
+        [
+            "probe",
+            "run",
+            "--key",
+            "lake_mirror_freshness",
+            "--lane",
+            "test",
+            "--lake-dest",
+            "D:/neuro-lake",
+        ],
+    )
+    assert r.exit_code == 0, r.output
+    assert seen == {
+        "ssh_alias": "neuro-desktop",
+        "lane_backend_key": "artifacts-prod",
+        "destination": "D:/neuro-lake",
+    }
+    with repo.engine.connect() as conn:
+        status = conn.execute(
+            text("SELECT status FROM neuro.system_health WHERE health_key='lake_mirror_freshness'")
+        ).scalar_one()
+    assert status == "ok"
+
+
+@pytest.mark.pg
+def test_lake_escalate_cli_override_alerts_on_current_block(repo, monkeypatch):
+    # the induced-test knob through the CLI: seed the lake row blocked, --escalate-after-hours 0 fires the ping.
+    from sqlalchemy import text as _text
+
+    from neuromancer_llm.governance.durability import LAKE_MIRROR_ROW, seed_row
+
+    with repo.engine.connect() as conn:
+        seed_row(conn, LAKE_MIRROR_ROW)
+    with repo.engine.begin() as conn:
+        conn.execute(
+            _text(
+                "UPDATE neuro.system_health SET status='blocked', measured_at=now() "
+                "WHERE health_key='lake_mirror_freshness'"
+            )
+        )
+    sent: list[str] = []
+    monkeypatch.setattr("neuromancer_llm.governance.notify.notify", lambda m, **kw: sent.append(m))
+    r = _runner.invoke(app, ["probe", "lake-escalate", "--lane", "test", "--escalate-after-hours", "0"])
+    assert r.exit_code == 0, r.output
+    assert "ESCALATED" in r.output and sent and "BLOB-LAKE MIRROR BLOCKED" in sent[0]
+
+
 # ---- report ----------------------------------------------------------------------------------------------
 
 

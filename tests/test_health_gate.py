@@ -20,7 +20,7 @@ import pytest
 from sqlalchemy import text
 
 from neuromancer_llm.db.lanes import ConfigurationError
-from neuromancer_llm.governance.durability import WAL_LAG_ROW, seed_row
+from neuromancer_llm.governance.durability import LAKE_MIRROR_ROW, WAL_LAG_ROW, seed_row
 from neuromancer_llm.governance.freshness import BACKUP_FRESHNESS_KEY, seed_backup_freshness
 from neuromancer_llm.governance.health import (
     DurabilityGateError,
@@ -29,6 +29,7 @@ from neuromancer_llm.governance.health import (
     assert_durability_ok,
     assert_wal_archiving_ok,
 )
+from neuromancer_llm.governance.lake_freshness import LAKE_MIRROR_FRESHNESS_KEY
 from neuromancer_llm.governance.notify import NotifyError
 from neuromancer_llm.governance.probes import _bump_freshness
 from neuromancer_llm.governance.wal_archiving import _bump_wal_lag
@@ -390,6 +391,20 @@ def test_durability_ok_blocks_when_wal_missing_despite_fresh_backup(repo, notify
         assert_durability_ok(repo.engine)  # ...but the composed gate BLOCKs
     _heal_wal(repo.engine)
     assert assert_durability_ok(repo.engine) is None  # both arms healthy -> passes
+
+
+@pytest.mark.pg
+def test_durability_ok_ignores_a_blocked_lake_mirror(repo, notify_rec):
+    # B-7 fork ruling, pinned BEHAVIORALLY (not just declaratively via GATE_CONSULTED_KEYS): the blob-lake
+    # mirror is NOTIFY-ONLY. With BOTH gating arms fresh + the lake_mirror_freshness row seeded 'blocked' (its
+    # maximally-stale born state), assert_durability_ok STILL passes — a stale lake mirror alarms but never
+    # blocks a canonical write. A future edit that inserts assert_lake_mirror_fresh into the gate body (the
+    # over-scoped gating the owner ruled OUT) would redden this.
+    _seed_fresh(repo.engine)  # backup + wal fresh + healthy
+    with repo.engine.connect() as conn:
+        seed_row(conn, LAKE_MIRROR_ROW)  # born 'blocked' + epoch — a maximally-stale lake mirror
+    assert _status(repo.engine, LAKE_MIRROR_FRESHNESS_KEY) == "blocked"  # the lake arm IS blocked...
+    assert assert_durability_ok(repo.engine) is None  # ...yet the durability gate does NOT block the write
 
 
 # ---- pg: the stale-branch CAS guard THROUGH the gate (the race this unit exists to close) ------------

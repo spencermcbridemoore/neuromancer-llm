@@ -19,6 +19,8 @@ from typing import TYPE_CHECKING
 
 from ..db.lanes import ConfigurationError
 from .freshness import BACKUP_FRESHNESS_KEY
+from .lake_freshness import LAKE_MIRROR_FRESHNESS_KEY
+from .lake_mirror import LakeMirrorDriver, run_lake_mirror_probe
 from .probes import BackupDriver, run_backup_probe
 from .wal_archiving import run_wal_archiver_probe
 from .wal_freshness import WAL_LAG_KEY
@@ -30,11 +32,13 @@ if TYPE_CHECKING:
 @dataclass(frozen=True)
 class ProbeContext:
     """What a probe run may need beyond the engine. `backup_driver`/`destination` are required by the
-    backup probe only (the CLI builds the real driver; tests inject scripted ones)."""
+    backup probe only; `lake_mirror_driver`/`destination` by the lake-mirror probe only (the CLI builds the
+    real drivers; tests inject scripted ones)."""
 
     backup_driver: BackupDriver | None = None
     destination: str | None = None
     actor_id: int | None = None
+    lake_mirror_driver: LakeMirrorDriver | None = None
 
 
 def _run_backup(engine: Engine, ctx: ProbeContext) -> None:
@@ -52,8 +56,23 @@ def _run_wal(engine: Engine, ctx: ProbeContext) -> None:
     run_wal_archiver_probe(engine, actor_id=ctx.actor_id)
 
 
+def _run_lake_mirror(engine: Engine, ctx: ProbeContext) -> None:
+    if ctx.lake_mirror_driver is None or not ctx.destination:
+        raise ConfigurationError(
+            "the lake_mirror_freshness probe requires a lake-mirror driver and a destination "
+            "(NEURO_LAKE_MIRROR_DEST / --dest) — refusing a driverless run (fail closed)."
+        )
+    run_lake_mirror_probe(
+        engine,
+        lake_mirror_driver=ctx.lake_mirror_driver,
+        destination=ctx.destination,
+        actor_id=ctx.actor_id,
+    )
+
+
 # The registry (keyed by the SAME constants as DURABILITY_ROWS; the keyset test pins the equality).
 PROBE_RUNNERS: dict[str, Callable[..., None]] = {
     BACKUP_FRESHNESS_KEY: _run_backup,
     WAL_LAG_KEY: _run_wal,
+    LAKE_MIRROR_FRESHNESS_KEY: _run_lake_mirror,
 }

@@ -1,0 +1,19 @@
+[Unit]
+# B-7 blob-lake mirror persistent-block escalation (2026-07-20) — the parallel of neuro-freshness-escalate.
+# Re-alerts while system_health['lake_mirror_freshness'] stays 'blocked' longer than the pinned onset
+# (governance/lake_freshness.py::resolve_lake_mirror_block_escalate_after == LAKE_MIRROR_STALE_AFTER).
+# Complements — does NOT replace — the per-run OnFailure ping on neuro-lake-mirror.service (that one is
+# infra-level; this one is the human-actionable consequence-and-action alert, sent daily until the block
+# clears). NOTIFY-ONLY: the lake mirror never gates a canonical write (the fork ruling).
+Description=neuro blob-lake mirror persistent-block escalation
+# A notify()-delivery failure exits non-zero -> this fallback fires the generic ping (belt on the alert).
+OnFailure=neuro-alert@%n.service
+
+[Service]
+Type=oneshot
+User=postgres
+EnvironmentFile=/etc/neuro/env
+TimeoutStartSec=120
+# `neuro probe lake-escalate` is READ-ONLY against system_health + notify(); no --escalate-after-hours here, so
+# the onset is the pinned LAKE_MIRROR_STALE_AFTER (automated escalation is pin-governed, fail-closed).
+ExecStart=/home/ubuntu/neuromancer-llm/.venv/bin/neuro probe lake-escalate --lane canonical

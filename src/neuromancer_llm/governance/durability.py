@@ -33,6 +33,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Connection
 
 from .freshness import BACKUP_FRESHNESS_KEY, resolve_backup_stale_after
+from .lake_freshness import LAKE_MIRROR_FRESHNESS_KEY, resolve_lake_mirror_stale_after
 from .wal_freshness import WAL_LAG_KEY
 
 
@@ -78,11 +79,23 @@ WAL_LAG_ROW = DurabilityRow(
     born_detail="seeded; awaiting first WAL-archiver probe",
     stale_after_bound=None,
 )
-DURABILITY_ROWS: tuple[DurabilityRow, ...] = (BACKUP_FRESHNESS_ROW, WAL_LAG_ROW)
+# lake_mirror_freshness (B-7, 2026-07-20) is a durability SIGNAL row that is DELIBERATELY NON-GATING (owner
+# fork ruling): it is provisioned + produced through these ONE surfaces (seed_all / the probe registry) so it
+# can never ship seeded-but-unrunnable, but its key is NOT in health.GATE_CONSULTED_KEYS — a stale lake mirror
+# ALARMS (the daily lake escalation), it never BLOCKs a canonical write. It carries the stale_after bound so its
+# freshness is measurable (the future Stage-B capture-path preflight reads it status-then-staleness).
+LAKE_MIRROR_ROW = DurabilityRow(
+    health_key=LAKE_MIRROR_FRESHNESS_KEY,
+    born_detail="seeded; awaiting first verified lake mirror",
+    stale_after_bound=resolve_lake_mirror_stale_after,
+)
+DURABILITY_ROWS: tuple[DurabilityRow, ...] = (BACKUP_FRESHNESS_ROW, WAL_LAG_ROW, LAKE_MIRROR_ROW)
 
 # The set of health_keys this surface provisions — cross-checked against the keys the gate consults
 # (governance/health.py::GATE_CONSULTED_KEYS; a test asserts GATE_CONSULTED_KEYS <= DURABILITY_KEYS), so a new
-# gate branch can never ship without its provisioning row.
+# gate branch can never ship without its provisioning row. The relation is a PROPER subset since B-7: every
+# GATE_CONSULTED key is provisioned here, but not every provisioned key gates — lake_mirror_freshness is a
+# provisioned, produced, NON-GATING signal (notify-only, the fork ruling).
 DURABILITY_KEYS: frozenset[str] = frozenset(r.health_key for r in DURABILITY_ROWS)
 
 

@@ -66,6 +66,7 @@ def make_backend(
     base_uri: str,
     local_root: str | os.PathLike[str] | None = None,
     connection_string: str | None = None,
+    read_timeout: float | None = None,
 ) -> StorageBackend:
     """Construct the storage adapter for a registered backend's `driver` (ADR-0040 seam; A2-4).
 
@@ -74,7 +75,8 @@ def make_backend(
     azure_blob -> AzureBlobBackend(container, connection_string): the container is base_uri's last path
       segment; the connection string comes from the argument or AZURE_STORAGE_CONNECTION_STRING and is
       REQUIRED (NO Azurite fallback — a cloud lane with no credential fails closed); the credential's account
-      endpoint host must MATCH base_uri's host (identity cross-check).
+      endpoint host must MATCH base_uri's host (identity cross-check); `read_timeout` (opt-in; default None ->
+      the SDK default) bounds each socket read — B-7's lake mirror passes it so a hung Azure fetch fails closed.
     Any other driver fails closed.
     """
     if driver == "local_fs":
@@ -107,7 +109,7 @@ def make_backend(
                 f"match the registered base_uri host {parsed.hostname!r} (fail closed; identity cross-check "
                 "closing the silent cross-account interleave hazard)."
             )
-        return AzureBlobBackend(container, connection_string=conn)
+        return AzureBlobBackend(container, connection_string=conn, read_timeout=read_timeout)
 
     raise ConfigurationError(f"unknown storage driver {driver!r} (fail closed; known: local_fs, azure_blob).")
 

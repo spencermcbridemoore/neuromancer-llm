@@ -36,15 +36,20 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import json
-import subprocess
 import tempfile
-from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Protocol
 
 from ..db.lanes import ConfigurationError
 from .probes import BackupOutcome
 from .provisioning_invariants import resolve_base_backup_interval, resolve_provisioning_margin
+from .sftp_transport import (
+    CommandResult as CommandResult,
+)
+from .sftp_transport import (
+    CommandRunner,
+    run_sftp_batch,
+    run_subprocess,
+)
 
 # Pinned per-step timeouts (§8 fold 5). Committed constants, not knobs: a change is an auditable commit.
 INFO_TIMEOUT_S = 120.0
@@ -56,30 +61,9 @@ MANIFEST_NAME = ".neuro-mirror-manifest.json"
 _SPOT_CHECKS = 3  # pushed files re-fetched + sha256-compared per run (plus backup.info when present)
 
 
-@dataclass(frozen=True)
-class CommandResult:
-    """One seam-executed command's outcome. A timeout is returncode=-1 with a 'timed out' stderr — the
-    driver treats it exactly like a failure (fail closed, recorded blocked)."""
-
-    returncode: int
-    stdout: str
-    stderr: str
-
-
-class CommandRunner(Protocol):
-    def __call__(self, argv: list[str], *, timeout_s: float) -> CommandResult: ...
-
-
-def run_subprocess(argv: list[str], *, timeout_s: float) -> CommandResult:
-    """The REAL runner (the VM path). Captures output; converts a timeout into a fail-closed
-    CommandResult (never a hang — the systemd RuntimeMaxSec is the belt above this suspender)."""
-    try:
-        proc = subprocess.run(  # noqa: S603 — argv is built from pinned constants + validated params
-            argv, capture_output=True, text=True, timeout=timeout_s, check=False
-        )
-    except subprocess.TimeoutExpired:
-        return CommandResult(returncode=-1, stdout="", stderr=f"timed out after {timeout_s:.0f}s")
-    return CommandResult(returncode=proc.returncode, stdout=proc.stdout, stderr=proc.stderr)
+# CommandResult / CommandRunner / run_subprocess now live in governance/sftp_transport.py (the shared
+# transport primitive extracted for B-7 so a second transport is not invented) and are re-exported above so
+# this module's by-name test imports (test_backup_driver.py) stay green.
 
 
 def _sha256_file(path: Path) -> str:
@@ -194,12 +178,7 @@ def make_pgbackrest_mirror_driver(
             tmp = Path(td)
 
             def sftp(batch_lines: list[str]) -> CommandResult:
-                batch = tmp / f"batch-{len(list(tmp.iterdir()))}.sftp"
-                batch.write_text("\n".join(batch_lines) + "\n", encoding="utf-8")
-                return runner(
-                    ["sftp", "-b", str(batch), "-o", "BatchMode=yes", ssh_alias],
-                    timeout_s=SFTP_TIMEOUT_S,
-                )
+                return run_sftp_batch(runner, ssh_alias, batch_lines, tmp_dir=tmp, timeout_s=SFTP_TIMEOUT_S)
 
             # 2a. fetch the remote manifest (a failed fetch = first run -> EMPTY manifest: over-push is the
             # safe direction, and the delete set derives from the REMOTE manifest so empty deletes nothing)

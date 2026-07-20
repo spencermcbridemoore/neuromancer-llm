@@ -1,0 +1,14 @@
+[Unit]
+# OnCalendar + Persistent=true — the mirror-arm / disk-pressure precedent, DELIBERATELY NOT the A2-16 monotonic
+# OnUnitActiveSec-only shape (which never fires and goes dormant after a reboot). A daily wall-clock fire, and
+# Persistent=true replays a run missed while the VM was down — so the off-cloud lake copy cannot silently fall
+# behind just because the box rebooted. DAILY is the cadence LAKE_MIRROR_STALE_AFTER=3d is derived from
+# (one cycle + ~2-cycle margin).
+Description=neuro blob-lake mirror cadence (daily)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
