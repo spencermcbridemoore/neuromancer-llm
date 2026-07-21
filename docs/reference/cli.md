@@ -9,6 +9,7 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro bundles seal` — STAGE 2 — seal a bundle (manifest_sha256 set, state=sealed; GC-exempt, ADR-0010).
 - `neuro bundles verify-golden` — STAGE 2 — verify against the manifest golden corpus.
 - `neuro capture` — Capture (Stage 2 vertical slice): logprob | replay | show.
+- `neuro capture campaign` — Run the ESTELA order-bias campaign: capture next-token logprobs across ALL k! answer orders of every
 - `neuro capture logprob` — Capture one real next-token logprob pass end to end (verbatim wire + identity + parquet bundle).
 - `neuro capture replay` — Replicate a capture for divergence measurement (ADR-0004 MEASURED): capture the experiment, capture a
 - `neuro capture show` — Read a captured run's logprobs from the lake AS A SELECT-ONLY CONSUMER: locate the parquet via

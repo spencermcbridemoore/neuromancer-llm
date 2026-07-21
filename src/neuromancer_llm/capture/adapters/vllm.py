@@ -199,6 +199,21 @@ class VLLMClient:
             raise VLLMAdapterError(f"/v1/models returned no models: {data!r}")
         return str(data["data"][0]["id"])
 
+    def tokenize(self, text: str, *, model: str) -> list[int]:
+        """Tokenize `text` with the SERVED model's tokenizer via the vLLM `/tokenize` endpoint.
+
+        Same served vocabulary that produces the id-keyed logprobs (the server is launched
+        `--return-tokens-as-token-ids`), so the returned ids are in the SAME id-space as
+        `LogprobSample.logprob_map` — the ESTELA answer-letter projection resolves each answer letter to
+        its token-id this way (§A12 D4b). Raises loudly on a malformed response (never a silent gap)."""
+        data = self._post("/tokenize", {"model": model, "prompt": text})
+        if not isinstance(data, dict) or not isinstance(data.get("tokens"), list):
+            raise VLLMAdapterError(f"/tokenize returned no token list: {data!r}")
+        try:
+            return [int(t) for t in data["tokens"]]
+        except (TypeError, ValueError) as exc:
+            raise VLLMAdapterError(f"/tokenize returned a non-int token: {data['tokens']!r}") from exc
+
     def server_identity(
         self,
         *,

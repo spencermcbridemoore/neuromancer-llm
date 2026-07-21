@@ -302,6 +302,128 @@ def replay(
 
 
 @app.command()
+def campaign(
+    corpus_root: str = typer.Option(..., help="path to the ESTELA JSONL (estela_text_only_mcq.jsonl)"),
+    corpus_commit: str = typer.Option(
+        ..., help="pinned ESTELA corpus commit sha (provenance; recorded in the runbook/manifest)"
+    ),
+    hf_revision: str = typer.Option(..., help="pinned HF revision sha (part of model identity; ADR-0005)"),
+    base_url: str = typer.Option(
+        "http://127.0.0.1:8001",
+        envvar="NEURO_VLLM_BASE_URL",
+        help="vLLM server base URL — :8001 (D4a); avoids the foreign :8000 squatter (env-gotchas)",
+    ),
+    hf_repo: str = typer.Option("mistralai/Mistral-7B-v0.3", help="HF repo (part of model identity)"),
+    tokenizer_file: str | None = typer.Option(
+        None, help="path to tokenizer.json — sha256'd for the durable tokenizer identity"
+    ),
+    tokenizer_hash: str | None = typer.Option(
+        None, help="tokenizer identity hash as hex (use instead of --tokenizer-file)"
+    ),
+    actor_key: str = typer.Option("owner", help="actor stamped on every run + capture (phase0 Q13)"),
+    origin: str | None = typer.Option(None, help="origin stamp (defaults to the hostname)"),
+    lake_root: str = typer.Option("./_lake", help="local lake root for the derived logprob parquet shards"),
+    backend_key: str = typer.Option(
+        "local-lake", help="registered storage_backends row to resolve the lake through (local-lake; D4a)"
+    ),
+    lane: str = typer.Option(
+        "canonical",
+        envvar="NEURO_EXPECTED_LANE",
+        help="expected DB lane verified before any write (fail closed)",
+    ),
+    n_logprobs: int = typer.Option(
+        64, help="top-k next-token logprobs (D4b amended 20->64, owner nod 2026-07-20)"
+    ),
+    max_k: int = typer.Option(
+        5, help="max option count in scope (k<=max_k; the k>5 variable-arity bank is excluded)"
+    ),
+) -> None:
+    """Run the ESTELA order-bias campaign: capture next-token logprobs across ALL k! answer orders of every
+    in-scope question, landing in the canonical DB with the versioned answer-letter projection (run_metrics).
+
+    CONTROL-PLANE op: NEURO_DATABASE_URL must be an admin DSN (registrar INSERTs + writer UPDATEs)."""
+    import socket
+
+    from ..capture.adapters.vllm import VLLMAdapterError, VLLMClient
+    from ..capture.campaign import EstelaCampaignError, read_estela_jsonl, run_campaign
+    from ..db.identity import sha256_bytes
+    from ..db.lanes import ConfigurationError, LaneAssertionError
+    from ..db.repository import IdentityMismatchError, Repository
+    from ..db.session import make_verified_engine
+    from ..governance.health import DurabilityGateError
+    from ..registry.backends import (
+        LOCAL_LAKE_BACKEND_KEY,
+        LOCAL_LAKE_BASE_URI,
+        resolve_capture_backend,
+    )
+    from ..storage.quota import QuotaDeniedError
+
+    try:
+        if tokenizer_file is not None:
+            tok_hash = sha256_bytes(Path(tokenizer_file).read_bytes())
+        elif tokenizer_hash is not None:
+            tok_hash = _tokenizer_hash_bytes(tokenizer_hash)
+        else:
+            raise ConfigurationError(
+                "tokenizer identity required: pass --tokenizer-file <tokenizer.json> or --tokenizer-hash <hex> "
+                "(register-first identity; ADR-0005)."
+            )
+        questions = read_estela_jsonl(Path(corpus_root), max_k=max_k)
+        engine = make_verified_engine(expected_lane=lane)
+        repo = Repository(engine, expected_lane=lane)
+        if backend_key == LOCAL_LAKE_BACKEND_KEY:
+            repo.get_or_create_storage_backend(
+                LOCAL_LAKE_BACKEND_KEY,
+                driver="local_fs",
+                lane="artifacts",
+                base_uri=LOCAL_LAKE_BASE_URI,
+                is_cloud=False,
+            )
+        backend_id, backend = resolve_capture_backend(repo, backend_key=backend_key, local_root=lake_root)
+        client = VLLMClient(base_url, timeout=120.0)
+
+        def _progress(done: int, total: int) -> None:
+            if done == 1 or done % 200 == 0 or done == total:
+                typer.echo(f"  ...{done}/{total} captured", err=True)
+
+        result = run_campaign(
+            repo=repo,
+            backend=backend,
+            backend_id=backend_id,
+            client=client,
+            tokenizer_hash=tok_hash,
+            questions=questions,
+            hf_repo=hf_repo,
+            hf_revision=hf_revision,
+            corpus_commit=corpus_commit,
+            expected_lane=lane,
+            n_logprobs=n_logprobs,
+            actor_key=actor_key,
+            origin=origin or socket.gethostname(),
+            progress=_progress,
+        )
+    except (
+        ConfigurationError,
+        LaneAssertionError,
+        VLLMAdapterError,
+        IdentityMismatchError,
+        QuotaDeniedError,
+        DurabilityGateError,
+        EstelaCampaignError,
+    ) as exc:
+        typer.secho(f"campaign failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"campaign corpus={result.corpus_commit} complete: {result.permutations_captured} permutations over "
+        f"{result.questions_captured} questions"
+    )
+    typer.echo(f"  method_version_id={result.method_version_id} censored_cells={result.censored_cells_total}")
+    if result.dropped_duplicate_option_uids:
+        typer.echo(f"  dropped (duplicate options, D6): {', '.join(result.dropped_duplicate_option_uids)}")
+
+
+@app.command()
 def show(
     run_id: int = typer.Option(..., help="run_id whose captured logprobs to read back from the lake"),
     reader_url: str | None = typer.Option(

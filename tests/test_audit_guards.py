@@ -43,15 +43,15 @@ def test_pg_major_assert_is_wired_into_migrations_env():
 
 
 def test_tokenizer_hash_validation_is_wired_into_both_capture_commands():
-    """C4.4 (wiring pin, review hardening): both CLI callsites (logprob + replay) route --tokenizer-hash
-    through the validating helper — a revert to raw `bytes.fromhex(tokenizer_hash)` at either callsite
-    would otherwise keep the suite green (the behavior probe below pins only the helper)."""
+    """C4.4 (wiring pin, review hardening): every capture CLI callsite (logprob + replay + campaign) routes
+    --tokenizer-hash through the validating helper — a revert to raw `bytes.fromhex(tokenizer_hash)` at any
+    callsite would otherwise keep the suite green (the behavior probe below pins only the helper)."""
     import pathlib
 
     src = (
         pathlib.Path(__file__).resolve().parents[1] / "src" / "neuromancer_llm" / "cli" / "capture.py"
     ).read_text(encoding="utf-8")
-    assert src.count("_tokenizer_hash_bytes(tokenizer_hash)") == 2  # logprob + replay
+    assert src.count("_tokenizer_hash_bytes(tokenizer_hash)") == 3  # logprob + replay + campaign
     # no raw fromhex on the CLI argument anywhere outside the helper's own body
     assert src.count("bytes.fromhex(value)") == 1 and "bytes.fromhex(tokenizer_hash)" not in src
 

@@ -621,6 +621,84 @@ class Repository:
                 )
             return existing["rule_id"]
 
+    # --- run_metrics vocabulary + writer (ADR-0017; ESTELA §A12 D4b — the FIRST run_metrics writer) -----
+    def seed_metric_key(self, *, metric_key: str, value_kind: str, description: str) -> str:
+        """Idempotent, FAIL-LOUD seed of a `metric_keys` vocabulary row — the FK target every `run_metrics`
+        row references (`run_metrics.metric_key -> metric_keys.metric_key`). Modeled on `seed_expected_rule`
+        (NOT `ON CONFLICT DO NOTHING` alone): a SAME-value re-seed is a no-op; a re-seed with a DIFFERENT
+        `value_kind`/`description` RAISES, because `metric_keys` is an identity-bearing vocabulary and a
+        silently-dropped divergent re-seed is the exact hole the 2026-07-02 seed audit closed. `metric_keys`
+        INSERT is registrar/admin-only (grants.sql), so this runs on the control plane."""
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.metric_keys (metric_key, value_kind, description) "
+                    "VALUES (:k, :vk, :d) ON CONFLICT (metric_key) DO NOTHING RETURNING metric_key"
+                ),
+                {"k": metric_key, "vk": value_kind, "d": description},
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            existing = (
+                conn.execute(
+                    text("SELECT value_kind, description FROM neuro.metric_keys WHERE metric_key = :k"),
+                    {"k": metric_key},
+                )
+                .mappings()
+                .one()
+            )
+            if existing["value_kind"] != value_kind or existing["description"] != description:
+                raise IdentityMismatchError(
+                    f"metric_key {metric_key!r} is already seeded with a different value_kind/description — a "
+                    "re-seed is idempotent only for the SAME vocabulary row; changing it is an explicit "
+                    "vocabulary update, never a silent re-seed (fail closed)."
+                )
+            return metric_key
+
+    def write_run_metric(
+        self,
+        *,
+        run_id: int,
+        metric_key: str,
+        value_json: str | None = None,
+        value_num: float | None = None,
+    ) -> int:
+        """Write ONE `run_metrics` row (the FIRST run_metrics writer; ADR-0017). Register-first /
+        raise-on-drift on `UNIQUE(run_id, metric_key)`: a re-write of the SAME (run_id, metric_key) with the
+        SAME value is idempotent (returns the existing id); a DIFFERENT value RAISES — the projection is
+        deterministic given the capture, so a drift genuinely CONTRADICTS (the integrity class, not the
+        attribution class). The `metric_key` FK must be seeded first (`seed_metric_key`); the 8 KB
+        `run_metrics_valve` (ADR-0017) is enforced by the DB CHECK. run_metrics INSERT is `neuro_writer`."""
+        with self.engine.begin() as conn:
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.run_metrics (run_id, metric_key, value_num, value_json) "
+                    "VALUES (:r, :k, :vn, :vj) "
+                    "ON CONFLICT (run_id, metric_key) DO NOTHING RETURNING run_metric_id"
+                ),
+                {"r": run_id, "k": metric_key, "vn": value_num, "vj": value_json},
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            existing = (
+                conn.execute(
+                    text(
+                        "SELECT run_metric_id, value_num, value_json FROM neuro.run_metrics "
+                        "WHERE run_id = :r AND metric_key = :k"
+                    ),
+                    {"r": run_id, "k": metric_key},
+                )
+                .mappings()
+                .one()
+            )
+            if existing["value_num"] != value_num or existing["value_json"] != value_json:
+                raise IdentityMismatchError(
+                    f"run_metric (run_id={run_id}, metric_key={metric_key!r}) already exists with a different "
+                    "value — the projection is deterministic given the capture, so a drift contradicts (raise, "
+                    "never a silent keep-first)."
+                )
+            return existing["run_metric_id"]
+
     # --- MEASURED determinism: method registry + replicate links + divergence (ADR-0004/0011) ----
     def register_method_version(
         self, *, method_key: str, semver: str, code_sha: bytes, set_active: bool
