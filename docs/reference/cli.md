@@ -39,10 +39,11 @@ The one `neuro` CLI (ADR-0038). Generated from `neuromancer_llm.cli.app` by `neu
 - `neuro probe report` — Render the operational durability state: every system_health durability row + recent probe reports
 - `neuro probe run` — Run ONE durability producer and record its signal (writer-grade; the systemd timers' ExecStart).
 - `neuro probe verify-config` — Assert the ruling-§3.5 provisioning invariants (retention/staleness/cadence/queue-max consistency)
-- `neuro runs` — Runs: new | adopt | finalize | show.
+- `neuro runs` — Runs: new | adopt | finalize | show | position-bias.
 - `neuro runs adopt` — STAGE 2 — retroactively label an adhoc/unlabeled run (ADR-0036).
 - `neuro runs finalize` — STAGE 2 — finalize a run.
 - `neuro runs new` — STAGE 2 — mint a labeled run via the composer.
+- `neuro runs position-bias` — Measure answer-position/order bias over a capture campaign's answer-letter projections. READ-ONLY.
 - `neuro runs show` — Show one run's DB-resident provenance read-only: identity, model, counts, inputs, metrics, lake pointers.
 - `neuro spend` — Spend governance: report | plan | reconcile.
 - `neuro spend plan` — Record a run_plans justification artifact (required above the budget threshold).
