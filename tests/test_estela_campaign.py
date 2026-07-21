@@ -132,17 +132,29 @@ def test_read_estela_jsonl_filters_scope(tmp_path) -> None:
                 json.dumps(
                     {
                         "uid": "q1",
-                        "stem": "S1",
+                        "question": "S1",
                         "choices": ["a", "b", "c"],
                         "num_choices": 3,
                         "has_figure": False,
                     }
                 ),
                 json.dumps(
-                    {"uid": "q2", "stem": "S2", "choices": ["a"] * 8, "num_choices": 8, "has_figure": False}
+                    {
+                        "uid": "q2",
+                        "question": "S2",
+                        "choices": ["a"] * 8,
+                        "num_choices": 8,
+                        "has_figure": False,
+                    }
                 ),  # k>5 -> skip
                 json.dumps(
-                    {"uid": "q3", "stem": "S3", "choices": ["a", "b"], "num_choices": 2, "has_figure": True}
+                    {
+                        "uid": "q3",
+                        "question": "S3",
+                        "choices": ["a", "b"],
+                        "num_choices": 2,
+                        "has_figure": True,
+                    }
                 ),  # has_figure -> skip
                 "",  # blank line ignored
             ]
@@ -158,15 +170,31 @@ def test_read_estela_jsonl_missing_field_raises(tmp_path) -> None:
     p = tmp_path / "c.jsonl"
     p.write_text(
         json.dumps({"uid": "q1", "choices": ["a", "b"], "num_choices": 2}), encoding="utf-8"
-    )  # no stem
-    with pytest.raises(ValueError, match="missing required field 'stem'"):
+    )  # no question
+    with pytest.raises(ValueError, match="missing required field 'question'"):
+        read_estela_jsonl(p)
+
+
+def test_read_estela_jsonl_rejects_legacy_stem_key(tmp_path) -> None:
+    """REGRESSION PIN (2026-07-21): the stem field is ``question``, NOT ``stem``.
+
+    The original build required ``stem`` -- the readiness doc's PROSE name -- and aborted at line 1 of the real
+    corpus, which carries ``question`` and no ``stem`` at all. Every fixture here encoded the same wrong key, so
+    19 green tests validated the design doc rather than the data. This pins the corrected key: a record shaped
+    the OLD way must fail loud, naming ``question``."""
+    p = tmp_path / "c.jsonl"
+    p.write_text(
+        json.dumps({"uid": "q1", "stem": "S", "choices": ["a", "b"], "num_choices": 2, "has_figure": False}),
+        encoding="utf-8",
+    )
+    with pytest.raises(EstelaCampaignError, match="missing required field 'question'"):
         read_estela_jsonl(p)
 
 
 def test_read_estela_jsonl_len_mismatch_raises(tmp_path) -> None:
     p = tmp_path / "c.jsonl"
     p.write_text(
-        json.dumps({"uid": "q1", "stem": "S", "choices": ["a", "b"], "num_choices": 3}), encoding="utf-8"
+        json.dumps({"uid": "q1", "question": "S", "choices": ["a", "b"], "num_choices": 3}), encoding="utf-8"
     )
     with pytest.raises(EstelaCampaignError, match="disagrees with num_choices"):
         read_estela_jsonl(p)
@@ -176,7 +204,7 @@ def test_read_estela_jsonl_missing_has_figure_raises(tmp_path) -> None:
     """has_figure is REQUIRED (fail-loud, not silent-falsy) so a misnamed figure flag can't leak (post-vet)."""
     p = tmp_path / "c.jsonl"
     p.write_text(
-        json.dumps({"uid": "q1", "stem": "S", "choices": ["a", "b"], "num_choices": 2}), encoding="utf-8"
+        json.dumps({"uid": "q1", "question": "S", "choices": ["a", "b"], "num_choices": 2}), encoding="utf-8"
     )
     with pytest.raises(EstelaCampaignError, match="has_figure"):
         read_estela_jsonl(p)

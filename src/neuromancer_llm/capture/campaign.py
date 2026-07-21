@@ -76,11 +76,16 @@ class EstelaCampaignError(ValueError):
 def read_estela_jsonl(path: Path, *, max_k: int = DEFAULT_MAX_K) -> list[EstelaQuestion]:
     """Read the ESTELA JSONL into in-scope questions (FAIL-LOUD field validation; text-only; k <= max_k).
 
-    Fields required per record: ``uid``, ``stem``, ``choices``, ``num_choices``, ``has_figure`` (the campaign
+    Fields required per record: ``uid``, ``question``, ``choices``, ``num_choices``, ``has_figure`` (the campaign
     injects its own A-E labels, so the dataset ``labels`` field is not used for the prompt). A missing field, a
-    ``len(choices) != num_choices`` disagreement, or a malformed line raises (the T-DATA preflight: the field
-    names come from the readiness doc's read of the pinned commit and must be confirmed byte-exact against the
-    real JSONL here). ``has_figure`` is REQUIRED (fail-loud, not silent-falsy) so a misnamed figure flag cannot
+    ``len(choices) != num_choices`` disagreement, or a malformed line raises (the T-DATA preflight).
+
+    ⚠ THE STEM FIELD IS ``question``, NOT ``stem`` — MEASURED against the pinned corpus 2026-07-21, after the
+    original build assumed ``stem`` (the readiness doc's PROSE name) and aborted at line 1 on the real file.
+    ``stem`` exists nowhere in the corpus. ``question`` is also the correct partner for ``choices``: both carry
+    ``$...$`` LaTeX, whereas ``question_raw``/``choices_raw`` carry ``<latex>...</latex>`` tags, and
+    ``question``'s byte profile (min 114 / mean 333 / max 491) is the one the readiness doc §1 actually measured.
+    The internal ``EstelaQuestion.stem`` attribute keeps its name; only the JSON key changed. ``has_figure`` is REQUIRED (fail-loud, not silent-falsy) so a misnamed figure flag cannot
     let a figure question leak into the text-only campaign; a truthy ``has_figure`` record is skipped. Records
     with ``num_choices`` outside ``[2, max_k]`` are out of scope (a degenerate k<2 has no order to permute)."""
     if max_k > len(LETTERS):
@@ -96,7 +101,7 @@ def read_estela_jsonl(path: Path, *, max_k: int = DEFAULT_MAX_K) -> list[EstelaQ
             rec = json.loads(line)
         except json.JSONDecodeError as exc:
             raise EstelaCampaignError(f"ESTELA JSONL line {lineno}: malformed JSON ({exc}).") from exc
-        for field in ("uid", "stem", "choices", "num_choices"):
+        for field in ("uid", "question", "choices", "num_choices"):
             if field not in rec:
                 raise EstelaCampaignError(
                     f"ESTELA JSONL line {lineno}: missing required field {field!r} "
@@ -121,7 +126,7 @@ def read_estela_jsonl(path: Path, *, max_k: int = DEFAULT_MAX_K) -> list[EstelaQ
         questions.append(
             EstelaQuestion(
                 uid=str(rec["uid"]),
-                stem=str(rec["stem"]),
+                stem=str(rec["question"]),
                 choices=tuple(str(c) for c in choices),
                 num_choices=k,
             )
