@@ -177,7 +177,24 @@ def status(
     lane: str = typer.Option("canonical", help="the lane this DB must positively be"),
 ) -> None:
     """Report each durability row (present / status / stale_after drift). Exit non-zero on any missing or
-    drifted row — the CI / A2-16-provisioning check."""
+    drifted row — the CI / A2-16-provisioning check.
+
+    RENDER-HONESTY (§A-62 / precedent 19: a rendered fact keyed on X must not assert Y). The fact this
+    command establishes is PROVISIONING — the row exists, and where it carries a bound its `stale_after`
+    sentinel matches the pin (wal_lag is deliberately BOUND-LESS, so for it provisioning is presence alone).
+    A row's `status` is an INDEPENDENT fact it deliberately does not gate on, so the two are rendered as
+    separate words. It previously printed a bare `ok` in front of the real status, so a `status='blocked'`
+    row rendered as "ok status=blocked" — a checkable falsehood (precedent 15) in a SAFETY surface.
+
+    ⚠ DO NOT "FIX" THIS BY EXITING NON-ZERO ON status='blocked'. Every row is BORN blocked by fail-closed
+    design (`durability.DurabilityRow.born_status`) and stays blocked until its first real probe bump, so
+    gating on status would make a freshly seeded DB fail the very provisioning check this command exists to
+    certify — the seed-then-green sequence pinned in tests/test_durability_seed.py. The OPERATIONAL health
+    read is `neuro probe report` (which names this command as the provisioning one in its own docstring);
+    the ADR-0020 interlock that BLOCKs a canonical write on these rows is `health.assert_durability_ok`.
+    A PRESENT row's non-'ok' status is REPORTED here — never suppressed, never gated on, and never
+    EXPLAINED (see the note at the foot of the run: this command cannot tell born-blocked from
+    probed-then-failed, and does not pretend to)."""
     from ..db.session import make_verified_engine
     from ..governance.durability import status_all
 
@@ -202,7 +219,7 @@ def status(
                     fg=typer.colors.YELLOW,
                 )
             else:
-                typer.echo(f"  {r.health_key}: ok status={r.status} stale_after={r.stale_after}")
+                typer.echo(f"  {r.health_key}: provisioned status={r.status} stale_after={r.stale_after}")
         bad = [r.health_key for r in rows if not r.present or r.drift]
         if bad:
             typer.secho(
@@ -210,3 +227,21 @@ def status(
             )
             raise typer.Exit(code=1)
         typer.echo(f"durability status (lane={lane}): all {len(rows)} row(s) provisioned + consistent")
+        # Report the independent fact WITHOUT gating on it, and WITHOUT explaining it. A first draft added
+        # "(a row is born blocked until its first probe)" — which re-committed precedent 19 inside the very
+        # fix: the list is keyed on status != 'ok', but born-blocked is only ONE of the ways a row gets
+        # there (a FAILED probe writes 'blocked' too — probes.py / wal_archiving.py / lake_mirror.py — as
+        # does health.py's drift/staleness CAS), so on a box whose backup has been failing for a week that
+        # parenthetical explained a live alarm away as a fresh seed. Naming a CONSEQUENCE instead would be
+        # the same error again: lake_mirror_freshness is deliberately NOT in health.GATE_CONSULTED_KEYS, so
+        # "canonical writes are blocked" is false for it. This command cannot honestly say WHY or SO-WHAT —
+        # so it says neither, and says that it says neither.
+        unhealthy = [r.health_key for r in rows if r.status != "ok"]
+        if unhealthy:
+            typer.echo(
+                f"  note: {len(unhealthy)} of {len(rows)} row(s) are not currently status='ok': "
+                f"{unhealthy}. Provisioning is green regardless — but this command establishes PROVISIONING "
+                "only: it does not say WHY a row is blocked (a born row and a probed-then-FAILED row look "
+                "identical here) nor whether canonical writes are gated on it. Read "
+                f"`neuro probe report --lane {lane}`"
+            )

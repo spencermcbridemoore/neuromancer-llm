@@ -292,6 +292,50 @@ def test_cli_seed_status_reconcile_on_test_lane(repo):
 
 
 @pytest.mark.pg
+def test_cli_status_never_calls_a_blocked_row_ok(repo):
+    """RENDER-HONESTY (§A-62 / precedent 19) in a SAFETY surface. Rows are BORN status='blocked', so a
+    freshly seeded DB is exactly the case where this command used to print `ok status=blocked` — the word
+    `ok` asserting a health verdict the command never established.
+
+    The provisioning verdict must STAY GREEN here (exit 0): born-blocked is correct fail-closed
+    provisioning, and gating on status would break the A2-16 seed-then-green sequence pinned above. So this
+    pins four facts together — green exit, real status visible, no `ok` in front of it, and the operator
+    pointed at the operational read."""
+    _runner.invoke(app, ["db", "durability", "seed", "--lane", "test"])
+    r = _runner.invoke(app, ["db", "durability", "status", "--lane", "test"])
+    assert r.exit_code == 0  # provisioning green: a born-blocked row is BY DESIGN, never a provisioning fault
+    assert "status=blocked" in r.stdout  # the real status is rendered, not suppressed
+    assert "ok status=blocked" not in r.stdout  # ...and is no longer prefixed by a bare `ok` (the falsehood)
+    assert "probe report" in r.stdout  # the operator is pointed at the OPERATIONAL read
+
+
+@pytest.mark.pg
+def test_cli_status_never_explains_a_blocked_row_as_merely_born_blocked(repo):
+    """The post-build vet's CONFIRMED finding: the first fix traded a false VERDICT for a false CAUSE.
+
+    The note is keyed on `status != 'ok'`, but born-blocked is only ONE route there — a probed-then-FAILED
+    row is written 'blocked' by the probe producers, and health.py's drift/staleness CAS flips 'ok'->'blocked'
+    long after the first probe. A parenthetical saying "a row is born blocked until its first probe" therefore
+    explained a LIVE alarm away as a fresh seed. The seeded-only test above cannot catch this, because there
+    the benign cause happens to be true — so this fixture builds the DIVERGENT case explicitly: a row whose
+    measured_at is seconds old, i.e. unambiguously probed, and still blocked."""
+    _runner.invoke(app, ["db", "durability", "seed", "--lane", "test"])
+    with repo.engine.begin() as conn:  # a probe RAN and FAILED: blocked, but measured_at is now, not epoch
+        conn.execute(
+            text(
+                "UPDATE neuro.system_health SET status='blocked', detail='backup FAILED', "
+                "measured_at=now() WHERE health_key = :k"
+            ),
+            {"k": BACKUP_FRESHNESS_KEY},
+        )
+    r = _runner.invoke(app, ["db", "durability", "status", "--lane", "test"])
+    assert r.exit_code == 0  # still a PROVISIONING pass — the row is present and its sentinel matches
+    assert "status=blocked" in r.stdout
+    assert "born blocked until its first probe" not in r.stdout  # the exact causal falsehood, gone
+    assert "does not say WHY" in r.stdout  # ...replaced by an explicit disclaimer of the cause
+
+
+@pytest.mark.pg
 def test_cli_lane_mismatch_fails_closed_no_write(repo):
     # default --lane canonical against the lane='test' session DB -> fail closed at assert_lane, NO write.
     r = _runner.invoke(app, ["db", "durability", "seed"])  # default lane=canonical
