@@ -18,7 +18,7 @@ from sqlalchemy import text
 
 from neuromancer_llm.capture.adapters.vllm import LogprobSample
 from neuromancer_llm.capture.events import INLINE_CAP, capture_logprob, logprob_parquet, write_capture_event
-from neuromancer_llm.db.identity import fingerprint_hash
+from neuromancer_llm.db.identity import fingerprint_hash, model_identity_hash
 from neuromancer_llm.db.repository import IdentityMismatchError
 from neuromancer_llm.storage.backends import LocalFsBackend
 
@@ -225,6 +225,129 @@ def test_register_tokenizer_identity_raises_on_drift(repo):
     with pytest.raises(IdentityMismatchError):  # same hash, different non-NULL hf_repo -> drift
         repo.register_tokenizer_identity(tokenizer_hash=b"TK", hf_repo="repoB", hf_revision="r1")
     assert repo.register_tokenizer_identity(tokenizer_hash=b"TK") is not None  # NULL incoming -> idempotent
+
+
+# --- UNIT 1 (§D follow-on #1): the OTHER direction — right LABEL, wrong FILE ------------------------
+# The test above covers the HARMLESS direction (right file, wrong label — cosmetic, the durable identity is
+# the hash and the hash is correct). These cover the DAMAGING one, which the ON CONFLICT (tokenizer_hash)
+# arbiter structurally cannot reach: a NEW hash never enters the conflict branch at all.
+
+
+@pytest.mark.pg
+def test_register_tokenizer_identity_raises_on_label_collision(repo):
+    """A NEW tokenizer_hash under an ALREADY-REGISTERED, fully pinned (hf_repo, hf_revision) RAISES rather
+    than silently minting a second tokenizer identity.
+
+    Decoys first (the RESTART IDENTITY blind-id trap): two throwaway rows so the real id is not 1. The
+    surviving-row assertion is on HASH BYTES as well as the id, so it cannot go blind on an id collision."""
+    d1 = repo.register_tokenizer_identity(tokenizer_hash=b"decoy-1")
+    d2 = repo.register_tokenizer_identity(tokenizer_hash=b"decoy-2")
+    first = repo.register_tokenizer_identity(
+        tokenizer_hash=b"RIGHT-FILE", hf_repo=HF_REPO, hf_revision=HF_REVISION
+    )
+    assert len({d1, d2, first}) == 3  # de-blinded: three distinct ids
+    with pytest.raises(IdentityMismatchError) as exc:
+        repo.register_tokenizer_identity(
+            tokenizer_hash=b"WRONG-FILE", hf_repo=HF_REPO, hf_revision=HF_REVISION
+        )
+    msg = str(exc.value)
+    assert b"RIGHT-FILE".hex()[:12] in msg and b"WRONG-FILE".hex()[:12] in msg  # names BOTH hashes
+    # the raise ran INSIDE the caller's txn -> the just-inserted row rolled back; nothing durable was minted
+    with repo.engine.connect() as conn:
+        surviving = conn.execute(
+            text(
+                "SELECT tokenizer_id, tokenizer_hash FROM neuro.tokenizer_identities "
+                "WHERE hf_repo = :r AND hf_revision = :rev"
+            ),
+            {"r": HF_REPO, "rev": HF_REVISION},
+        ).all()
+    assert [(r.tokenizer_id, bytes(r.tokenizer_hash)) for r in surviving] == [(first, b"RIGHT-FILE")]
+
+
+@pytest.mark.pg
+def test_label_collision_raises_when_the_wrong_file_was_already_registered(repo):
+    """The escape the post-build vet CONFIRMED against a first draft that scanned only the inserted branch.
+
+    The wrong file's hash may ALREADY be registered — one NULL-labelled row is enough — so the call lands on
+    the tokenizer_hash CONFLICT branch, which mints nothing but still hands back a tokenizer_id bound to the
+    wrong BYTES; the caller then forks model + fingerprint from it exactly as before, and the drift loop
+    passes it because a STORED NULL is 'unspecified'. 'Nothing was inserted' is not 'nothing was bound'.
+    Reddens if the scan is moved back under `if inserted is not None:`."""
+    wrong = repo.register_tokenizer_identity(tokenizer_hash=b"WRONG-FILE")  # unlabelled, registered earlier
+    right = repo.register_tokenizer_identity(
+        tokenizer_hash=b"RIGHT-FILE", hf_repo=HF_REPO, hf_revision=HF_REVISION
+    )
+    assert wrong != right
+    with pytest.raises(IdentityMismatchError):
+        repo.register_tokenizer_identity(
+            tokenizer_hash=b"WRONG-FILE", hf_repo=HF_REPO, hf_revision=HF_REVISION
+        )
+
+
+def test_a_tokenizer_label_collision_really_would_fork_model_identity():
+    """The damage claim MEASURED, not asserted (precedent 10): two model identities differing ONLY in
+    tokenizer_hash produce DIFFERENT identity_hashes. That is what makes the second tokenizer row mint a
+    second model_id — and the guard above a precondition rather than a nicety. Pure function; no DB."""
+    common = {
+        "hf_repo": HF_REPO,
+        "hf_revision": HF_REVISION,
+        "dtype_quant": "bf16",
+        "serving_stack": "vllm",
+        "serving_version": "0.23.0",
+        "arch_family": "llama",
+    }
+    assert model_identity_hash(tokenizer_hash=b"RIGHT-FILE", **common) != model_identity_hash(
+        tokenizer_hash=b"WRONG-FILE", **common
+    )
+
+
+@pytest.mark.pg
+def test_tokenizer_label_guard_skips_both_asymmetric_null_cases(repo):
+    """The standing both-asymmetric-NULL-cases obligation. A pair with a NULL half names no immutable
+    upstream artifact, so it is 'unspecified' (the conflict branch's own convention) and must still
+    INSERT — deliberately out of scope, not checked-and-passed."""
+    base = repo.register_tokenizer_identity(tokenizer_hash=b"base", hf_repo=HF_REPO, hf_revision=HF_REVISION)
+    no_repo = repo.register_tokenizer_identity(tokenizer_hash=b"nullrepo", hf_revision=HF_REVISION)
+    no_revision = repo.register_tokenizer_identity(tokenizer_hash=b"nullrev", hf_repo=HF_REPO)
+    assert len({base, no_repo, no_revision}) == 3
+
+
+@pytest.mark.pg
+def test_tokenizer_label_guard_allows_a_genuine_revision_bump(repo):
+    """Same repo, DIFFERENT pinned revision = a different upstream artifact, so a different tokenizer.json
+    is expected. The guard keys on the FULL pair; keying on hf_repo alone would falsely redden here."""
+    pinned = repo.register_tokenizer_identity(
+        tokenizer_hash=b"rev-one", hf_repo=HF_REPO, hf_revision=HF_REVISION
+    )
+    bumped = repo.register_tokenizer_identity(
+        tokenizer_hash=b"rev-two", hf_repo=HF_REPO, hf_revision="deadbeef" * 5
+    )
+    assert pinned != bumped
+
+
+@pytest.mark.pg
+def test_tokenizer_label_guard_allows_a_different_repo_at_the_same_revision(repo):
+    """The OTHER half of 'keys on the FULL pair' — a fork/mirror can carry the same revision sha under a
+    different repo, and that is a different artifact. Without this, a mutation dropping the `hf_repo`
+    conjunct survives every other probe here (the criterion had no falsifying fixture until it did)."""
+    original = repo.register_tokenizer_identity(
+        tokenizer_hash=b"repo-one", hf_repo=HF_REPO, hf_revision=HF_REVISION
+    )
+    fork = repo.register_tokenizer_identity(
+        tokenizer_hash=b"repo-two", hf_repo="someone/Mistral-7B-v0.3-fork", hf_revision=HF_REVISION
+    )
+    assert original != fork
+
+
+@pytest.mark.pg
+def test_tokenizer_label_guard_ignores_a_stored_unpinned_row(repo):
+    """A STORED row with a NULL half must not block a later fully pinned registration under the same repo —
+    the SQL equality drops it for free, and this pins that it stays dropped."""
+    unpinned = repo.register_tokenizer_identity(tokenizer_hash=b"stored-null-rev", hf_repo=HF_REPO)
+    later = repo.register_tokenizer_identity(
+        tokenizer_hash=b"later-pinned", hf_repo=HF_REPO, hf_revision=HF_REVISION
+    )
+    assert unpinned != later
 
 
 # --- BLOCK 1: capture resume paths fail loud (mirror the registrar's R2) ----------------------------

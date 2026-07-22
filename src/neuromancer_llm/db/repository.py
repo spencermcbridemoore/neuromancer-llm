@@ -18,7 +18,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 
-from sqlalchemy import Engine, text
+from sqlalchemy import Connection, Engine, text
 
 from .identity import fingerprint_hash as _fingerprint_hash
 from .identity import model_identity_hash
@@ -397,7 +397,42 @@ class Repository:
         """INSERT-only by tokenizer_hash (the durable identity); idempotent return on conflict. On a
         tokenizer_hash conflict the recorded hf_repo/hf_revision must MATCH when both sides specify them —
         a same-hash re-register with conflicting (non-NULL) provenance raises (consistency with the model/
-        fingerprint conflict path; ADR-0005). A NULL on either side is 'unspecified', not a conflict."""
+        fingerprint conflict path; ADR-0005). A NULL on either side is 'unspecified', not a conflict.
+
+        BOTH DIRECTIONS RAISE (the second added 2026-07-22). The one above is the HARMLESS direction —
+        right FILE, wrong LABEL — and it is cosmetic: the durable identity is the hash, and the hash is
+        correct. The DAMAGING direction is its mirror image, right LABEL, wrong FILE: a wrong tokenizer.json
+        registered under an already-known (hf_repo, hf_revision) mints a SECOND tokenizer identity, and from
+        it a second model_identity (register_model_identity hashes over tokenizer_HASH) and a second
+        fingerprint (model_identity is folded into the semantic config) — a tokenizer -> model -> fingerprint
+        fork that every row COUNT reads green through. `cli/capture.py:22-25`'s 2026-07-02 audit correction
+        already named this exact end state "a silent identity split" that "raise-on-drift could never
+        reconcile", but it fixed only the INPUT SHAPE (hex validity + 32 bytes) — so a WELL-FORMED sha256 of
+        the wrong file still landed in precisely the hazard that correction names.
+
+        ⚠ THE LABEL SCAN THEREFORE RUNS ON BOTH BRANCHES, ABOVE THE INSERTED/CONFLICT SPLIT — not only when
+        a row was minted. A first draft ran it on the INSERTED branch alone, which was a checkable falsehood
+        (post-build vet, 2026-07-22): the wrong file's hash may ALREADY be registered — a NULL-labelled row
+        is enough — in which case the call lands on the CONFLICT branch, which mints nothing but still hands
+        back a tokenizer_id bound to the wrong bytes, and the caller forks model + fingerprint from it just
+        the same. The stored-NULL drift loop below cannot catch it either: a stored NULL is 'unspecified' and
+        passes. "Nothing was inserted" is NOT "nothing was bound".
+
+        It takes an EXPLICIT SECOND LOOKUP, not a wider conflict branch: `tokenizer_identities` is UNIQUE on
+        `tokenizer_hash` ALONE (phase3-ddl.sql:79-81 — hf_repo/hf_revision are bare nullable text carrying no
+        unique), so NO `ON CONFLICT` arbiter can ever route a label collision into the conflict branch. That
+        structural dead end is why the gap outlived earlier vets: the upsert idiom cannot express it.
+
+        ⚠ It cannot false-fire on an honest re-capture: `tokenizer_hash` is a raw sha256 over
+        tokenizer.json's BYTES, carrying no tokenizer-library version, so it is stable across re-reads of the
+        same file. Two things DO make it fire on a re-read, and neither is a defect in the guard — both are
+        the label failing to name one immutable artifact. (a) Sourcing tokenizer.json from a git checkout
+        under `core.autocrlf`: CRLF and LF bytes hash differently at the same commit — the ESTELA corpus trap
+        (env-gotchas) reappearing on a different file; hash the file as FETCHED, never as checked out.
+        (b) Passing a MUTABLE `hf_revision` (a branch name like `main` rather than a commit sha): nothing at
+        HEAD constrains the column to an immutable ref, so the same label legitimately covers different bytes
+        over time. In both cases the raise is the guard correctly refusing to let two files hide under one
+        label — pin the revision."""
         with self.engine.begin() as conn:
             inserted = conn.execute(
                 text(
@@ -406,6 +441,7 @@ class Repository:
                 ),
                 {"h": tokenizer_hash, "r": hf_repo, "rev": hf_revision, "n": note},
             ).scalar_one_or_none()
+            self._assert_no_tokenizer_label_collision(conn, tokenizer_hash, hf_repo, hf_revision)
             if inserted is not None:
                 return inserted
             existing = (
@@ -426,6 +462,59 @@ class Repository:
                         f"{existing[field]!r}, not {want!r} (ADR-0005 register-first, raise-on-mismatch)."
                     )
             return existing["tokenizer_id"]
+
+    @staticmethod
+    def _assert_no_tokenizer_label_collision(
+        conn: Connection,
+        tokenizer_hash: bytes,
+        hf_repo: str | None,
+        hf_revision: str | None,
+    ) -> None:
+        """Raise if a FULLY PINNED (hf_repo, hf_revision) already names a DIFFERENT tokenizer_hash.
+
+        Called ABOVE the inserted/conflict split, inside the CALLER'S transaction, so that (a) on the
+        inserted branch the raise rolls the just-minted row back — nothing durable is created — and (b) on
+        the conflict branch it still fires, which is the case a first draft missed. That placement is the
+        point: an identity split is unrecoverable in practice — there is no delete verb for identity rows
+        anywhere in src/ (the only DELETE is bundles/gc.py, on unsealed bundles).
+
+        SCOPE, stated so it can never be mistaken for coverage: it fires only when BOTH incoming labels are
+        non-NULL. A pair with a NULL half names no immutable upstream artifact, so it is 'unspecified' —
+        the conflict branch's NULL-means-unspecified convention, applied here to the PAIR rather than
+        per-field — and is deliberately OUT of scope rather than checked-and-passed. Both asymmetric NULL
+        cases are pinned BEHAVIOURALLY by test (the standing both-NULL-cases obligation), as are stored-side
+        NULLs, which fall out of the SQL equality for free.
+
+        ⚠ The `hf_repo is None or hf_revision is None` early return is a BELT, not the mechanism, and is
+        deliberately NOT counted in the mutation matrix (precedent 11): deleting it is behaviour-preserving,
+        because binding NULL to :r or :rev makes the WHERE clause NULL for every row under SQL three-valued
+        logic, so `clash` is None and control reaches the same return. It is kept for legibility and so the
+        fail-closed intent is stated where a reader meets it — but it is UNPINNABLE BY CONSTRUCTION, and
+        claiming otherwise would be the overclaim precedent 11 exists to prevent.
+
+        NOT a substitute for a DB constraint under concurrency: two concurrent first-registrations of
+        different hashes under one label can each miss the other under READ COMMITTED. That is the standing
+        ADR-0046 row-locking class, unchanged by this guard; the capture path is single-writer today.
+        """
+        if hf_repo is None or hf_revision is None:
+            return
+        clash = conn.execute(
+            text(
+                "SELECT tokenizer_hash FROM neuro.tokenizer_identities "
+                "WHERE hf_repo = :r AND hf_revision = :rev AND tokenizer_hash <> :h LIMIT 1"
+            ),
+            {"r": hf_repo, "rev": hf_revision, "h": tokenizer_hash},
+        ).scalar_one_or_none()
+        if clash is None:
+            return
+        raise IdentityMismatchError(
+            f"tokenizer label {hf_repo}@{hf_revision} is already registered with tokenizer_hash "
+            f"{clash.hex()[:12]}, not {tokenizer_hash.hex()[:12]} — one pinned (hf_repo, hf_revision) names "
+            "ONE immutable tokenizer.json, so a second hash under it is a WRONG-FILE read, not a new "
+            "identity. Registering it would fork tokenizer -> model_identity -> fingerprint while every row "
+            "count reads green (ADR-0005 register-first, raise-on-drift; the 'silent identity split' named "
+            "by cli/capture.py's 2026-07-02 audit correction, which fixed only the input SHAPE)."
+        )
 
     def register_model_identity(
         self,
