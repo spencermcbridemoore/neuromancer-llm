@@ -23,6 +23,18 @@ payload is LOGPROBS, never stimulus text — can be read, the CLI does not expos
 payload column of `capture_events` (`request_text` / `response_text`) is selected anywhere here. Read the SQL
 and see it.
 
+★ THE RESOLUTION FLOOR — MEASURED ON CANONICAL 2026-07-21, AND IT BOUNDS WHAT THIS MODULE CAN SEE. The captured
+answer-letter logprobs sit on a **0.0625-nat (2^-4) quantization grid**: in every sampled projection, every
+pairwise difference between letters is an exact multiple of 0.0625, and each projection is one arbitrary float32
+constant (the log-softmax normalizer) minus an integer number of grid steps. That is the signature of **bf16
+logits with magnitude in [8, 16)**, where the bf16 ULP is exactly 2^3 * 2^-7 = 0.0625 — a property of the pinned
+capture recipe (bf16, ``--logprobs-mode raw_logprobs``), applying retroactively to all 6,000 ESTELA captures.
+
+Consequences a reader must not miss: the answer letters span only ~4 distinguishable levels, so **13.7% of
+permutations have no resolvable argmax at all** (they tie, and are excluded + counted); and no increase in
+``n_logprobs`` can help, because the limit is DEPTH, not breadth — the D4b 20 -> 64 supersession (log:227) fixed
+censoring, which is a different axis. A campaign needing finer resolution needs float32 logits, not more of them.
+
 THE LOAD-BEARING SUBTLETY: the projection is keyed by LETTER (= POSITION), so measuring content-vs-position
 requires mapping each letter back through the permutation. BOTH DIRECTIONS ARE USED AND THEY ARE NOT THE SAME:
 letter ``i`` displayed source option ``perm[i]`` (a FORWARD index, `capture/campaign.py:171`), while the correct
@@ -80,8 +92,14 @@ def argmax_letter(projection: dict[str, float | None]) -> Argmax:
     ★ THE TIE RULE (explicit, never assumed away): an EXACT tie for the maximum is NOT broken — it returns
     reason='tie' and the caller EXCLUDES and COUNTS it. Any deterministic letter-ordered tie-break ("lowest
     letter wins") would inject position bias into a position-bias measure and manufacture precisely the
-    A-favoured result under test. Exclusion is the only rule that cannot fabricate the finding. At k <= 5 exact
-    ties are improbable, which is why the rule must be DEFINED rather than assumed unreachable."""
+    A-favoured result under test. Exclusion is the only rule that cannot fabricate the finding.
+
+    ⚠ TIES ARE COMMON, NOT RARE — MEASURED, NOT ASSUMED. This docstring previously claimed exact ties are
+    "improbable at k <= 5". The first canonical run REFUTED that: **820 / 6,000 = 13.7%** of the ESTELA
+    permutations tie, spread across every question. The cause is the capture recipe, not the model — see the
+    bf16 quantization note in the module docstring. So the rule is not a formality guarding an unreachable
+    branch; it decides the disposition of one permutation in seven, and the excluded fraction MUST be reported
+    (it is, as `tie_count`, per-question and per-k)."""
     live = [(i, v) for i, (_letter, v) in enumerate(sorted(projection.items())) if v is not None]
     if not live:
         return Argmax(None, _CENSORED)
