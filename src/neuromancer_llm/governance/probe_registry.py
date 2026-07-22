@@ -45,7 +45,7 @@ def _run_backup(engine: Engine, ctx: ProbeContext) -> None:
     if ctx.backup_driver is None or not ctx.destination:
         raise ConfigurationError(
             "the backup_freshness probe requires a backup driver and a destination "
-            "(NEURO_BACKUP_DEST / --dest) — refusing a driverless run (fail closed)."
+            "(NEURO_BACKUP_DEST / --dest) — refusing to run without both (fail closed)."
         )
     run_backup_probe(
         engine, backup_driver=ctx.backup_driver, destination=ctx.destination, actor_id=ctx.actor_id
@@ -60,7 +60,7 @@ def _run_lake_mirror(engine: Engine, ctx: ProbeContext) -> None:
     if ctx.lake_mirror_driver is None or not ctx.destination:
         raise ConfigurationError(
             "the lake_mirror_freshness probe requires a lake-mirror driver and a destination "
-            "(NEURO_LAKE_MIRROR_DEST / --dest) — refusing a driverless run (fail closed)."
+            "(NEURO_LAKE_MIRROR_DEST / --lake-dest) — refusing to run without both (fail closed)."
         )
     run_lake_mirror_probe(
         engine,

@@ -162,6 +162,112 @@ def test_run_lake_mirror_wires_driver_and_destination(repo, monkeypatch):
 
 
 @pytest.mark.pg
+def test_fail_closed_messages_name_a_flag_that_ACTUALLY_UNBLOCKS(repo, monkeypatch):
+    """Each fail-closed destination message must name the flag that RESOLVES it — for EVERY arm.
+
+    `probe_registry.py`'s lake-mirror message named `--dest`. That flag exists, so a name-only check passes,
+    but it is the BACKUP arm's flag: `cli/probe.py` gates lake_mirror_freshness on `lake_dest`, so an operator
+    who did exactly what the error said still got the same error. A delivered-but-unactionable alert is the
+    E-16 corollary — an alert that names the failed thing instead of the action.
+
+    So this pins the REMEDY, not the spelling: parse the flag out of the message, pass THAT flag through the
+    CLI with a scripted driver, and require the probe to get past the destination check.
+
+    BOTH LAYERS, because they are not the same text and only one of them is reachable. `cli/probe.py` raises
+    its OWN refusal before the runner is ever called, so the message an operator actually reads on
+    `neuro probe run` is the CLI's — the registry's was correct-but-dead here, and the CLI's was live-but-
+    unpinned. Each layer's flag is parsed from that layer's own message and each must unblock; the two are
+    then required to AGREE, so neither can drift into the other's flag.
+
+    Both arms run in ONE probe so a fix to either cannot hide a break in the other, and the set of
+    destination-bearing arms is DERIVED from PROBE_RUNNERS (§8 fold 7: a future arm is a one-surface append or
+    this reddens) rather than hardcoded — a third dest-bearing arm must be added to the remedy check."""
+    import re
+
+    from neuromancer_llm.db.lanes import ConfigurationError
+    from neuromancer_llm.governance.freshness import BACKUP_FRESHNESS_KEY
+    from neuromancer_llm.governance.lake_freshness import LAKE_MIRROR_FRESHNESS_KEY
+    from neuromancer_llm.governance.lake_mirror import LakeMirrorOutcome
+    from neuromancer_llm.governance.probe_registry import ProbeContext
+
+    def _one_flag(where: str, message: str) -> str:
+        flags = re.findall(r"--[a-z][a-z0-9-]*", message)
+        assert len(flags) == 1, f"{where}: expected exactly one flag in {message!r}, got {flags}"
+        return flags[0]
+
+    def _registry_flag(key: str) -> str:
+        # The runner refuses before it touches the engine, so no DB is needed to read its message.
+        with pytest.raises(ConfigurationError) as excinfo:
+            PROBE_RUNNERS[key](None, ProbeContext())
+        return _one_flag(f"registry[{key}]", str(excinfo.value))
+
+    def _refusal_with_a_driver_but_no_destination(key: str, ctx: ProbeContext) -> str:
+        """The guard is `driver is None OR not destination`, so the message must not name ONE of them as the
+        cause — E-19 as extended: a line keyed on a disjunction may not assert which disjunct fired."""
+        with pytest.raises(ConfigurationError) as excinfo:
+            PROBE_RUNNERS[key](None, ctx)
+        message = str(excinfo.value)
+        assert "driverless" not in message, (
+            f"{key}: a driver WAS supplied and only the destination was missing, but the refusal blames a "
+            f"driverless run — a cause the guard did not establish.\n{message}"
+        )
+        return message
+
+    remedies = {BACKUP_FRESHNESS_KEY: "D:/neuro-backups", LAKE_MIRROR_FRESHNESS_KEY: "D:/neuro-lake"}
+    dest_bearing = set()
+    for key in PROBE_RUNNERS:
+        try:
+            PROBE_RUNNERS[key](None, ProbeContext())
+        except ConfigurationError:
+            dest_bearing.add(key)
+        except Exception:  # noqa: BLE001 — a runner that needs a real engine is simply not dest-gated
+            pass
+    assert dest_bearing == set(remedies), (
+        f"destination-bearing arms {sorted(dest_bearing)} != the arms this remedy check exercises "
+        f"{sorted(remedies)} — a new arm must be added here, not silently skipped (fold 7)"
+    )
+
+    monkeypatch.setattr(
+        "neuromancer_llm.governance.backup_driver.make_pgbackrest_mirror_driver",
+        lambda **kw: lambda destination: BackupOutcome(ok=True, detail="scripted mirror ok"),
+    )
+    monkeypatch.setattr(
+        "neuromancer_llm.governance.lake_mirror.make_lake_mirror_driver",
+        lambda **kw: (
+            lambda engine, destination: LakeMirrorOutcome(
+                ok=True, detail="scripted mirror ok", checked=1, pushed=1, deleted=0, verified=1
+            )
+        ),
+    )
+
+    for key, value in remedies.items():
+        _seed(repo.engine)
+
+        # LAYER 1 — the message the operator actually reads: the CLI's own refusal, live on `probe run`.
+        refused = _runner.invoke(app, ["probe", "run", "--key", key, "--lane", "test"])
+        assert refused.exit_code == 1, refused.output
+        cli_flag = _one_flag(f"cli[{key}]", refused.output)
+
+        # LAYER 2 — the library-level message any non-CLI caller of the runner would get.
+        registry_flag = _registry_flag(key)
+        _refusal_with_a_driver_but_no_destination(
+            key,
+            ProbeContext(backup_driver=lambda _d: None, lake_mirror_driver=lambda _e, _d: None),
+        )
+        assert cli_flag == registry_flag, (
+            f"{key}: the CLI says to pass {cli_flag} but the runner says {registry_flag} — two layers "
+            "disagreeing about the remedy is how one of them drifts into the other's flag unnoticed"
+        )
+
+        # THE REMEDY ITSELF: do exactly what the message said, and require it to unblock.
+        r = _runner.invoke(app, ["probe", "run", "--key", key, "--lane", "test", cli_flag, value])
+        assert r.exit_code == 0, (
+            f"{key}: its fail-closed message says to pass {cli_flag}, but doing exactly that still failed "
+            f"-- a delivered-but-unactionable alert.\n{r.output}"
+        )
+
+
+@pytest.mark.pg
 def test_lake_escalate_cli_override_alerts_on_current_block(repo, monkeypatch):
     # the induced-test knob through the CLI: seed the lake row blocked, --escalate-after-hours 0 fires the ping.
     from sqlalchemy import text as _text
