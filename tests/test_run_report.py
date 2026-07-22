@@ -11,6 +11,8 @@ DE-BLINDED by a second run with a DIFFERENT count, run_key lookup, RunNotFoundEr
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from sqlalchemy import text
 from typer.testing import CliRunner
@@ -20,14 +22,32 @@ from neuromancer_llm.db.run_report import RunNotFoundError, build_run_report
 
 _runner = CliRunner()
 
+# The render bound on an identity digest (db/run_report.py: `.hex()[:16]`).
+_HEX_BOUND = 16
+
+
+def _tokenizer_hash(tag: str) -> bytes:
+    """A REAL 32-byte sha256-shaped tokenizer digest = 64 hex chars.
+
+    THE LENGTH IS LOAD-BEARING (precedent 20). The original stand-in `b"tok-m1"` is 6 bytes = 12 hex chars,
+    SHORTER than the 16-char render bound, so `.hex()[:16]` was a no-op on it and a mutation deleting the bound
+    could not have reddened — the 'renders a BOUNDED pointer' criterion would have been prose."""
+    return hashlib.sha256(f"tokenizer-{tag}".encode()).digest()
+
 
 # --- seed helpers (raw SQL; the run_report SQL reads what these write) ------------------------------
 def _seed_model(conn, *, tag: str = "m1") -> int:
+    """The model_id alone, for probes that do not care which tokenizer row it bound."""
+    return _seed_model_and_tokenizer(conn, tag=tag)[0]
+
+
+def _seed_model_and_tokenizer(conn, *, tag: str = "m1") -> tuple[int, int]:
+    """(model_id, tokenizer_id) — both ids RETURNED by the DB, never inferred from insertion order."""
     tok = conn.execute(
         text("INSERT INTO neuro.tokenizer_identities (tokenizer_hash) VALUES (:h) RETURNING tokenizer_id"),
-        {"h": f"tok-{tag}".encode()},
+        {"h": _tokenizer_hash(tag)},
     ).scalar_one()
-    return conn.execute(
+    model_id = conn.execute(
         text(
             "INSERT INTO neuro.model_identities (identity_hash, hf_repo, hf_revision, dtype_quant, "
             "tokenizer_id, serving_stack, serving_version, arch_family) "
@@ -44,18 +64,43 @@ def _seed_model(conn, *, tag: str = "m1") -> int:
             "arch": "llama",
         },
     ).scalar_one()
+    return int(model_id), int(tok)
 
 
-def _label_run(conn, run_id: int, model_id: int) -> int:
+def _label_run(conn, run_id: int, model_id: int, *, tag: str = "01") -> int:
     fp = conn.execute(
         text(
             "INSERT INTO neuro.fingerprints (fingerprint_hash, model_id, declared_mode, semantic_config) "
             "VALUES (:h, :m, 'greedy', :sc) RETURNING fingerprint_id"
         ),
-        {"h": b"fp-hash-01", "m": model_id, "sc": "canonical-semantic-config"},
+        {"h": f"fp-hash-{tag}".encode(), "m": model_id, "sc": "canonical-semantic-config"},
     ).scalar_one()
     conn.execute(text("UPDATE neuro.runs SET fingerprint_id = :f WHERE run_id = :r"), {"f": fp, "r": run_id})
     return fp
+
+
+def _seed_decoy_identities(conn, *, tokenizers: int, models: int, fingerprints: int) -> None:
+    """Advance tokenizer_identities / model_identities / fingerprints by DIFFERENT amounts.
+
+    `TRUNCATE ... RESTART IDENTITY` makes the first row of every table pk=1, and these three advance in
+    LOCKSTEP when a helper mints one of each — so equal decoy counts re-collide at the next integer and the
+    probe goes blind to which id landed in which field (env-gotchas, three consecutive ranks). Different counts
+    per table is the only shape that separates them."""
+    for i in range(tokenizers):
+        conn.execute(
+            text("INSERT INTO neuro.tokenizer_identities (tokenizer_hash) VALUES (:h)"),
+            {"h": _tokenizer_hash(f"decoy-tok-{i}")},
+        )
+    for i in range(models):
+        decoy_model = _seed_model(conn, tag=f"decoy-model-{i}")
+        if i < fingerprints:
+            conn.execute(
+                text(
+                    "INSERT INTO neuro.fingerprints (fingerprint_hash, model_id, declared_mode, "
+                    "semantic_config) VALUES (:h, :m, 'greedy', 'decoy-config')"
+                ),
+                {"h": f"decoy-fp-{i}".encode(), "m": decoy_model},
+            )
 
 
 def _mark_unlabeled(conn, run_id: int) -> None:
@@ -243,6 +288,92 @@ def test_show_labeled_run_resolves_model_identity(seeded):
     assert report.model.dtype_quant == "bf16"
     assert report.model.arch_family == "llama"
     assert all(c in "0123456789abcdef" for c in report.model.fingerprint_hash_hex)  # hex pointer, not config
+
+
+@pytest.mark.pg
+def test_model_identity_carries_model_id_and_bounded_tokenizer_pointer(seeded):
+    """CRITERION (b) at the library grain: the tokenizer digest reaches the report as a BOUNDED hex pointer.
+
+    The seeded digest is a full 32-byte sha256 (64 hex chars), so the 16-char bound is load-bearing: deleting
+    `[:16]` renders 64 chars and this reddens. `model_id` is asserted against the id the fixture actually
+    minted, never against a positional guess (precedent 10 — measure, don't reason)."""
+    repo, run_id = seeded["repo"], seeded["run_id"]
+    with repo.engine.begin() as conn:
+        model_id = _seed_model(conn, tag="bound")
+        _label_run(conn, run_id, model_id)
+    full_hex = _tokenizer_hash("bound").hex()
+    assert len(full_hex) == 64  # the fixture itself is checked: a short digest could not falsify the bound
+
+    report = build_run_report(repo.engine, run_id=run_id, lane="test")
+    assert report.model is not None
+    assert report.model.model_id == model_id
+    assert report.model.tokenizer_hash_hex == full_hex[:_HEX_BOUND]
+    assert len(report.model.tokenizer_hash_hex) == _HEX_BOUND
+    assert report.model.tokenizer_hash_hex != full_hex  # the bound actually removed something
+    # A digest is a POINTER, not tokenizer content — nothing but lowercase hex ever reaches the render.
+    assert all(c in "0123456789abcdef" for c in report.model.tokenizer_hash_hex)
+
+
+@pytest.mark.pg
+def test_model_id_and_tokenizer_are_the_runs_own_not_another_runs(seeded):
+    """CRITERION (a), E-18 de-blind: two runs, DIFFERENT models and DIFFERENT tokenizers, each report showing
+    ITS OWN pair.
+
+    Breaking either join in the head query — `m.model_id = f.model_id` or
+    `t.tokenizer_id = m.tokenizer_id` — leaks the other entity's identity, which is exactly the cross-run
+    provenance blindness this surface exists to close.
+
+    The decoy CALL is (tokenizers=3, models=4, fingerprints=2); the resulting ADVANCE differs per table and is
+    not the same as those arguments — `_seed_model` mints a tokenizer of its own, so tokenizer_identities moves
+    by 3+4. All EIGHT ids (run / fingerprint / model / tokenizer, for A and B) are captured from what the DB
+    RETURNED, PRINTED, and asserted pairwise distinct. The tokenizer ids are in that set deliberately: the
+    mis-keyed-join mutation `t.tokenizer_id = m.model_id` is detectable only while a run's tokenizer_id differs
+    from its model_id, and E-18 exists so a later fixture edit that collapses that offset reddens here instead
+    of going quietly blind."""
+    repo, run_a, actor_id, campaign_id = (
+        seeded["repo"],
+        seeded["run_id"],
+        seeded["actor_id"],
+        seeded["campaign_id"],
+    )
+    run_b = repo.create_run(
+        "c-test/slug/dig-B",
+        campaign_id=campaign_id,
+        work_slug="slug",
+        variant_digest="digB",
+        actor_id=actor_id,
+    )
+    with repo.engine.begin() as conn:
+        _seed_decoy_identities(conn, tokenizers=3, models=4, fingerprints=2)
+        model_a, tok_a = _seed_model_and_tokenizer(conn, tag="A")
+        fp_a = _label_run(conn, run_a, model_a, tag="A")
+        model_b, tok_b = _seed_model_and_tokenizer(conn, tag="B")
+        fp_b = _label_run(conn, run_b, model_b, tag="B")
+
+    ids = {
+        "run_a": run_a,
+        "fp_a": fp_a,
+        "model_a": model_a,
+        "tok_a": tok_a,
+        "run_b": run_b,
+        "fp_b": fp_b,
+        "model_b": model_b,
+        "tok_b": tok_b,
+    }
+    print(f"de-blind ids: {ids}")  # printed, per the banked rule — never inferred from insertion order
+    assert len(set(ids.values())) == len(ids), f"decoys failed to separate the ids: {ids}"
+
+    a = build_run_report(repo.engine, run_id=run_a, lane="test")
+    b = build_run_report(repo.engine, run_id=run_b, lane="test")
+    assert a.model is not None and b.model is not None
+
+    assert a.model.model_id == model_a
+    assert b.model.model_id == model_b
+    assert a.model.model_id != b.model.model_id
+
+    assert a.model.tokenizer_hash_hex == _tokenizer_hash("A").hex()[:_HEX_BOUND]
+    assert b.model.tokenizer_hash_hex == _tokenizer_hash("B").hex()[:_HEX_BOUND]
+    assert a.model.tokenizer_hash_hex != b.model.tokenizer_hash_hex
 
 
 @pytest.mark.pg
@@ -493,6 +624,62 @@ def test_cli_renders_model_line_for_labeled_run(seeded):
     assert "model:" in res.output
     assert "arch=llama" in res.output
     assert "serving=vllm@0.23.0" in res.output
+
+
+@pytest.mark.pg
+def test_cli_renders_model_id_and_a_bounded_tokenizer_pointer(seeded):
+    """CRITERION (a)+(b) at the RENDER grain: `model_id` and the tokenizer digest reach the human, the id is
+    the MODEL's, and the digest is BOUNDED.
+
+    DE-BLINDED (E-18). Without decoys this probe is vacuous: `_truncate_all` restarts every identity, so a
+    lone seeded run has run_id == fingerprint_id == model_id == tokenizer_id == 1, and `model_id:    1` is
+    equally satisfied by a render of the run id or the fingerprint id. Decoys with per-table-differing counts
+    separate them; the ids are PRINTED and asserted pairwise distinct, and the `fingerprint:` line is pinned
+    with its own id so the label-to-column binding is de-blinded in both directions.
+
+    Asserted as EXACT LINES, not substrings: `model_id:    1` is a substring of `model_id:    12`, so a
+    substring check cannot tell a correct id from a wrong one that shares a prefix.
+
+    The full 64-char hex must appear NOWHERE in the output, so replacing the bounded pointer with the whole
+    digest reddens (payload discipline: a hex POINTER, never the content it identifies)."""
+    repo, run_id = seeded["repo"], seeded["run_id"]
+    with repo.engine.begin() as conn:
+        _seed_decoy_identities(conn, tokenizers=2, models=3, fingerprints=1)
+        model_id, tok_id = _seed_model_and_tokenizer(conn, tag="render")
+        fp_id = _label_run(conn, run_id, model_id, tag="render")
+    full_hex = _tokenizer_hash("render").hex()
+
+    ids = {"run_id": run_id, "fp_id": fp_id, "model_id": model_id, "tok_id": tok_id}
+    print(f"render de-blind ids: {ids}")
+    assert len(set(ids.values())) == len(ids), f"decoys failed to separate the ids: {ids}"
+
+    res = _runner.invoke(runs_app, ["show", str(run_id), "--lane", "test"])
+    assert res.exit_code == 0, res.output
+    lines = res.output.splitlines()
+    assert f"  model_id:    {model_id}" in lines
+    # The fingerprint line carries a DIFFERENT id, so rendering it under the model_id label reddens.
+    assert any(ln.startswith(f"  fingerprint: {fp_id} hash=") for ln in lines), res.output
+    assert f"  tokenizer:   {full_hex[:_HEX_BOUND]} " in res.output
+    assert full_hex not in res.output  # the bound is real: the whole digest is never rendered
+    # The line names the column the digest came FROM, so it cannot be misread as the model's hf label.
+    assert "sha256 prefix of tokenizer_identities.tokenizer_hash" in res.output
+
+
+@pytest.mark.pg
+def test_cli_absent_model_states_absence_and_asserts_nothing_else(seeded):
+    """CRITERION (c): with no fingerprint, the two new lines state their OWN absence and NOTHING else.
+
+    Asserted as EXACT LINES (E-19 as extended at log:238). Any added clause — a cause ('no model identity
+    yet'), a consequence, or a cross-reference to the other line — reddens, because the durability lesson is
+    that a coherent false explanation is worse than none: `model_id` and the tokenizer digest are read through
+    two different registry rows, and a line keyed on one must not speak for the other. They are also asserted
+    PRESENT, not merely absent-of-noise: omitting them entirely is the blindness this unit closes."""
+    run_id = seeded["run_id"]  # plain seeded run: fingerprint NULL, is_unlabeled False
+    res = _runner.invoke(runs_app, ["show", str(run_id), "--lane", "test"])
+    assert res.exit_code == 0, res.output
+    lines = res.output.splitlines()
+    assert "  model_id:    none" in lines
+    assert "  tokenizer:   none" in lines
 
 
 @pytest.mark.pg

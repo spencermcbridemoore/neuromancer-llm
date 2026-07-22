@@ -54,11 +54,13 @@ def show(
     """Show one run's DB-resident provenance read-only: identity, model, counts, inputs, metrics, lake pointers.
 
     A READ-ONLY render of a single run — the first `neuro` verb whose product is something a human looks at. It
-    shows DB-resident facts ONLY: run + model identity (an unlabeled adhoc run shows fingerprint=none +
-    unlabeled=yes honestly, ADR-0036), per-run counts, the input/config rows, the registered per-run metrics
-    (ADR-0017), and storage POINTERS. It does NOT read artifacts/parquet back — that is unverifiable in-band
-    (ADR-0009) and lives under `capture show --backend-key`; a pointer printed honestly beats a payload rendered
-    unverifiably. Thin delegate: the read lives in db/run_report.py; this parses args and renders.
+    shows DB-resident facts ONLY: run + model identity, including `model_id` and a bounded tokenizer-sha pointer
+    (an unlabeled adhoc run shows fingerprint=none + unlabeled=yes honestly, ADR-0036), per-run counts, the
+    input/config rows, the registered per-run metrics (ADR-0017), and storage POINTERS. It does NOT read
+    artifacts/parquet back — that is unverifiable in-band (ADR-0009) and lives in `neuro capture show`, which
+    reads the LOCAL lake parquet under the manifest's sha256+size binding; a CLOUD read-back BY BACKEND KEY is
+    registered, not built. A pointer printed honestly beats a payload rendered unverifiably. Thin delegate: the
+    read lives in db/run_report.py; this parses args and renders.
     """
     # Selector usage check FIRST — before any DB is opened — so a missing/ambiguous selector is a clean usage
     # error (exit 2), distinct from a well-formed request for a run that does not exist (exit 1, below).
@@ -272,12 +274,26 @@ def _echo_report(report: RunReport) -> None:
         # can be fingerprint-NULL while is_unlabeled=False (no CHECK ties them; repo.create_run makes exactly
         # that), so hardcoding "unlabeled" here would contradict `unlabeled: no` — a checkable falsehood.
         typer.echo("  fingerprint: none (no model identity yet)")
+        # Each absence line states its OWN fact and nothing else — no cause, no consequence, no claim about the
+        # other line (E-19 as extended: a coherent false explanation is worse than none). They are printed
+        # rather than omitted so a reader can tell "this run has no model_id / no tokenizer digest" apart from
+        # "this command does not show them" — which is the blindness this surface exists to close.
+        typer.echo("  model_id:    none")
+        typer.echo("  tokenizer:   none")
     else:
         m = report.model
         typer.echo(f"  fingerprint: {m.fingerprint_id} hash={m.fingerprint_hash_hex} mode={m.declared_mode}")
         typer.echo(
             f"  model:       {m.hf_repo or '(local/opaque)'}@{m.hf_revision or '—'} "
             f"dtype={m.dtype_quant} serving={m.serving_stack}@{m.serving_version} arch={m.arch_family}"
+        )
+        # model_id is the identity the ESTELA D4a continuity check reads ("all 6,000 bound to model_id=1") —
+        # previously an operational by-hand query with no surface. It states the id and nothing more.
+        typer.echo(f"  model_id:    {m.model_id}")
+        # The tokenizer digest is a SEPARATE registry row's identity with its own hf label, so this line names
+        # its source column and asserts nothing about the model's hf label printed above it.
+        typer.echo(
+            f"  tokenizer:   {m.tokenizer_hash_hex} (sha256 prefix of tokenizer_identities.tokenizer_hash)"
         )
 
     typer.echo(

@@ -10,13 +10,16 @@ The read-side idiom, set here to be cited (the way rank 4 set the write-side one
   guarantee without re-verifying — and it opens a read-only `connect()`, never the write-path `begin()`.
 * v1 renders DB-RESIDENT FACTS ONLY: run identity + model identity (NULL-honest for an unlabeled/ADR-0036 run),
   per-run COUNTS, the input/config rows, the registered per-run metrics (ADR-0017), and storage POINTERS. There
-  is NO artifact/parquet read-back — that is ADR-0009 territory (unverifiable in-band) and is registered
-  separately as `capture show --backend-key`. A pointer printed honestly beats a payload rendered unverifiably.
+  is NO artifact/parquet read-back — that is ADR-0009 territory (unverifiable in-band) and lives in
+  `neuro capture show`, which reads the LOCAL lake parquet back under the manifest's sha256+size binding
+  (capture/reader.py); reading a CLOUD-resident artifact BY BACKEND KEY is registered, not built. A pointer
+  printed honestly beats a payload rendered unverifiably.
 * PAYLOAD DISCIPLINE (EXAM_RESTRICTED): the capture side carries wire payloads — `capture_events.request_text` /
   `response_text` — that may hold restricted stimulus content. This module NEVER selects a payload column: events
   surface as COUNTS, `run_metrics.value_json` surfaces as a byte-length POINTER (`octet_length`, never its
-  content), and storage pointers carry a backend key + uri, never bytes. The SQL is the mechanism — read it and
-  see that no payload/content column is in any select list.
+  content), identity digests (fingerprint / tokenizer hashes) surface as BOUNDED hex prefixes, and storage
+  pointers carry a backend key + uri, never bytes. The SQL is the mechanism — read it and see that no
+  payload/content column is in any select list.
 """
 
 from __future__ import annotations
@@ -34,8 +37,13 @@ class RunNotFoundError(Exception):
 
 @dataclass(frozen=True)
 class RunModelIdentity:
-    """The run's model identity, resolved fingerprint -> model_identities. Present ONLY when the run carries a
-    fingerprint; an adhoc/unlabeled run (ADR-0036) has fingerprint_id NULL and this is `None` on the report."""
+    """The run's model identity, resolved fingerprint -> model_identities -> tokenizer_identities. Present ONLY
+    when the run carries a fingerprint; an adhoc/unlabeled run (ADR-0036) has fingerprint_id NULL and this is
+    `None` on the report.
+
+    `tokenizer_hash_hex` is the TOKENIZER's own durable identity (`tokenizer_identities.tokenizer_hash`), which
+    is a DIFFERENT registry row from the model: that table carries its own nullable `hf_repo`/`hf_revision`, so
+    this digest says nothing about the model's hf label rendered beside it."""
 
     fingerprint_id: int
     fingerprint_hash_hex: str  # short hex prefix of the fingerprint hash (a pointer, not the config)
@@ -47,6 +55,9 @@ class RunModelIdentity:
     serving_stack: str
     serving_version: str
     arch_family: str
+    tokenizer_hash_hex: (
+        str  # short hex prefix of tokenizer_identities.tokenizer_hash (a pointer, not the file)
+    )
 
 
 @dataclass(frozen=True)
@@ -121,9 +132,10 @@ class RunReport:
     storage_pointers: tuple[RunStoragePointer, ...]
 
 
-# The head query: run identity + campaign + actor, LEFT JOIN fingerprint -> model (NULL for an unlabeled run).
-# NO payload column is selected. The WHERE clause is appended from one of two FIXED literals below (the value is
-# always a bound param; the selector column is never interpolated).
+# The head query: run identity + campaign + actor, LEFT JOIN fingerprint -> model -> tokenizer (all NULL for an
+# unlabeled run). NO payload column is selected; `tokenizer_hash` is an identity DIGEST, not tokenizer content,
+# and is bounded to a hex prefix before it is rendered. The WHERE clause is appended from one of two FIXED
+# literals below (the value is always a bound param; the selector column is never interpolated).
 _HEAD_SELECT = """
     SELECT r.run_id, r.run_key, r.work_slug, r.variant_digest, r.run_kind, r.origin,
            r.is_unlabeled, r.fingerprint_id, r.invocation_id, r.created_at, r.finalized_at,
@@ -131,12 +143,14 @@ _HEAD_SELECT = """
            a.actor_key, a.display_name AS actor_display_name, a.kind AS actor_kind,
            f.fingerprint_hash, f.declared_mode,
            m.model_id, m.hf_repo, m.hf_revision, m.dtype_quant,
-           m.serving_stack, m.serving_version, m.arch_family
+           m.serving_stack, m.serving_version, m.arch_family,
+           t.tokenizer_hash
     FROM neuro.runs r
     JOIN neuro.campaigns c ON c.campaign_id = r.campaign_id
     JOIN neuro.actors a ON a.actor_id = r.actor_id
     LEFT JOIN neuro.fingerprints f ON f.fingerprint_id = r.fingerprint_id
     LEFT JOIN neuro.model_identities m ON m.model_id = f.model_id
+    LEFT JOIN neuro.tokenizer_identities t ON t.tokenizer_id = m.tokenizer_id
 """
 _HEAD_BY_ID = _HEAD_SELECT + " WHERE r.run_id = :sel"
 _HEAD_BY_KEY = _HEAD_SELECT + " WHERE r.run_key = :sel"
@@ -233,6 +247,10 @@ def build_run_report(
             serving_stack=str(head["serving_stack"]),
             serving_version=str(head["serving_version"]),
             arch_family=str(head["arch_family"]),
+            # Unconditional, exactly like model_id above: fingerprints.model_id and model_identities.tokenizer_id
+            # are BOTH `NOT NULL REFERENCES`, so a non-NULL fingerprint_id guarantees this join resolved. A
+            # None-arm here would be an unreachable branch no fixture could redden (precedent 14).
+            tokenizer_hash_hex=bytes(head["tokenizer_hash"]).hex()[:16],
         )
 
     inputs = tuple(
