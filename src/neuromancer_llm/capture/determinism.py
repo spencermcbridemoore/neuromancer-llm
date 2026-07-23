@@ -21,6 +21,7 @@ from enum import StrEnum
 from sqlalchemy import Engine, text
 
 from neuromancer_llm.capture.adapters.vllm import LogprobSample, VLLMClient
+from neuromancer_llm.db.lanes import ConfigurationError
 
 # E6 hardware gate (capture contract §6): batch invariance requires compute capability >= 8.0. The
 # 4090 is sm89 (8.9), so the gate passes here and the test skips visibly on lesser hardware.
@@ -172,8 +173,8 @@ DIVERGENCE_METHOD_SEMVER = "1.0.0"
 
 # Per-dtype absolute-logprob tolerance for the TOLERANCE branch (nats). HEURISTIC placeholders for substrates
 # whose own E6 has NOT certified bitwise — refined per substrate, never identity (ADR-0004). The owned
-# vllm-bi-on@sm89 lane is BITWISE (E6 2026-06-20), so this branch is not exercised there.
-DEFAULT_TOLERANCE = 5e-2
+# vllm-bi-on@sm89 lane is BITWISE (E6 2026-06-20), so this branch is not exercised there. An UNMAPPED grade
+# FAILS CLOSED in tolerance_for (no default band — a wrong grade must not inherit the loosest one; log:246).
 TOLERANCE_BY_DTYPE = {"bf16": 5e-2, "fp16": 5e-2, "fp32": 1e-3}
 
 
@@ -225,7 +226,18 @@ def measure_divergence(reference: LogprobSample, other: LogprobSample) -> dict[s
 
 
 def tolerance_for(dtype_quant: str) -> float:
-    return TOLERANCE_BY_DTYPE.get(dtype_quant, DEFAULT_TOLERANCE)
+    """The per-dtype TOLERANCE-branch band (nats). FAIL CLOSED on an unmapped grade: an unknown/typo dtype
+    (fp8/int8/'bfloat16') must NOT silently inherit a DEFAULT band — the loosest one (5e-2, 50x looser than
+    fp32) is exactly wrong for a high-precision runtime and would swallow a real divergence. The D1
+    "no default-clean member" idiom (the dtype_quant belt, log:245) applied to the tolerance table."""
+    try:
+        return TOLERANCE_BY_DTYPE[dtype_quant]
+    except KeyError:
+        raise ConfigurationError(
+            f"no TOLERANCE band registered for dtype_quant={dtype_quant!r} "
+            f"(known: {sorted(TOLERANCE_BY_DTYPE)}) — refusing to apply a default band to an unmapped grade "
+            "(fail closed; a loose default could swallow a real divergence on a high-precision runtime)."
+        ) from None
 
 
 def assert_meets_expected(

@@ -23,6 +23,7 @@ from neuromancer_llm.capture.determinism import (
     assert_meets_expected,
     compare,
 )
+from neuromancer_llm.db.lanes import ConfigurationError
 
 
 def _sample(n=20, generated=1000, base=1000):
@@ -67,6 +68,21 @@ def test_rt_tolerance_fails_on_token_set_changed():
     assert div.token_set_changed
     with pytest.raises(DivergenceVerdictError):
         assert_meets_expected(ExpectedLevel.TOLERANCE, div, dtype_quant="bf16")
+
+
+def test_rt_tolerance_unmapped_dtype_fails_closed():
+    """The TOLERANCE branch must NOT silently apply a default band to an unmapped/unknown dtype grade — an
+    fp8/int8/typo grade gets NO band (a loud ConfigurationError), never the loosest one (5e-2, which would
+    swallow a real divergence on a high-precision runtime). Fail closed, the D1 'no default-clean member'
+    idiom applied to the tolerance table (the dtype_quant belt, log:245)."""
+    s = _sample()
+    div = compare(s, s)  # within any band: max_abs_diff=0.0, no argmax flip, no token-set change
+    assert div.max_abs_diff == 0.0 and not div.argmax_flip and not div.token_set_changed
+    # a MAPPED grade PASSES (0.0 within 5e-2) — proves tolerance_for is genuinely reached, not short-circuited
+    assert assert_meets_expected(ExpectedLevel.TOLERANCE, div, dtype_quant="bf16") is True
+    # an UNMAPPED grade fails closed instead of silently passing at the old default band
+    with pytest.raises(ConfigurationError):
+        assert_meets_expected(ExpectedLevel.TOLERANCE, div, dtype_quant="fp8")
 
 
 def test_rt_compare_disjoint_topk_is_max_divergence():
