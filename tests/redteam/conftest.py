@@ -146,6 +146,7 @@ def rt_capture():
             expected_lane="test",
             hf_repo="r",
             hf_revision="rev",
+            dtype_quant="bf16",
             tokenizer_hash=b"T",
             campaign_key="c",
             work_slug="slug",

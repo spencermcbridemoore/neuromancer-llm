@@ -43,6 +43,11 @@ def _tokenizer_hash_bytes(tokenizer_hash: str) -> bytes:
 
 @app.command()
 def logprob(
+    dtype_quant: str = typer.Option(
+        ...,
+        help="runtime dtype/quant grade folded into the model identity (e.g. bf16/fp16/fp32); NOT on the wire, "
+        "so it MUST be declared — no default (fail closed against a silent dtype mislabel)",
+    ),
     hf_revision: str = typer.Option(..., help="pinned HF revision sha (part of model identity; ADR-0005)"),
     base_url: str = typer.Option(
         "http://127.0.0.1:8000", envvar="NEURO_VLLM_BASE_URL", help="vLLM OpenAI-compatible server base URL"
@@ -126,6 +131,7 @@ def logprob(
             expected_lane=lane,
             hf_repo=hf_repo,
             hf_revision=hf_revision,
+            dtype_quant=dtype_quant,
             tokenizer_hash=tok_hash,
             campaign_key=campaign_key,
             work_slug=work_slug,
@@ -167,6 +173,11 @@ def logprob(
 
 @app.command()
 def replay(
+    dtype_quant: str = typer.Option(
+        ...,
+        help="runtime dtype/quant grade folded into the model identity + the E6 divergence tolerance (e.g. "
+        "bf16/fp16/fp32); NOT on the wire, so it MUST be declared — no default (fail closed)",
+    ),
     hf_revision: str = typer.Option(..., help="pinned HF revision sha (part of model identity; ADR-0005)"),
     base_url: str = typer.Option(
         "http://127.0.0.1:8000", envvar="NEURO_VLLM_BASE_URL", help="vLLM OpenAI-compatible server base URL"
@@ -258,6 +269,7 @@ def replay(
                 expected_lane=lane,
                 hf_repo=hf_repo,
                 hf_revision=hf_revision,
+                dtype_quant=dtype_quant,
                 tokenizer_hash=tok_hash,
                 campaign_key=campaign_key,
                 work_slug=work_slug,
@@ -272,7 +284,9 @@ def replay(
 
         original = _capture(None)
         replicate = _capture(new_invocation_id())
-        measured = replicate_and_measure(repo=repo, original=original, replicate=replicate)
+        measured = replicate_and_measure(
+            repo=repo, original=original, replicate=replicate, dtype_quant=dtype_quant
+        )
     except (
         ConfigurationError,
         LaneAssertionError,
@@ -303,6 +317,11 @@ def replay(
 
 @app.command()
 def campaign(
+    dtype_quant: str = typer.Option(
+        ...,
+        help="runtime dtype/quant grade folded into the model identity (e.g. bf16/fp16/fp32); NOT on the wire, "
+        "so it MUST be declared — no default (fail closed against a silent dtype mislabel)",
+    ),
     corpus_root: str = typer.Option(..., help="path to the ESTELA JSONL (estela_text_only_mcq.jsonl)"),
     corpus_commit: str = typer.Option(
         ..., help="pinned ESTELA corpus commit sha (provenance; recorded in the runbook/manifest)"
@@ -395,6 +414,7 @@ def campaign(
             questions=questions,
             hf_repo=hf_repo,
             hf_revision=hf_revision,
+            dtype_quant=dtype_quant,
             corpus_commit=corpus_commit,
             expected_lane=lane,
             n_logprobs=n_logprobs,

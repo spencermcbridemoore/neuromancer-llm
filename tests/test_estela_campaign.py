@@ -360,6 +360,7 @@ def test_run_campaign_full_loop(repo, tmp_path) -> None:
         questions=questions,
         hf_repo="r",
         hf_revision="rev",
+        dtype_quant="bf16",
         corpus_commit="158a8c3-test",
         expected_lane="test",
         n_logprobs=64,

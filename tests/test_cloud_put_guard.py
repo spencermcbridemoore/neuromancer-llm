@@ -184,6 +184,7 @@ def test_capture_logprob_refuses_raw_cloud_before_any_wire_call(repo, driver):
             expected_lane="test",
             hf_repo="org/model",
             hf_revision="deadbeef",
+            dtype_quant="bf16",
             tokenizer_hash=b"\x00" * 32,
             campaign_key="c",
             work_slug="w",

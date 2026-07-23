@@ -151,6 +151,7 @@ def _capture_kwargs(repo, backend_id, backend, **over):
         expected_lane="canonical",
         hf_repo="r",
         hf_revision="rev",
+        dtype_quant="bf16",
         tokenizer_hash=b"T" * 32,
         campaign_key="a217",
         work_slug="accept",

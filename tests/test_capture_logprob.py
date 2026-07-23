@@ -594,6 +594,7 @@ def test_capture_logprob_end_to_end(repo, tmp_path):
         expected_lane="test",
         hf_repo=HF_REPO,
         hf_revision=HF_REVISION,
+        dtype_quant="bf16",
         tokenizer_hash=tok_hash,
         campaign_key="phase4-capture",
         work_slug="mcq-next-token",
@@ -709,6 +710,7 @@ def test_capture_replicate_read_end_to_end(repo, provisioned_roles, role_url, tm
         expected_lane="test",
         hf_repo=HF_REPO,
         hf_revision=HF_REVISION,
+        dtype_quant="bf16",
         tokenizer_hash=tok_hash,
         campaign_key="phase4-capture",
         work_slug="mcq-next-token",
@@ -722,7 +724,7 @@ def test_capture_replicate_read_end_to_end(repo, provisioned_roles, role_url, tm
     replicate = capture_logprob(**common, invocation_id=new_invocation_id())
 
     # the determinism loop closes BITWISE: same fingerprint, distinct re-invocation, divergence == 0.
-    measured = replicate_and_measure(repo=repo, original=original, replicate=replicate)
+    measured = replicate_and_measure(repo=repo, original=original, replicate=replicate, dtype_quant="bf16")
     assert measured.original_run_id != measured.replicate_run_id
     assert measured.expected_level == "bitwise"
     assert measured.bitwise_identical and measured.meets_expected

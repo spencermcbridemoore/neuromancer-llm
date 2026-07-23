@@ -98,7 +98,7 @@ def test_rt_disjoint_topk_persists_inf_before_raise(repo, tmp_path, rt_capture):
     )
 
     with pytest.raises(DivergenceVerdictError):  # disjoint top-k is not bitwise-identical on the bitwise lane
-        replicate_and_measure(repo=repo, original=original, replicate=replicate)
+        replicate_and_measure(repo=repo, original=original, replicate=replicate, dtype_quant="bf16")
 
     fresh = create_engine(repo.engine.url, future=True)
     try:
@@ -161,7 +161,7 @@ def test_rt_argmax_flip_persists_before_raise(repo, tmp_path, rt_capture):
     replicate = rt_capture(repo, tmp_path, flipped, invocation_id=new_invocation_id())
 
     with pytest.raises(DivergenceVerdictError):
-        replicate_and_measure(repo=repo, original=original, replicate=replicate)
+        replicate_and_measure(repo=repo, original=original, replicate=replicate, dtype_quant="bf16")
 
     # the divergence row was persisted BEFORE the raise, and is visible to a FRESH engine/connection
     from sqlalchemy import create_engine
@@ -195,7 +195,7 @@ def test_rt_unassessed_measure_records_then_refuses(repo, tmp_path, rt_capture):
         conn.execute(text("DELETE FROM neuro.expected_reproducibility_rules"))
 
     with pytest.raises(UnassessedExpectationError):
-        replicate_and_measure(repo=repo, original=original, replicate=replicate)
+        replicate_and_measure(repo=repo, original=original, replicate=replicate, dtype_quant="bf16")
     # the divergence WAS recorded before the refusal (the gap is visible data, not a silent pass)
     with repo.engine.connect() as conn:
         assert conn.execute(text("SELECT count(*) FROM neuro.divergence_measurements")).scalar_one() == 1

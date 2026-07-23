@@ -93,6 +93,7 @@ def _capture(repo, tmp_path, client, **over):
         expected_lane="test",
         hf_repo="r",
         hf_revision="rev",
+        dtype_quant="bf16",
         tokenizer_hash=b"T",
         campaign_key="c",
         work_slug="slug",
@@ -301,7 +302,7 @@ def test_replicate_and_measure_bitwise_closes_loop(repo, tmp_path):
     replicate = _capture(repo, tmp_path, client, invocation_id=new_invocation_id())
     assert original.run_id != replicate.run_id  # distinct runs (the replicate is a re-invocation)
 
-    result = replicate_and_measure(repo=repo, original=original, replicate=replicate)
+    result = replicate_and_measure(repo=repo, original=original, replicate=replicate, dtype_quant="bf16")
     assert result.bitwise_identical and result.meets_expected
     assert result.max_abs_diff == 0.0 and result.expected_level == "bitwise"
 
@@ -344,7 +345,7 @@ def test_replicate_and_measure_divergent_fails_loud_on_bitwise_lane(repo, tmp_pa
     replicate = _capture(repo, tmp_path, client, invocation_id=new_invocation_id())
 
     with pytest.raises(DivergenceVerdictError):
-        replicate_and_measure(repo=repo, original=original, replicate=replicate)
+        replicate_and_measure(repo=repo, original=original, replicate=replicate, dtype_quant="bf16")
 
     # the divergence was RECORDED before the raise (loud, not swallowed)
     with repo.engine.connect() as conn:
@@ -421,6 +422,7 @@ def test_capture_path_role_boundary(repo, provisioned_roles, role_url, tmp_path)
                 expected_lane="test",
                 hf_repo="r",
                 hf_revision="rev",
+                dtype_quant="bf16",
                 tokenizer_hash=b"Trole",
                 campaign_key="rc",
                 work_slug="rs",
@@ -455,7 +457,7 @@ def test_registered_divergence_method_code_sha_parity(repo, tmp_path):
     s = _sample(20)
     original = _capture(repo, tmp_path, _FakeClient([s]), invocation_id=None)
     replicate = _capture(repo, tmp_path, _FakeClient([s]), invocation_id=new_invocation_id())
-    replicate_and_measure(repo=repo, original=original, replicate=replicate)
+    replicate_and_measure(repo=repo, original=original, replicate=replicate, dtype_quant="bf16")
     with repo.engine.connect() as conn:
         code_sha = conn.execute(
             text(

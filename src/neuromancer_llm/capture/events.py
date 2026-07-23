@@ -444,6 +444,25 @@ class LogprobCaptureResult:
     sample: LogprobSample  # the parsed distribution this capture observed (for the MEASURED replicate loop)
 
 
+def require_dtype_quant(dtype_quant: str) -> None:
+    """Fail-closed guard for the caller-asserted runtime dtype/quant model-identity grade.
+
+    `dtype_quant` folds into the MODEL IDENTITY + fingerprint (`capture_logprob`) and the E6 divergence
+    TOLERANCE (`replicate_and_measure`), yet it is NOT on the wire (`capture/adapters/vllm.py`: revision/dtype/
+    quant are launch-time facts) — so it is caller-asserted and, per the D1 "no default-clean member" idiom
+    (`importer/ingress.py`), REQUIRED with NO default. Omission is a required-kwarg TypeError; an EMPTY/blank
+    grade is refused HERE, fail closed, before any identity or tolerance decision. This belt forbids the SILENT
+    default and the empty grade ONLY — a WRONG-but-present grade (a valid label on the wrong runtime, e.g.
+    "bf16" declared while the server ran fp16) is the grid-consistency guard's job (registered §D follow-on;
+    the dtype leaves a 2^-4/2^-7/continuous fingerprint in the logprobs — the bf16-depth diagnostic, log:244)."""
+    if not dtype_quant or not dtype_quant.strip():
+        raise ConfigurationError(
+            "dtype_quant is REQUIRED and must be a non-empty model-identity grade (e.g. bf16/fp16/fp32); it is "
+            "NOT on the wire, so the caller must assert the REAL runtime dtype — refusing an absent/blank grade "
+            "(fail closed; a silent default would fold a wrong dtype into the model identity)."
+        )
+
+
 def capture_logprob(
     *,
     repo: Repository,
@@ -459,7 +478,7 @@ def capture_logprob(
     variant_digest: str,
     actor_key: str,
     origin: str,
-    dtype_quant: str = "bf16",
+    dtype_quant: str,
     serving_stack: str = "vllm",
     serving_version: str = "0.23.0",
     arch_family: str = "llama",
@@ -491,6 +510,9 @@ def capture_logprob(
     worker, identity/bundle registration on the control plane — belongs with the distributed worker runtime
     (workers/runtime.py); not built now.
     """
+    # Fail closed on an absent/blank runtime dtype grade BEFORE any wire call or durable write — it folds into
+    # the model identity below and must be a conscious caller assertion, never a silent default (D1 idiom).
+    require_dtype_quant(dtype_quant)
     # A2-11b: the durability consult (below) and the internal bundle registrar gate/verify on the lane, which
     # must be TRUSTWORTHY — `expected_lane` is a free param, but `repo` was verify_engine'd for its OWN lane at
     # construction. A param that DISAGREES with the repo's verified lane is a caller misconfiguration that must
@@ -725,7 +747,7 @@ def replicate_and_measure(
     replicate: LogprobCaptureResult,
     method_semver: str = DIVERGENCE_METHOD_SEMVER,
     expected_override: str | None = None,
-    dtype_quant: str = "bf16",
+    dtype_quant: str,
 ) -> ReplicateMeasureResult:
     """Close the determinism loop E6 opened (ADR-0004 MEASURED): register the divergence method, link the
     original/replicate run pair, measure divergence with the EXISTING compare(), persist it, then assert the
@@ -737,6 +759,9 @@ def replicate_and_measure(
     pair — it NEVER feeds the fingerprint (ADR-0004). The divergence row is recorded BEFORE the assertion, so
     a violation is persisted (the loud signal is data) AND raised.
     """
+    # Fail closed on an absent/blank dtype grade before it selects the divergence tolerance (a wrong grade
+    # would pick the wrong per-dtype tolerance band and could pass a real divergence silently).
+    require_dtype_quant(dtype_quant)
     # register-first: the divergence method version must exist before any divergence row references it.
     method_version_id = repo.register_method_version(
         method_key=DIVERGENCE_METHOD_KEY,
