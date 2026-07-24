@@ -54,6 +54,8 @@ def _sample_with_letters(letters: dict[str, float]) -> LogprobSample:
 class _FakeCampaignClient:
     """GPU-free vLLM stand-in: served_model + a prefix-stable toy tokenizer + a fixed capture sample."""
 
+    serving_stack = "vllm"  # substrate-axis DERIVE: the adapter self-report the cross-check reads
+
     def __init__(self, sample: LogprobSample) -> None:
         self._sample = sample
         self.capture_calls = 0
@@ -61,6 +63,9 @@ class _FakeCampaignClient:
 
     def served_model(self) -> str:
         return "fake/Mistral-7B-v0.3"
+
+    def server_version(self) -> str:
+        return "0.23.0"  # substrate-axis DERIVE: the wire /version the cross-check reads
 
     def tokenize(self, text: str, *, model: str) -> list[int]:
         # Prefix-stable: a trailing ' <LETTER>' is ONE token == LETTER_TOKEN_ID; the base is one token/char.
@@ -361,6 +366,8 @@ def test_run_campaign_full_loop(repo, tmp_path) -> None:
         hf_repo="r",
         hf_revision="rev",
         dtype_quant="bf16",
+        serving_stack="vllm",
+        serving_version="0.23.0",
         corpus_commit="158a8c3-test",
         expected_lane="test",
         n_logprobs=64,

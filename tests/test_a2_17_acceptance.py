@@ -121,8 +121,13 @@ class _SizedClient:
     """A vLLM stand-in whose response body is EXACTLY _RESPONSE_BYTES long (fold 7: the spill put's spend
     quantity is then an exact Decimal at the ledger's Numeric(18,6) grain)."""
 
+    serving_stack = "vllm"  # substrate-axis DERIVE: the adapter self-report the cross-check reads
+
     def served_model(self) -> str:
         return "org/model"
+
+    def server_version(self) -> str:
+        return "0.23.0"  # substrate-axis DERIVE: the wire /version the cross-check reads
 
     def next_token_logprobs_capture(self, prompt, *, model, n_logprobs, seed):
         pairs = tuple((1000 + i, -0.01 * (i + 1)) for i in range(n_logprobs))
@@ -152,6 +157,8 @@ def _capture_kwargs(repo, backend_id, backend, **over):
         hf_repo="r",
         hf_revision="rev",
         dtype_quant="bf16",
+        serving_stack="vllm",
+        serving_version="0.23.0",
         tokenizer_hash=b"T" * 32,
         campaign_key="a217",
         work_slug="accept",

@@ -98,8 +98,13 @@ class _RecordingBackend:
 class _FakeClient:
     """A vLLM stand-in so the capture path runs GPU-free; the consult fires before any durable write."""
 
+    serving_stack = "vllm"  # substrate-axis DERIVE: the adapter self-report the cross-check reads
+
     def served_model(self) -> str:
         return "fake/Mistral-7B-v0.3"
+
+    def server_version(self) -> str:
+        return "0.23.0"  # substrate-axis DERIVE: the wire /version the cross-check reads
 
     def next_token_logprobs_capture(self, prompt, *, model, n_logprobs, seed) -> CapturedLogprobs:
         pairs = tuple((1000 + i, -0.01 * (i + 1)) for i in range(n_logprobs))
@@ -226,6 +231,8 @@ def test_capture_canonical_consult_blocks_before_first_durable_write(canonical_u
             hf_repo="r",
             hf_revision="rev",
             dtype_quant="bf16",
+            serving_stack="vllm",
+            serving_version="0.23.0",
             tokenizer_hash=b"T",
             campaign_key="c",
             work_slug="slug",
@@ -287,6 +294,8 @@ def _canonical_capture_kwargs(repo, tmp_path, *, expected_lane):
         hf_repo="r",
         hf_revision="rev",
         dtype_quant="bf16",
+        serving_stack="vllm",
+        serving_version="0.23.0",
         tokenizer_hash=b"T",
         campaign_key="c",
         work_slug="slug",

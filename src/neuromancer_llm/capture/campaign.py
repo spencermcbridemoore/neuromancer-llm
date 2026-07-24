@@ -28,7 +28,12 @@ from .answer_letter import (
     resolve_letter_token_ids,
     write_answer_letter_projection,
 )
-from .events import capture_logprob, require_dtype_quant
+from .events import (
+    assert_substrate_matches_wire,
+    capture_logprob,
+    require_dtype_quant,
+    require_substrate,
+)
 
 if TYPE_CHECKING:
     from ..db.repository import Repository
@@ -191,6 +196,8 @@ def run_campaign(
     hf_repo: str,
     hf_revision: str,
     dtype_quant: str,
+    serving_stack: str,
+    serving_version: str,
     corpus_commit: str,
     expected_lane: str = "canonical",
     n_logprobs: int = 64,
@@ -203,9 +210,17 @@ def run_campaign(
 
     ``n_logprobs`` defaults to 64 (owner nod 2026-07-20, amends D4b's top-20 -> §G): near-exact for k<=5 and
     frozen-at-capture (unrecoverable without a GPU re-run), so it is set high here."""
-    # Fail closed FAST on an absent/blank dtype grade — before the corpus scan, the method-version INSERT, and
-    # the capture loop — so a mislabeled campaign never registers a method or writes a single identity row.
+    # Fail closed FAST on an absent/blank dtype/substrate grade — before the corpus scan, the method-version
+    # INSERT, and the capture loop — so a mislabeled campaign never registers a method or writes a single
+    # identity row. require_substrate is the SUBSTRATE-axis sibling of require_dtype_quant.
     require_dtype_quant(dtype_quant)
+    require_substrate(serving_stack=serving_stack, serving_version=serving_version)
+    # DERIVE cross-check at campaign start, BEFORE any durable write (register_answer_letter_method below is a
+    # method-version registration + active-pointer repoint) or GPU cost: the declared substrate must match the
+    # adapter self-report + the server's wire /version, else RAISE before anything is persisted. It needs only
+    # `client` (not served_model), so it is hoisted here to keep the fail-fast promise literal. Each
+    # capture_logprob re-checks (memoized: one wire /version read for the whole 6,000-capture sweep).
+    assert_substrate_matches_wire(client, serving_stack=serving_stack, serving_version=serving_version)
     kept, dropped = partition_campaign_questions(questions)
     if not kept:
         raise EstelaCampaignError("no ESTELA questions in scope after selection (empty or all dropped).")
@@ -240,6 +255,8 @@ def run_campaign(
                 hf_repo=hf_repo,
                 hf_revision=hf_revision,
                 dtype_quant=dtype_quant,
+                serving_stack=serving_stack,
+                serving_version=serving_version,
                 tokenizer_hash=tokenizer_hash,
                 campaign_key=CAMPAIGN_KEY,
                 work_slug=q.uid,

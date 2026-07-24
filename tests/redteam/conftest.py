@@ -101,12 +101,17 @@ class _FakeClient:
     """A vLLM stand-in returning precomputed CapturedLogprobs so the REAL capture + measure path runs
     without a GPU. The wire bytes are synthetic-but-verbatim (stored as captured)."""
 
+    serving_stack = "vllm"  # substrate-axis DERIVE: the adapter self-report the cross-check reads
+
     def __init__(self, samples: list[LogprobSample]) -> None:
         self._samples = samples
         self._calls = 0
 
     def served_model(self) -> str:
         return "fake/Mistral-7B-v0.3"
+
+    def server_version(self) -> str:
+        return "0.23.0"  # substrate-axis DERIVE: the wire /version the cross-check reads
 
     def next_token_logprobs_capture(self, prompt, *, model, n_logprobs, seed) -> CapturedLogprobs:
         s = self._samples[self._calls]
@@ -147,6 +152,8 @@ def rt_capture():
             hf_repo="r",
             hf_revision="rev",
             dtype_quant="bf16",
+            serving_stack="vllm",
+            serving_version="0.23.0",
             tokenizer_hash=b"T",
             campaign_key="c",
             work_slug="slug",

@@ -185,6 +185,8 @@ def test_capture_logprob_refuses_raw_cloud_before_any_wire_call(repo, driver):
             hf_repo="org/model",
             hf_revision="deadbeef",
             dtype_quant="bf16",
+            serving_stack="vllm",
+            serving_version="0.23.0",
             tokenizer_hash=b"\x00" * 32,
             campaign_key="c",
             work_slug="w",

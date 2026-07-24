@@ -48,6 +48,16 @@ def logprob(
         help="runtime dtype/quant grade folded into the model identity (e.g. bf16/fp16/fp32); NOT on the wire, "
         "so it MUST be declared — no default (fail closed against a silent dtype mislabel)",
     ),
+    serving_stack: str = typer.Option(
+        ...,
+        help="serving stack folded into the model identity (e.g. vllm); NOT on the wire, so it MUST be "
+        "declared — cross-checked against the adapter self-report (no default, fail closed)",
+    ),
+    serving_version: str = typer.Option(
+        ...,
+        help="serving-stack version folded into the model identity (e.g. 0.23.0); NOT on the wire, so it MUST "
+        "be declared — cross-checked against the server /version (no default, fail closed)",
+    ),
     hf_revision: str = typer.Option(..., help="pinned HF revision sha (part of model identity; ADR-0005)"),
     base_url: str = typer.Option(
         "http://127.0.0.1:8000", envvar="NEURO_VLLM_BASE_URL", help="vLLM OpenAI-compatible server base URL"
@@ -132,6 +142,8 @@ def logprob(
             hf_repo=hf_repo,
             hf_revision=hf_revision,
             dtype_quant=dtype_quant,
+            serving_stack=serving_stack,
+            serving_version=serving_version,
             tokenizer_hash=tok_hash,
             campaign_key=campaign_key,
             work_slug=work_slug,
@@ -177,6 +189,16 @@ def replay(
         ...,
         help="runtime dtype/quant grade folded into the model identity + the E6 divergence tolerance (e.g. "
         "bf16/fp16/fp32); NOT on the wire, so it MUST be declared — no default (fail closed)",
+    ),
+    serving_stack: str = typer.Option(
+        ...,
+        help="serving stack folded into the model identity (e.g. vllm); NOT on the wire, so it MUST be "
+        "declared — cross-checked against the adapter self-report (no default, fail closed)",
+    ),
+    serving_version: str = typer.Option(
+        ...,
+        help="serving-stack version folded into the model identity (e.g. 0.23.0); NOT on the wire, so it MUST "
+        "be declared — cross-checked against the server /version (no default, fail closed)",
     ),
     hf_revision: str = typer.Option(..., help="pinned HF revision sha (part of model identity; ADR-0005)"),
     base_url: str = typer.Option(
@@ -270,6 +292,8 @@ def replay(
                 hf_repo=hf_repo,
                 hf_revision=hf_revision,
                 dtype_quant=dtype_quant,
+                serving_stack=serving_stack,
+                serving_version=serving_version,
                 tokenizer_hash=tok_hash,
                 campaign_key=campaign_key,
                 work_slug=work_slug,
@@ -321,6 +345,16 @@ def campaign(
         ...,
         help="runtime dtype/quant grade folded into the model identity (e.g. bf16/fp16/fp32); NOT on the wire, "
         "so it MUST be declared — no default (fail closed against a silent dtype mislabel)",
+    ),
+    serving_stack: str = typer.Option(
+        ...,
+        help="serving stack folded into the model identity (e.g. vllm); NOT on the wire, so it MUST be "
+        "declared — cross-checked against the adapter self-report (no default, fail closed)",
+    ),
+    serving_version: str = typer.Option(
+        ...,
+        help="serving-stack version folded into the model identity (e.g. 0.23.0); NOT on the wire, so it MUST "
+        "be declared — cross-checked against the server /version (no default, fail closed)",
     ),
     corpus_root: str = typer.Option(..., help="path to the ESTELA JSONL (estela_text_only_mcq.jsonl)"),
     corpus_commit: str = typer.Option(
@@ -415,6 +449,8 @@ def campaign(
             hf_repo=hf_repo,
             hf_revision=hf_revision,
             dtype_quant=dtype_quant,
+            serving_stack=serving_stack,
+            serving_version=serving_version,
             corpus_commit=corpus_commit,
             expected_lane=lane,
             n_logprobs=n_logprobs,

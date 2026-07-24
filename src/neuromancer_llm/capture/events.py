@@ -463,6 +463,76 @@ def require_dtype_quant(dtype_quant: str) -> None:
         )
 
 
+def require_substrate(*, serving_stack: str, serving_version: str) -> None:
+    """Fail-closed guard for the caller-asserted SUBSTRATE-axis model-identity grades (the sibling belt of
+    `require_dtype_quant`).
+
+    `serving_stack`/`serving_version` fold into the MODEL IDENTITY (`model_identity_hash`'s 5th/6th
+    components) AND the fingerprint's `serving_version_tag` — yet, like `dtype_quant`, they are launch-time
+    facts NOT on the capture wire (`capture/adapters/vllm.py`). Before this belt both DEFAULTED (`"vllm"`,
+    `"0.23.0"`), so a wave-2 capture on a different runtime that forgot to override them would silently carry
+    the wave-1 substrate identity — a false MERGE the tokenizer_hash cannot backstop (a version/stack change
+    keeps the same tokenizer). Per the D1 "no default-clean member" idiom (`importer/ingress.py`) both are
+    REQUIRED with NO default at every capture entry; an absent/blank grade is refused HERE, fail closed,
+    before any identity decision. This belt forbids the SILENT default + the empty grade ONLY — a
+    WRONG-but-present value is caught by the wire cross-check (`assert_substrate_matches_wire`, the DERIVE
+    half)."""
+    for name, value in (("serving_stack", serving_stack), ("serving_version", serving_version)):
+        if not value or not value.strip():
+            raise ConfigurationError(
+                f"{name} is REQUIRED and must be a non-empty substrate grade; it is NOT on the capture wire, "
+                "so the caller must assert the REAL runtime value — refusing an absent/blank grade (fail "
+                "closed; a silent default would fold a wrong substrate into the model identity)."
+            )
+
+
+def compose_serving_version_tag(serving_stack: str, serving_version: str) -> str:
+    """The fingerprint's `serving_version_tag` COMPOSED from the substrate components — ONE implementation,
+    never a free third assertion.
+
+    `serving_stack` + `serving_version` feed the MODEL identity (`model_identity_hash`); this tag feeds the
+    FINGERPRINT (`build_semantic_config` -> `fingerprint_hash`). Before this unit the tag was a SEPARATE
+    defaulted kwarg, so an operator could set `serving_version="0.24.0"` while the tag stayed `"vllm-0.23.0"`
+    — a self-contradictory fingerprint (identity says one version, tag says another). Deriving the tag from
+    the same two components makes that unrepresentable. Byte-form `<stack>-<version>` (e.g. `"vllm-0.23.0"`),
+    exactly the old default for the pinned wave-1 tuple, so existing canonical identities never re-mint
+    (NO-CHURN)."""
+    return f"{serving_stack}-{serving_version}"
+
+
+def assert_substrate_matches_wire(client: VLLMClient, *, serving_stack: str, serving_version: str) -> None:
+    """DERIVE cross-check (the substrate-axis Layer-2, sibling of the tokenizer collision-guard): the
+    DECLARED substrate must match what the adapter/wire actually report, else RAISE (fail closed).
+
+      * serving_stack  — DERIVED from the adapter's own self-report (`client.serving_stack`): the adapter
+        knows which stack it is, so a capture declaring `"nnsight"` while driving the vLLM adapter is refused.
+      * serving_version — DERIVED from the WIRE (`client.server_version()` -> GET /version): a capture
+        declaring `"0.23.0"` against a server actually running a different version is refused — the false
+        MERGE the tokenizer_hash cannot backstop (a version change keeps the same tokenizer).
+
+    Fails CLOSED on a client that does not self-report its stack or an unreachable /version (the pinned
+    v0.23.0 server exposes both). The REQUIRE belt forces a conscious declaration; this verifies it against
+    reality."""
+    derived_stack = getattr(client, "serving_stack", None)
+    if derived_stack is None:
+        raise ConfigurationError(
+            "the capture client does not self-report `serving_stack` — cannot cross-check the declared "
+            "substrate stack (fail closed; the DERIVE half requires the adapter to report its own stack)."
+        )
+    if derived_stack != serving_stack:
+        raise ConfigurationError(
+            f"declared serving_stack={serving_stack!r} disagrees with the adapter's self-reported "
+            f"{derived_stack!r} — refusing to fold a wrong stack into the model identity (fail closed)."
+        )
+    derived_version = client.server_version()
+    if derived_version != serving_version:
+        raise ConfigurationError(
+            f"declared serving_version={serving_version!r} disagrees with the server's wire /version "
+            f"{derived_version!r} — refusing to fold a wrong runtime version into the model identity (fail "
+            "closed; a version change keeps the same tokenizer, so nothing else catches this substrate lie)."
+        )
+
+
 def capture_logprob(
     *,
     repo: Repository,
@@ -479,15 +549,14 @@ def capture_logprob(
     actor_key: str,
     origin: str,
     dtype_quant: str,
-    serving_stack: str = "vllm",
-    serving_version: str = "0.23.0",
+    serving_stack: str,
+    serving_version: str,
     arch_family: str = "llama",
     prompt: str | None = None,
     n_logprobs: int = 20,
     seed: int = 1234,
     batch_invariant: bool = True,
     runner: str = "V1",
-    serving_version_tag: str = "vllm-0.23.0",
     compute_capability: float = 8.9,
     dataset_name: str = "logprobs",
     expected_uuid: uuid.UUID | str | None = None,
@@ -513,6 +582,11 @@ def capture_logprob(
     # Fail closed on an absent/blank runtime dtype grade BEFORE any wire call or durable write — it folds into
     # the model identity below and must be a conscious caller assertion, never a silent default (D1 idiom).
     require_dtype_quant(dtype_quant)
+    # Same belt for the SUBSTRATE axis (serving_stack/serving_version): required + non-defaulted, refused blank
+    # here — fail closed before any identity decision. The fingerprint's serving_version_tag is COMPOSED from
+    # the SAME two components (one source), so it can never contradict the identity (was a free third kwarg).
+    require_substrate(serving_stack=serving_stack, serving_version=serving_version)
+    serving_version_tag = compose_serving_version_tag(serving_stack, serving_version)
     # A2-11b: the durability consult (below) and the internal bundle registrar gate/verify on the lane, which
     # must be TRUSTWORTHY — `expected_lane` is a free param, but `repo` was verify_engine'd for its OWN lane at
     # construction. A param that DISAGREES with the repo's verified lane is a caller misconfiguration that must
@@ -536,6 +610,10 @@ def capture_logprob(
 
     # 1. CAPTURE the true wire payload verbatim (request + response bytes), with the derived distribution.
     served = client.served_model()
+    # DERIVE cross-check (before any durable write): the declared substrate must match the adapter's
+    # self-reported stack AND the server's wire /version — a declared-vs-real mismatch RAISES (fail closed),
+    # closing the "right label, wrong runtime" substrate lie the way the tokenizer collision-guard closed it.
+    assert_substrate_matches_wire(client, serving_stack=serving_stack, serving_version=serving_version)
     captured = client.next_token_logprobs_capture(prompt, model=served, n_logprobs=n_logprobs, seed=seed)
 
     # A2-11b (ADR-0020): gate the CANONICAL capture on the durability interlock, BEFORE the FIRST durable

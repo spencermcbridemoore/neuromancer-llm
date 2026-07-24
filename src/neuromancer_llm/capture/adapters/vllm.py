@@ -122,9 +122,15 @@ def _parse_token_id(key: str) -> int:
 class VLLMClient:
     """Thin stdlib HTTP client for the containerized OpenAI-compatible vLLM server."""
 
+    #: The serving STACK this adapter self-reports (the substrate-axis DERIVE half). A capture's declared
+    #: `serving_stack` is cross-checked against this (capture/events.py::assert_substrate_matches_wire) so a
+    #: wrong stack label cannot fold into the model identity — this adapter IS vLLM, definitionally.
+    serving_stack: str = "vllm"
+
     def __init__(self, base_url: str = "http://127.0.0.1:8000", *, timeout: float = 60.0) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self._server_version: str | None = None
 
     # --- transport ---------------------------------------------------------------------------------
     def _get(self, path: str, *, timeout: float | None = None) -> object:
@@ -198,6 +204,27 @@ class VLLMClient:
         if not isinstance(data, dict) or not data.get("data"):
             raise VLLMAdapterError(f"/v1/models returned no models: {data!r}")
         return str(data["data"][0]["id"])
+
+    def server_version(self) -> str:
+        """The vLLM server version read from the WIRE (GET /version -> `{"version": ...}`).
+
+        The substrate-axis DERIVE half: a capture's declared `serving_version` is cross-checked against this
+        (capture/events.py::assert_substrate_matches_wire) so a version change — which keeps the SAME
+        tokenizer, hence is NOT backstopped by tokenizer_hash — cannot silently MERGE into a stale model
+        identity. Memoized: the served version is a launch-time constant, so the wire is read once per client
+        even across a 6,000-capture campaign. `/version` is source-confirmed present in the pinned v0.23.0
+        image (the EXTRACTED image source at entrypoints/serve/instrumentator/basic.py, mounted via
+        register_vllm_serve_api_routers; the LIVE server is not exercised in this build) and the image reports
+        "0.23.0" (log:244); a missing/malformed body raises loudly (fail closed, never a silent gap)."""
+        if self._server_version is None:
+            data = self._get("/version")
+            if not isinstance(data, dict) or not data.get("version"):
+                raise VLLMAdapterError(
+                    f"/version returned no version: {data!r} — cannot derive serving_version for the "
+                    "substrate-axis cross-check (the server must expose vLLM's /version route)."
+                )
+            self._server_version = str(data["version"])
+        return self._server_version
 
     def tokenize(self, text: str, *, model: str) -> list[int]:
         """Tokenize `text` with the SERVED model's tokenizer via the vLLM `/tokenize` endpoint.
