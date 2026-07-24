@@ -194,6 +194,8 @@ class BundleRegistrar:
         run_model_identity: RunModelIdentityBlock | None = None,
         tokenization: TokenizationBlock | None = None,
         not_applicable: Sequence[str] = (),
+        recompute_recipe: str | None = None,
+        estimated_cost: object | None = None,
         crash_at: str | None = None,
     ) -> int:
         """Run the W1-W8 ordering. Returns the bundle_id. Idempotent on resume for IDENTICAL bytes.
@@ -252,6 +254,8 @@ class BundleRegistrar:
             run_model_identity=run_model_identity,
             tokenization=tokenization,
             not_applicable=not_applicable,
+            recompute_recipe=recompute_recipe,
+            estimated_cost=estimated_cost,
             shard_footer_kv=shard_footer_kv or None,
         )
         mbytes = manifest_bytes(manifest)
@@ -303,9 +307,11 @@ class BundleRegistrar:
                 new_sha = sha256_bytes(shard.data)
                 row = conn.execute(
                     text(
-                        "INSERT INTO neuro.artifacts (bundle_id, kind, backend_id, uri, sha256, size_bytes, retention) "
-                        "VALUES (:b, :kind, :be, :uri, :sha, :sz, 'ttl') "
-                        # self-assign no-op on conflict so RETURNING yields the EXISTING sha256 (not overwritten)
+                        "INSERT INTO neuro.artifacts "
+                        "(bundle_id, kind, backend_id, uri, sha256, size_bytes, retention, recompute_recipe) "
+                        "VALUES (:b, :kind, :be, :uri, :sha, :sz, 'ttl', :rr) "
+                        # self-assign no-op on conflict so RETURNING yields the EXISTING sha256 (not overwritten);
+                        # recompute_recipe is set on first insert and NOT overwritten on an idempotent resume.
                         "ON CONFLICT (backend_id, uri) DO UPDATE SET size_bytes = neuro.artifacts.size_bytes "
                         "RETURNING artifact_id, sha256"
                     ),
@@ -316,6 +322,7 @@ class BundleRegistrar:
                         "uri": key,
                         "sha": new_sha,
                         "sz": shard.size_bytes,
+                        "rr": recompute_recipe,
                     },
                 ).one()
                 if bytes(row.sha256) != new_sha:  # R2: idempotent for same bytes, fail-loud for different

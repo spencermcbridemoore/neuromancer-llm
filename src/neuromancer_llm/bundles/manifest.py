@@ -45,6 +45,7 @@ def build_manifest(
     retention: str = "ttl",
     pinned: bool = False,
     recompute_recipe: str | None = None,
+    estimated_cost: object | None = None,
     lineage: list | None = None,
     run_model_identity: RunModelIdentityBlock | None = None,
     tokenization: TokenizationBlock | None = None,
@@ -118,7 +119,7 @@ def build_manifest(
         "chunk_map": {},
         "integrity": {s.name: s.sha256_hex for s in shards},  # per-file sha256
         "retention": {"ttl_class": retention, "pinned": pinned},
-        "recompute_recipe": {"recipe": recompute_recipe, "estimated_cost": None},
+        "recompute_recipe": {"recipe": recompute_recipe, "estimated_cost": estimated_cost},
         "lineage": lineage or [],
         "per_tensor_stats": {},
         "completeness": {},  # computed below, once every other block is assembled

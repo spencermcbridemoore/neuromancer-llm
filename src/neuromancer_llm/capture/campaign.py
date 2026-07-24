@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..db.identity import content_hash
 from .answer_letter import (
     register_answer_letter_method,
     resolve_letter_token_ids,
@@ -48,6 +49,22 @@ LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 DEFAULT_MAX_K = 5
 #: The pinned prompt-template version (D5 pin i). Recorded in the method/coordinates; a drift breaks recompute.
 PROMPT_TEMPLATE_VERSION = "v1"
+
+#: The pinned ESTELA corpus, by git commit -> its PARSED-CONTENT digest (§A·43 pin idiom; §D follow-on #3, the
+#: VALIDATION half). The digest is over PARSED content (uid + stem + choices — every prompt-determining field),
+#: NEVER file bytes — the desktop-CRLF (211808 B) vs VM-LF (211713 B) trap at the SAME commit makes file bytes
+#: machine-dependent (env-gotchas). The single entry is computed over ``read_estela_jsonl(corpus,
+#: max_k=DEFAULT_MAX_K)`` = the 75 in-scope questions of the max_k=5 ESTELA campaign (so the pin is scoped to that
+#: campaign's read; a run at a different max_k reads a different subset and fails closed here — intentional).
+#: ⚠ PERSISTING corpus provenance (a ``run_inputs`` row) is DEFERRED to the wave-2 stimulus registry:
+#: ``run_inputs``' one-referent CHECK (ddl:265-267) has no home for a bare ``corpus_commit`` —
+#: ``run_inputs.prompt_set_id`` -> ``prompt_sets.content_hash`` is the structural home, and ``prompt_sets`` is
+#: the deferred registry. This is validation ONLY.
+PINNED_CORPUS_CONTENT: dict[str, str] = {
+    "158a8c32248a2f4980a14075b221a78f00bbbbd7": (
+        "25dcfeb830f4ef6df86752ad30951be6992ab544b7b79461fe70c61ea5e596d0"
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -165,6 +182,50 @@ def partition_campaign_questions(
     return kept, dropped
 
 
+def corpus_content_digest(questions: list[EstelaQuestion]) -> str:
+    """A machine-INDEPENDENT parsed-content digest of the in-scope corpus: sorted ``[uid, stem, list(choices)]``
+    triples, hashed through THE canonicalizer (``content_hash``; §B, one implementation per concept).
+
+    Covers ALL prompt-determining parsed content — the STEM (``render_prompt_v1`` embeds ``q.stem`` verbatim, so
+    a stem-only edit changes the captured prompts) as well as uid + choices. ⚠ The charter specified "uid set +
+    choices"; the A2 post-build vet found (+ confirmed) that excluding the stem lets a stem-only drift pass the
+    drift guarantee, so the stem is included — it is a parsed JSON string exactly like the choices (both carry
+    ``$...$`` LaTeX), so this stays machine-independent.
+
+    NEVER hashes file bytes: the desktop-CRLF (211808 B) vs VM-LF (211713 B) checkout of the SAME pinned commit
+    differ in bytes but parse to identical uid/stem/choices, so a file-byte validator would falsely redden per
+    machine (env-gotchas; the trap Unit D flagged). Sorted by uid so read order cannot change the digest."""
+    payload = sorted([q.uid, q.stem, list(q.choices)] for q in questions)
+    return content_hash(payload).hex()
+
+
+def assert_corpus_matches_pin(corpus_commit: str, questions: list[EstelaQuestion]) -> None:
+    """Validate the declared ``--corpus-commit`` against the parsed content actually read (§D follow-on #3:
+    today ``corpus_commit`` is a free string echoed to stdout, never compared to the file). Fail closed BOTH
+    directions on the PINNED corpus, so a mislabel cannot ride:
+
+      * declared commit is pinned but its content DRIFTED (the file is not the pinned corpus) -> RAISE;
+      * content IS a pinned corpus but declared under a DIFFERENT commit (mislabeled provenance) -> RAISE.
+
+    An unknown commit whose content matches NO pin passes (an unpinned/experimental corpus is not gated here;
+    the pin is the ESTELA provenance guarantee, not a whitelist). Persistence stays deferred to wave-2."""
+    computed = corpus_content_digest(questions)
+    expected = PINNED_CORPUS_CONTENT.get(corpus_commit)
+    if expected is not None and computed != expected:
+        raise EstelaCampaignError(
+            f"corpus_commit={corpus_commit!r} is pinned to content digest {expected} but the parsed corpus "
+            f"digests to {computed} — the corpus content drifted from its pinned commit (validate the "
+            "corpus/commit; do not run)."
+        )
+    if expected is None:
+        mislabeled = next((c for c, d in PINNED_CORPUS_CONTENT.items() if d == computed), None)
+        if mislabeled is not None:
+            raise EstelaCampaignError(
+                f"the parsed corpus content matches pinned commit {mislabeled!r} but --corpus-commit was "
+                f"declared {corpus_commit!r} — refusing a mislabeled provenance commit (do not run)."
+            )
+
+
 def enumerate_permutations(k: int) -> list[tuple[int, ...]]:
     """The pinned enumeration rule (D5 pin ii): lexicographic ``itertools.permutations(range(k))``; perm-index
     p in 0..k!-1 selects ``permutations[p]``. FROZEN — this is the recompute contract."""
@@ -221,6 +282,10 @@ def run_campaign(
     # `client` (not served_model), so it is hoisted here to keep the fail-fast promise literal. Each
     # capture_logprob re-checks (memoized: one wire /version read for the whole 6,000-capture sweep).
     assert_substrate_matches_wire(client, serving_stack=serving_stack, serving_version=serving_version)
+    # A2b (§D follow-on #3): validate the declared --corpus-commit against the PARSED content actually read,
+    # before any capture — a pinned commit whose content drifted (or the pinned content under a wrong commit)
+    # RAISES, so corpus_commit is no longer a free string echoed but never checked. Persistence deferred (wave-2).
+    assert_corpus_matches_pin(corpus_commit, questions)
     kept, dropped = partition_campaign_questions(questions)
     if not kept:
         raise EstelaCampaignError("no ESTELA questions in scope after selection (empty or all dropped).")

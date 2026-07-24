@@ -60,6 +60,7 @@ from .determinism import (
     resolve_expected_level,
 )
 from .determinism import substrate_key as derive_substrate_key
+from .recipe import RECOMPUTE_ESTIMATED_COST, RECOMPUTE_RECIPE_JSON
 
 # capture_events.{request,response}_text octet cap (mirrors the capture_inline_cap CHECK; ADR-0003/0022).
 INLINE_CAP = 8192
@@ -763,6 +764,11 @@ def capture_logprob(
             token_table_shard=shard_name,
         ),
         not_applicable=("chunk_map", "hook_point_map", "payloads", "per_tensor_stats"),
+        # A2a (manifest block-10 revival): the ONE pinned recipe constant -> manifest block 10 AND
+        # artifacts.recompute_recipe (so a GC'd derived parquet can be regenerated; ADR-0034 / phase0 Q6),
+        # with the D5-MEASURED per-capture estimated_cost (no longer a silent None).
+        recompute_recipe=RECOMPUTE_RECIPE_JSON,
+        estimated_cost=RECOMPUTE_ESTIMATED_COST,
         table_manifests=[
             TableManifestSpec(
                 shard_name=shard_name,
