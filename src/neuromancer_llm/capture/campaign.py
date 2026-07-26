@@ -29,12 +29,14 @@ from .answer_letter import (
     resolve_letter_token_ids,
     write_answer_letter_projection,
 )
+from .determinism import DEFAULT_TARGET_PROMPT
 from .events import (
     assert_substrate_matches_wire,
     capture_logprob,
     require_dtype_quant,
     require_substrate,
 )
+from .gridcheck import assert_grid_consistent, grid_preflight_note
 
 if TYPE_CHECKING:
     from ..db.repository import Repository
@@ -87,6 +89,7 @@ class CampaignResult:
     permutations_captured: int
     censored_cells_total: int
     dropped_duplicate_option_uids: tuple[str, ...]
+    preflight_grid_note: str  # §D Layer-2: the controlled-probe grid observation (informational; runbook)
 
 
 class EstelaCampaignError(ValueError):
@@ -286,6 +289,18 @@ def run_campaign(
     # before any capture — a pinned commit whose content drifted (or the pinned content under a wrong commit)
     # RAISES, so corpus_commit is no longer a free string echoed but never checked. Persistence deferred (wave-2).
     assert_corpus_matches_pin(corpus_commit, questions)
+    # §D Layer-2 grid PREFLIGHT (joins the fail-fast family, before any durable write): one CONTROLLED probe on
+    # a fixed prompt via the NON-capture primitive (no DB write), grid-verified against the declared dtype. A
+    # declared full-depth (fp32) grade whose logprobs are demonstrably quantized RAISES here — catching the
+    # mislabel before the one-shot/no-resume sweep spends GPU (log:231 C3), on a controlled prompt more reliably
+    # than the campaign's (possibly flat) first real capture. served_model is reused for the letter-id resolve.
+    served_model = client.served_model()
+    _probe = client.next_token_logprobs(
+        DEFAULT_TARGET_PROMPT, model=served_model, n_logprobs=n_logprobs, seed=1234
+    )
+    _probe_logprobs = [lp for _, lp in _probe.top_logprobs]
+    assert_grid_consistent(_probe_logprobs, dtype_quant=dtype_quant)
+    preflight_grid_note = grid_preflight_note(_probe_logprobs, dtype_quant=dtype_quant)
     kept, dropped = partition_campaign_questions(questions)
     if not kept:
         raise EstelaCampaignError("no ESTELA questions in scope after selection (empty or all dropped).")
@@ -297,7 +312,7 @@ def run_campaign(
     # Resolve the answer-letter token-ids ONCE (every prompt shares the identical '...\n\nAnswer:' tail): use
     # the first kept question's identity-permutation prompt as the exact-context base. The resolver asserts a
     # strict-prefix + single-token delta and raises on a non-prefix-stable tokenizer (never a silent wrong id).
-    served_model = client.served_model()
+    # served_model was resolved at the grid preflight above (reused; one /v1/models read per campaign).
     base_perm = tuple(range(kept[0].num_choices))
     base_prompt = render_prompt_v1(kept[0].stem, permuted_labeled_options(kept[0].choices, base_perm))
     letter_token_ids = resolve_letter_token_ids(
@@ -348,4 +363,5 @@ def run_campaign(
         permutations_captured=done,
         censored_cells_total=censored_total,
         dropped_duplicate_option_uids=tuple(dropped),
+        preflight_grid_note=preflight_grid_note,
     )

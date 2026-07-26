@@ -60,6 +60,7 @@ from .determinism import (
     resolve_expected_level,
 )
 from .determinism import substrate_key as derive_substrate_key
+from .gridcheck import assert_grid_consistent
 from .recipe import RECOMPUTE_ESTIMATED_COST, RECOMPUTE_RECIPE_JSON
 
 # capture_events.{request,response}_text octet cap (mirrors the capture_inline_cap CHECK; ADR-0003/0022).
@@ -453,9 +454,11 @@ def require_dtype_quant(dtype_quant: str) -> None:
     quant are launch-time facts) — so it is caller-asserted and, per the D1 "no default-clean member" idiom
     (`importer/ingress.py`), REQUIRED with NO default. Omission is a required-kwarg TypeError; an EMPTY/blank
     grade is refused HERE, fail closed, before any identity or tolerance decision. This belt forbids the SILENT
-    default and the empty grade ONLY — a WRONG-but-present grade (a valid label on the wrong runtime, e.g.
-    "bf16" declared while the server ran fp16) is the grid-consistency guard's job (registered §D follow-on;
-    the dtype leaves a 2^-4/2^-7/continuous fingerprint in the logprobs — the bf16-depth diagnostic, log:244)."""
+    default and the empty grade ONLY — a WRONG-but-present grade is `capture/gridcheck.py`'s job (§D Layer 2,
+    BUILT): it hard-raises the ONE reliably detectable dtype lie — a declared full-depth `fp32` whose captured
+    logprobs carry a coarse quantization grid — but bf16<->fp16 is NOT identifiable from log-softmax (softmax
+    shift-invariance), so that axis stays this belt's conscious assertion plus a wave-2 re-capture's new model
+    identity + new E6 cert (the bf16-depth diagnostic, log:244)."""
     if not dtype_quant or not dtype_quant.strip():
         raise ConfigurationError(
             "dtype_quant is REQUIRED and must be a non-empty model-identity grade (e.g. bf16/fp16/fp32); it is "
@@ -616,6 +619,13 @@ def capture_logprob(
     # closing the "right label, wrong runtime" substrate lie the way the tokenizer collision-guard closed it.
     assert_substrate_matches_wire(client, serving_stack=serving_stack, serving_version=serving_version)
     captured = client.next_token_logprobs_capture(prompt, model=served, n_logprobs=n_logprobs, seed=seed)
+
+    # §D Layer-2 (grid-consistency guard): a declared full-depth (fp32) grade whose captured logprobs carry a
+    # coarse quantization grid is a "right label, wrong runtime dtype" lie the Layer-1 require_dtype_quant belt
+    # cannot see — refuse it HERE, above the first durable write (the D1 identity-integrity idiom). Only ACTS on
+    # a continuous grade, so honest bf16/fp16 captures never enter the raise path; bf16<->fp16 is not
+    # identifiable from log-softmax (softmax shift-invariance), so it is deliberately not attempted here.
+    assert_grid_consistent([lp for _, lp in captured.sample.top_logprobs], dtype_quant=dtype_quant)
 
     # A2-11b (ADR-0020): gate the CANONICAL capture on the durability interlock, BEFORE the FIRST durable
     # write (the register-first identity INSERTs below). A stale/flipped system_health status refuses the

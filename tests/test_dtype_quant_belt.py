@@ -11,8 +11,10 @@ Layer 1 (here) makes `dtype_quant` REQUIRED and non-defaulted at every capture e
 (`capture_logprob`, `replicate_and_measure`, `run_campaign`) AND the operator surface (`neuro capture
 logprob | replay | campaign`) — mirroring the D1 "no default-clean member" idiom (`importer/ingress.py`;
 `tests/test_cli_importer.py`). It forbids the SILENT default and the EMPTY grade only. A WRONG-but-present
-grade (a valid label on the wrong runtime) is the grid-consistency guard's job — a registered §D follow-on,
-NOT tested here (the dtype leaves a 2^-4/2^-7/continuous fingerprint in the logprobs; bf16-depth, log:244).
+grade (a valid label on the wrong runtime) is `capture/gridcheck.py`'s job (§D Layer 2, BUILT; tested in
+tests/test_gridcheck.py), NOT here — it hard-raises the ONE reliably detectable lie (a declared full-depth
+`fp32` whose captured logprobs carry a coarse quantization grid); bf16<->fp16 is not identifiable from
+log-softmax (bf16-depth, log:244).
 """
 
 from __future__ import annotations

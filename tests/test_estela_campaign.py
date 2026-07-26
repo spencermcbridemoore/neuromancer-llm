@@ -36,6 +36,7 @@ from neuromancer_llm.capture.campaign import (
     render_prompt_v1,
     run_campaign,
 )
+from neuromancer_llm.db.lanes import ConfigurationError
 from neuromancer_llm.db.repository import IdentityMismatchError
 from neuromancer_llm.registry.metric_keys import ANSWER_LETTER_LOGPROBS_V1
 from neuromancer_llm.storage.backends import LocalFsBackend
@@ -51,21 +52,37 @@ def _sample_with_letters(letters: dict[str, float]) -> LogprobSample:
     return LogprobSample(prompt="p", generated_token_id=gen, top_logprobs=pairs)
 
 
+def _bf16_grid_probe_sample() -> LogprobSample:
+    """The grid-PREFLIGHT probe's GPU-free stand-in: a ~40-token next-token distribution on a clean 0.0625-nat
+    (bf16 @ [8,16)) grid, so `capture/gridcheck.py` classifies it QUANTIZED — the preflight's grid check is
+    genuinely exercised without a live server."""
+    pairs = tuple((3000 + i, -0.0625 * i) for i in range(40))
+    return LogprobSample(prompt="probe", generated_token_id=3000, top_logprobs=pairs)
+
+
 class _FakeCampaignClient:
     """GPU-free vLLM stand-in: served_model + a prefix-stable toy tokenizer + a fixed capture sample."""
 
     serving_stack = "vllm"  # substrate-axis DERIVE: the adapter self-report the cross-check reads
 
-    def __init__(self, sample: LogprobSample) -> None:
+    def __init__(self, sample: LogprobSample, probe_sample: LogprobSample | None = None) -> None:
         self._sample = sample
+        self._probe_sample = probe_sample if probe_sample is not None else _bf16_grid_probe_sample()
         self.capture_calls = 0
         self.tokenize_calls = 0
+        self.probe_calls = 0
 
     def served_model(self) -> str:
         return "fake/Mistral-7B-v0.3"
 
     def server_version(self) -> str:
         return "0.23.0"  # substrate-axis DERIVE: the wire /version the cross-check reads
+
+    def next_token_logprobs(self, prompt: str, *, model: str, n_logprobs: int, seed: int) -> LogprobSample:
+        # The §D Layer-2 grid-preflight probe (NON-capture primitive; no DB write). Returns the fixed bf16-grid
+        # distribution so the preflight's assert_grid_consistent / grid_preflight_note run against a real grid.
+        self.probe_calls += 1
+        return self._probe_sample
 
     def tokenize(self, text: str, *, model: str) -> list[int]:
         # Prefix-stable: a trailing ' <LETTER>' is ONE token == LETTER_TOKEN_ID; the base is one token/char.
@@ -410,3 +427,64 @@ def test_run_campaign_full_loop(repo, tmp_path) -> None:
     assert counts["campaigns"] == 1  # one campaign for the whole sweep
     # q1 is k=2 -> only A/B projected (C excluded by the sub-map); values from the fixed sample.
     assert q1_perm0_json == '{"A":-0.5,"B":-1.5}'
+
+
+# --- DB: the §D Layer-2 grid PREFLIGHT wired into the runner --------------------------------------------
+@pytest.mark.pg
+def test_run_campaign_populates_preflight_grid_note(repo, tmp_path) -> None:
+    """The controlled grid probe runs exactly once (before the sweep) and its observation rides out on
+    CampaignResult for the runbook — a QUANTIZED note here (bf16 grid), never a raise (declared bf16)."""
+    backend = LocalFsBackend(tmp_path)
+    backend_id = repo.get_or_create_storage_backend(
+        "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
+    )
+    client = _FakeCampaignClient(_sample_with_letters({"A": -0.5, "B": -1.5}))
+    result = run_campaign(
+        repo=repo,
+        backend=backend,
+        backend_id=backend_id,
+        client=client,
+        tokenizer_hash=b"T",
+        questions=[EstelaQuestion(uid="q1", stem="S1", choices=("x", "y"), num_choices=2)],
+        hf_repo="r",
+        hf_revision="rev",
+        dtype_quant="bf16",
+        serving_stack="vllm",
+        serving_version="0.23.0",
+        corpus_commit="c-test",
+        expected_lane="test",
+        n_logprobs=64,
+        origin="test",
+    )
+    assert client.probe_calls == 1  # exactly one controlled probe, before the sweep
+    assert "QUANTIZED" in result.preflight_grid_note and "0.0625" in result.preflight_grid_note
+
+
+@pytest.mark.pg
+def test_run_campaign_preflight_raises_on_fp32_over_claim(repo, tmp_path) -> None:
+    """A declared full-depth fp32 whose probe logprobs carry a coarse quantization grid RAISES at the preflight,
+    BEFORE any capture or durable write — the one-shot/no-resume fail-fast (log:231 C3)."""
+    backend = LocalFsBackend(tmp_path)
+    backend_id = repo.get_or_create_storage_backend(
+        "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
+    )
+    client = _FakeCampaignClient(_sample_with_letters({"A": -0.5, "B": -1.5}))
+    with pytest.raises(ConfigurationError, match="demonstrably QUANTIZED"):
+        run_campaign(
+            repo=repo,
+            backend=backend,
+            backend_id=backend_id,
+            client=client,
+            tokenizer_hash=b"T",
+            questions=[EstelaQuestion(uid="q1", stem="S1", choices=("x", "y"), num_choices=2)],
+            hf_repo="r",
+            hf_revision="rev",
+            dtype_quant="fp32",
+            serving_stack="vllm",
+            serving_version="0.23.0",
+            corpus_commit="c-test",
+            expected_lane="test",
+            n_logprobs=64,
+            origin="test",
+        )
+    assert client.probe_calls == 1 and client.capture_calls == 0  # raised at the preflight, no sweep spent

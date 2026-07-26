@@ -475,6 +475,7 @@ def campaign(
         f"{result.questions_captured} questions"
     )
     typer.echo(f"  method_version_id={result.method_version_id} censored_cells={result.censored_cells_total}")
+    typer.echo(f"  {result.preflight_grid_note}")  # §D Layer-2: the controlled-probe grid observation
     if result.dropped_duplicate_option_uids:
         typer.echo(f"  dropped (duplicate options, D6): {', '.join(result.dropped_duplicate_option_uids)}")
 
