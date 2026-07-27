@@ -12,7 +12,13 @@ from __future__ import annotations
 import pytest
 from sqlalchemy import text
 
-from neuromancer_llm.bundles.registrar import BundleRegistrar, SeamIntegrityError, SeamStateError
+from neuromancer_llm.bundles.bundlespec import sha256_hex
+from neuromancer_llm.bundles.registrar import (
+    BundleRegistrar,
+    CrashInjected,
+    SeamIntegrityError,
+    SeamStateError,
+)
 from neuromancer_llm.storage.backends import LocalFsBackend
 
 pytestmark = pytest.mark.pg
@@ -87,26 +93,46 @@ def test_rt_bundle_backend_id_drift_raises(seeded, tmp_path):
 
 def test_rt_per_artifact_sha_divergence_raises(seeded, tmp_path):
     """L9 (defense-in-depth): if a stored artifact sha256 diverges from the blob while the manifest still
-    matches, the per-artifact compare (registrar's last line) raises SeamIntegrityError. We force the
-    inconsistent state (sealed bundle + tampered stored sha) so the normally-shadowed branch fires."""
+    matches, the per-artifact compare (registrar's last line) raises SeamIntegrityError.
+
+    ⚠ THE SETUP REACHES 'sealed' THE LEGAL WAY. It used to roll a fully-registered bundle BACK with
+    `UPDATE ... SET state='sealed'`, which migration 0003 now refuses in-schema (registered->sealed is the
+    seam-state resurrection L9 exists to forbid, and the trigger is faithful to the app: registrar.py's
+    own CAS refuses it too). The equivalent legal shape is the crash window the seam already ships —
+    `crash_at="before_register"` raises AFTER `_seal` has committed, leaving the bundle 'sealed' with NO
+    artifacts — and the tampered artifact row is then inserted by hand at the registrar's OWN
+    content-addressed key so the re-register's `ON CONFLICT (backend_id, uri)` lands on it.
+    The first register call must BE the crashing one: on an already-registered bundle `_seal` returns
+    early (idempotent re-seal) and the crash would leave the state 'registered', not 'sealed'."""
     repo = seeded["repo"]
-    reg, bid = _register(seeded, tmp_path, ds="seam_pa", pp="seam_pa/p0")
+    backend = LocalFsBackend(tmp_path)
     backend_id = repo.get_or_create_storage_backend(
         "lake", driver="local_fs", lane="artifacts", base_uri=str(tmp_path), is_cloud=False
     )
+    reg = BundleRegistrar(repo.engine, backend, expected_lane="test")
+    kw = {
+        "run_id": seeded["run_id"],
+        "backend_id": backend_id,
+        "dataset_name": "seam_pa",
+        "partition_path": "seam_pa/p0",
+        "shards": SHARDS,
+    }
+    with pytest.raises(CrashInjected):  # W6: sealed, blobs on disk, nothing registered
+        reg.register(**kw, crash_at="before_register")
     with repo.engine.begin() as conn:
-        # roll the bundle back to 'sealed' so a re-register re-enters the artifacts loop, and tamper ONE
-        # stored artifact sha so it disagrees with its (unchanged) blob bytes.
-        conn.execute(text("UPDATE neuro.bundles SET state='sealed' WHERE bundle_id=:b"), {"b": bid})
+        bid = conn.execute(text("SELECT bundle_id FROM neuro.bundles WHERE state='sealed'")).scalar_one()
+        # The registrar's own key: {partition}/{sha256hex(bytes)}/{name} (FIX #7 content-addressing).
+        # Deriving it here rather than hardcoding keeps the collision honest if the formula ever moves.
+        name = "shard-0001.bin"
+        uri = f"seam_pa/p0/{sha256_hex(SHARDS[name])}/{name}"
         conn.execute(
-            text("UPDATE neuro.artifacts SET sha256=:s WHERE bundle_id=:b AND uri LIKE '%shard-0001.bin'"),
-            {"s": b"\x00" * 32, "b": bid},
+            text(
+                "INSERT INTO neuro.artifacts (bundle_id, kind, backend_id, uri, sha256, size_bytes) "
+                "VALUES (:b, 'other', :be, :u, :s, :sz)"
+            ),
+            {"b": bid, "be": backend_id, "u": uri, "s": b"\x00" * 32, "sz": len(SHARDS[name])},
         )
-    with pytest.raises(SeamIntegrityError):
-        reg.register(
-            run_id=seeded["run_id"],
-            backend_id=backend_id,
-            dataset_name="seam_pa",
-            partition_path="seam_pa/p0",
-            shards=SHARDS,
-        )
+    # `match=` pins the BRANCH: three separate paths in register() raise SeamIntegrityError, so a bare
+    # raises-check would go green if an earlier guard started firing and this branch went dead again.
+    with pytest.raises(SeamIntegrityError, match="already registered with a different sha256"):
+        reg.register(**kw)

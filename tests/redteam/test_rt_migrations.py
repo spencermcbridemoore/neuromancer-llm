@@ -1,7 +1,11 @@
 """Red-team: migrations own the schema; from-zero == frozen DDL (L10).
 
-  * downgrade round-trip — `upgrade head` then `downgrade base` cleanly drops the neuro schema (the
-    disaster-recovery path the parity test never exercises), in a THROWAWAY database.
+  * downgrade round-trip — `upgrade head` then `downgrade base` drops every neuro OBJECT (the
+    disaster-recovery path the parity test never exercises), in a THROWAWAY database. ⚠ The empty
+    SCHEMA itself REMAINS (0001's downgrade drops tables/types/functions individually, never the
+    schema) — and that is load-bearing, not incidental: the post-downgrade `pg_proc` assert is scoped
+    to `nspname='neuro'`, so if the schema were ever dropped instead, that assert would read 0
+    unconditionally and the orphan-function net would go permanently, silently green.
   * schema completeness — the migrated session schema carries the full table set + the in-schema
     assign-once trigger/function (migrations materialized the whole schema, not a subset).
 
@@ -38,7 +42,8 @@ def _recreate_db(base: str, dbname: str) -> None:
 
 def test_rt_migration_downgrade_round_trips(pg_url):
     """L10: `upgrade head` -> `downgrade base` round-trips cleanly in a throwaway DB — the downgrade DO-block
-    (the disaster-recovery path) drops the neuro schema entirely."""
+    (the disaster-recovery path) drops every neuro OBJECT; the empty schema itself remains (see the
+    module header — the surviving schema is what makes the pg_proc assert below meaningful)."""
     try:
         _recreate_db(pg_url, "rt_downgrade")
     except Exception as exc:  # noqa: BLE001 — needs CREATE DATABASE; skip cleanly where not permitted
@@ -68,7 +73,19 @@ def test_rt_migration_downgrade_round_trips(pg_url):
                         "AND tablename <> 'alembic_version'"  # alembic's own bookkeeping survives, empty
                     )
                 ).scalar_one()
+                # ...and every in-schema FUNCTION too. Tables-only was blind to an orphaned function: a
+                # downgrade with a wrong argument signature is a SILENT no-op under `DROP ... IF EXISTS`,
+                # so the triggers vanish with the tables while their functions survive and no assertion
+                # here could tell. True at 0001 (its DO-block drops assert_assign_once explicitly) and at
+                # 0003, so this is a regression net for the whole class, not a new obligation.
+                fns_left = conn.execute(
+                    text(
+                        "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+                        "WHERE n.nspname='neuro'"
+                    )
+                ).scalar_one()
             assert tables_left == 0
+            assert fns_left == 0, "a downgrade left an orphan neuro.* function behind"
         finally:
             eng.dispose()
     finally:
@@ -79,8 +96,9 @@ def test_rt_migration_downgrade_round_trips(pg_url):
 
 
 def test_rt_migrated_schema_is_complete(engine):
-    """L10: migrations-from-zero materialized the FULL schema — the core table set, the 13 enums, and the
-    in-schema assign-once function + trigger (the guard L11 relies on), not a subset."""
+    """L10: migrations-from-zero materialized the FULL schema — the core table set, the 13 enums, the
+    in-schema assign-once function + trigger (the guard L11 relies on), AND migration 0003's four
+    state-CAS guard functions + their four triggers (ADR-0046 P-4) — not a subset."""
     with engine.connect() as conn:
         tables = conn.execute(
             text("SELECT count(*) FROM pg_tables WHERE schemaname='neuro' AND tablename<>'alembic_version'")
@@ -102,6 +120,25 @@ def test_rt_migrated_schema_is_complete(engine):
                 "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
                 "JOIN pg_namespace n ON n.oid=c.relnamespace "
                 "WHERE n.nspname='neuro' AND NOT t.tgisinternal AND t.tgname LIKE '%assign_once%'"
+            )
+        ).scalar_one()
+        # 0003 (ADR-0046 P-4): the jobs/bundles state-CAS guards + the capture_events.model_id bind.
+        # NAME-SCOPED, mirroring the assign-once asserts above, so the two migrations' objects are pinned
+        # independently and a dropped trigger cannot be masked by an unrelated one existing.
+        c2_fns = conn.execute(
+            text(
+                "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+                "WHERE n.nspname='neuro' AND p.proname IN ('assert_job_state_transition', "
+                "'assert_bundle_state_transition', 'assert_bundle_insert_state', 'assert_capture_model_bind')"
+            )
+        ).scalar_one()
+        c2_triggers = conn.execute(
+            text(
+                "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname='neuro' AND NOT t.tgisinternal AND t.tgname IN "
+                "('jobs_state_transition', 'bundles_state_transition', 'bundles_state_insert', "
+                "'capture_events_model_bind')"
             )
         ).scalar_one()
         core = (
@@ -131,7 +168,11 @@ def test_rt_migrated_schema_is_complete(engine):
             .scalars()
             .all()
         )
+    # 0003 adds NEITHER a table NOR an enum (its guards are functions + triggers), so these two do not
+    # move — the `call_failures` satellite was declined from 0003 for exactly that reason (it adds a TABLE).
     assert tables == 45, f"expected 45 neuro tables, got {tables}"
     assert enums == 13, f"expected 13 neuro enums, got {enums}"
     assert has_fn == 1 and has_trigger == 1  # the in-schema assign-once guard is materialized
+    assert c2_fns == 4, f"expected 4 migration-0003 guard functions, got {c2_fns}"
+    assert c2_triggers == 4, f"expected 4 migration-0003 guard triggers, got {c2_triggers}"
     assert len(core) == 16  # every core table is present

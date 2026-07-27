@@ -313,13 +313,25 @@ def test_rt_two_parents_complete_concurrently_child_unblocks(seeded):
     under a fresh snapshot that includes the winner's commit.
 
     HAND-DRIVEN INTERLEAVE, two sessions, explicit latches (E-13). Both connections drive the PRODUCTION
-    helper, so the hammer never tests its own copy of the SQL."""
+    helper, so the hammer never tests its own copy of the SQL.
+
+    ⚠ THE PARENTS ARE ADVANCED TO 'claimed' FIRST, and that is not decoration. `complete()` opens its own
+    transaction and commits, so the hammer cannot use it — it needs both parents' 'succeeded' writes held
+    UNCOMMITTED on two connections. Since migration 0003 the jobs state ladder is enforced in-schema, and
+    queued->succeeded is not a rung the app can take, so the bare UPDATE must start from a state the app
+    really reaches. The advance is itself a legal edge (queued->claimed, Repository.claim's own), it is
+    committed before the interleave begins, and it changes nothing about what this hammer proves — it
+    makes the schedule one production can actually produce, which the earlier form was not."""
     repo, run_id, w = seeded["repo"], seeded["run_id"], seeded["actor_id"]
     engine = repo.engine
     p1 = repo.enqueue(run_id=run_id, job_key="k#ws-p1", job_role="p1")
     p2 = repo.enqueue(run_id=run_id, job_key="k#ws-p2", job_role="p2")
     child = repo.enqueue(run_id=run_id, job_key="k#ws-c", job_role="c", depends_on=[p1, p2])
     assert repo.state_of(child) == "blocked"
+    with engine.begin() as conn:  # queued -> claimed (legal), committed before the interleave
+        conn.execute(
+            text("UPDATE neuro.jobs SET state = 'claimed' WHERE job_id = ANY(:ids)"), {"ids": [p1, p2]}
+        )
 
     conn_a, conn_b = engine.connect(), engine.connect()
     done_b = threading.Event()
@@ -737,11 +749,24 @@ def test_rt_reaper_empty_sweep_is_cheap_and_quiet(seeded):
     assert _active_leases(repo.engine, job) == 1
 
 
-def test_rt_no_schema_change_this_session():
-    """ADR-0046's locking arm carries NO schema change (the 0003 trigger migration is a later unit), so
-    parity stays 0001-scoped and the frozen reference stays pristine."""
+def test_rt_migration_set_is_the_three_of_record():
+    """The migration set of record, pinned by IDENTITY so a stray or misnamed revision reddens.
+
+    ⚠ This was `assert len(migrations) == 2` with the docstring "ADR-0046's locking arm carries NO schema
+    change (the 0003 trigger migration is a later unit)". Session C2 IS that later unit, so that clause is
+    DISCHARGED and leaving it asserting 2 would ship a checkable falsehood (precedent 15). The pin is not
+    deleted and not bumped to a bare count — it is the only migration-set assertion in the tree, and an
+    exact list is what keeps its value once the count stops being the point.
+
+    The OTHER clause of the original docstring stands UNCHANGED and is load-bearing for 0003 itself:
+    parity stays 0001-scoped (test_migration_ddl_parity upgrades to `0001_initial_schema`, not head), so
+    0003 is invisible to it and `tests/reference/phase3-ddl.sql` stays pristine."""
     import pathlib  # noqa: PLC0415
 
     root = pathlib.Path(inspect.getfile(repo_mod)).parent.parent.parent.parent
     migrations = sorted(p.name for p in (root / "migrations" / "versions").glob("*.py"))
-    assert len(migrations) == 2, f"this session adds no migration, found {migrations}"
+    assert migrations == [
+        "0001_initial_schema.py",
+        "0002_external_records_stamp.py",
+        "0003_state_transition_triggers.py",
+    ], f"unexpected migration set: {migrations}"

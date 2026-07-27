@@ -240,3 +240,38 @@ def test_registrar_active_version_grant_is_column_scoped(engine, provisioned_rol
         _exec_as(reader, "UPDATE neuro.divergence_measurements SET max_abs_diff = 1 WHERE divergence_id = -1")
         is False
     )
+
+
+def test_writer_out_of_ladder_state_update_is_rejected_by_the_schema(seeded, provisioned_roles, role_url):
+    """★ P-5 (ADR-0046): a bare out-of-ladder UPDATE by the REAL `neuro_writer` role is refused BY THE
+    SCHEMA, not by a missing grant — the distinction the whole 0003 migration exists to make.
+
+    The writer DOES hold `GRANT UPDATE (state, ...) ON jobs` (grants.sql), which is precisely why the
+    software CAS in db/repository.py was bypassable once an untrusted worker connects directly. So the
+    probe must prove two things in one shot: the LEGAL rung succeeds as the writer (the grant is real and
+    this is not a permission test in disguise), and the illegal rung is refused with the TRIGGER'S OWN
+    message.
+
+    ⚠ Deliberately NOT written with `_exec_as`: that helper re-raises anything that is not a permission
+    denial, so a trigger RAISE would surface as a test ERROR rather than an assertion — and per the
+    house VACUOUS-RED law an `error` is not a `failed`, so it would score on the wrong signal in a
+    mutation matrix. This follows the shipped assign-once idiom instead (pytest.raises + assert on the
+    message). It also acts on a REAL seeded row: the sibling role probes target `job_id = -1`, which
+    matches zero rows, and a row-level trigger never fires on an empty result set."""
+    repo, run_id = seeded["repo"], seeded["run_id"]
+    job = repo.enqueue(run_id=run_id, job_key="k#p5-writer")
+    assert repo.state_of(job) == "queued"
+
+    weng = create_engine(role_url(provisioned_roles, "neuro_writer"), future=True)
+    try:
+        # the LEGAL rung: the writer's grant genuinely permits a state UPDATE
+        with weng.begin() as conn:
+            conn.execute(text("UPDATE neuro.jobs SET state = 'claimed' WHERE job_id = :j"), {"j": job})
+        # the ILLEGAL rung: refused in-schema, and the message says which transition
+        with pytest.raises(Exception) as excinfo, weng.begin() as conn:  # noqa: PT011 — message asserted below
+            conn.execute(text("UPDATE neuro.jobs SET state = 'blocked' WHERE job_id = :j"), {"j": job})
+    finally:
+        weng.dispose()
+    assert "illegal job_state transition" in str(excinfo.value).lower()
+    assert "permission denied" not in str(excinfo.value).lower()  # rejected by the TRIGGER, not the grant
+    assert repo.state_of(job) == "claimed"
