@@ -22,6 +22,7 @@ from sqlalchemy import Connection, Engine, text
 
 from .identity import fingerprint_hash as _fingerprint_hash
 from .identity import model_identity_hash
+from .lanes import ConfigurationError
 
 
 class IdentityMismatchError(RuntimeError):
@@ -38,8 +39,53 @@ class ReplicateMismatchError(RuntimeError):
 # thread + reaper loop (the *policy*) are owned by workers/runtime.py; the lease INTERVAL is applied
 # here because this is where the lease SQL lives.
 LEASE_SECONDS = 120
-RENEW_SECONDS = 40
+# The renewal cadence is DERIVED from the lease TTL by its own SAFETY FLOOR, never an independent
+# literal: at least LEASE_RENEW_MIN_ATTEMPTS renewal attempts must fit inside one lease TTL. Two
+# literals would be two implementations of one relationship — and the rot is silent: a later
+# LEASE_SECONDS edit would leave the cadence behind and hand live workers' jobs to the reaper.
+# `resolve_renew_interval` below is the fail-closed authority, and it is what the B-4 renewal thread
+# calls (workers/runtime.py).
+#
+# ⚠ THE MARGIN, STATED EXACTLY (it is NOT `MIN_ATTEMPTS - 1`). After a renewal succeeds at T the lease
+# runs to T+LEASE_SECONDS, and the loop acts-then-waits, so attempts land at T+40, T+80, T+120+ε. Only
+# the first two are STRICTLY inside the lease, and the third is refused by #6a's `expires_at >= now()`.
+# ⇒ at 40/120 exactly **ONE** consecutive lost heartbeat is survivable, not two. Recorded precisely
+# because a module must not overstate its own guarantee: an operator sizing a retry budget against
+# "two" would be sizing against a margin that does not exist. Widening it means a SMALLER divisor of
+# LEASE_SECONDS, which changes the ADR-0039 cadence and is an owner call, not a silent edit.
+LEASE_RENEW_MIN_ATTEMPTS = 3
+RENEW_SECONDS = LEASE_SECONDS // LEASE_RENEW_MIN_ATTEMPTS  # 40 — the ADR-0039 cadence, now derived
 REAPER_SECONDS = 60
+
+
+def resolve_renew_interval() -> int:
+    """The single renewal-cadence resolution point (the `resolve_archiver_probe_interval` /
+    `resolve_backup_stale_after` pin idiom): the renewal interval in seconds, or `ConfigurationError`
+    if it no longer preserves the margin its own derivation promises.
+
+    FAIL CLOSED ON A STATED PROPERTY, not a weaker one. The check is
+    `RENEW_SECONDS * LEASE_RENEW_MIN_ATTEMPTS <= LEASE_SECONDS` — at least LEASE_RENEW_MIN_ATTEMPTS
+    attempts fit inside one lease TTL. A merely `RENEW < LEASE` check would admit 60/120, which leaves
+    only ONE in-lease attempt and NO lost-heartbeat margin at all: that hands a running job to the
+    reaper and manufactures exactly the near-expiry contention ADR-0046 exists to remove.
+
+    ⚠ WHAT THIS DOES **NOT** PROMISE (see the constants block): the surviving margin is
+    LEASE_RENEW_MIN_ATTEMPTS **minus two**, because the last of the fitted attempts lands ON the expiry
+    boundary and #6a refuses it. At the shipped 40/120 that is ONE lost heartbeat, not two. The guard
+    is a floor on the cadence, not a promise about consecutive failures.
+
+    Values are read from the module globals at CALL time, so the guard is live on the real renewal path
+    rather than an import-time assertion (an import-time raise would redden the whole suite as a
+    collection ERROR, which verifies nothing)."""
+    if RENEW_SECONDS <= 0 or RENEW_SECONDS * LEASE_RENEW_MIN_ATTEMPTS > LEASE_SECONDS:
+        raise ConfigurationError(
+            f"lease renewal cadence is unsafe: RENEW_SECONDS={RENEW_SECONDS}s leaves fewer than "
+            f"{LEASE_RENEW_MIN_ATTEMPTS} attempts inside a {LEASE_SECONDS}s lease "
+            f"(db/repository.py) — refusing to run a renewal thread with no lost-heartbeat margin "
+            f"(fail closed). A change is an auditable commit."
+        )
+    return RENEW_SECONDS
+
 
 # A job is claimable only when 'queued'. 'blocked' (unmet deps) and all in-flight/terminal states are
 # excluded by construction — the claim predicate never selects them (C2).
