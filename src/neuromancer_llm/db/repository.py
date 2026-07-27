@@ -1006,28 +1006,15 @@ class Repository:
         depends_on: Sequence[int] = (),
     ) -> int:
         # C20: compute the initial state from the deps' REAL state, never "has deps => blocked forever".
-        # A job enqueued AFTER all its deps already SUCCEEDED is immediately 'queued' (the unblock fires
-        # inside complete(), which already ran). A dep that is TERMINAL-FAILED (dead_letter / cancelled)
-        # can never become 'succeeded', so the dependent can never run -> it is enqueued 'cancelled'
-        # ('failed' is transient/retryable, so it is NOT terminal -> the dependent waits, 'blocked').
+        # ⚠ THE DEP READ, THE CHILD INSERT AND THE EDGE INSERTS MUST STAY IN **THIS ONE** TRANSACTION.
+        # The C20 fix is not the `FOR NO KEY UPDATE` token by itself — it is that the row lock the dep
+        # read takes is still HELD when the child and its edges COMMIT. Hoisting the dep read into its
+        # own `engine.begin()` (a plausible-looking connection-hygiene refactor) releases the lock early
+        # and fully restores the TOCTOU while every behavioural probe stays green, which is why
+        # `tests/redteam/test_rt_locking.py` pins this envelope by AST containment and not merely by the
+        # call existing.
         with self.engine.begin() as conn:
-            if not depends_on:
-                state = "queued"
-            else:
-                dep_states = (
-                    conn.execute(
-                        text("SELECT state FROM neuro.jobs WHERE job_id = ANY(:ids)"),
-                        {"ids": list(depends_on)},
-                    )
-                    .scalars()
-                    .all()
-                )
-                if any(s in ("dead_letter", "cancelled") for s in dep_states):
-                    state = "cancelled"
-                elif len(dep_states) == len(set(depends_on)) and all(s == "succeeded" for s in dep_states):
-                    state = "queued"
-                else:
-                    state = "blocked"
+            state = "queued" if not depends_on else self._initial_state_for_deps(conn, depends_on)
             job_id = conn.execute(
                 text(
                     "INSERT INTO neuro.jobs (job_key, run_id, job_role, shard_key, queue, gpu_class, vram_needed_mb, state) "
@@ -1050,6 +1037,52 @@ class Repository:
                     {"j": job_id, "d": dep},
                 )
             return job_id
+
+    @staticmethod
+    def _initial_state_for_deps(conn, depends_on: Sequence[int]) -> str:
+        """C20's dep-state read — the initial state of a job being enqueued against `depends_on`.
+
+        All deps SUCCEEDED -> 'queued' (the unblock fires inside complete(), which already ran). A dep
+        that is TERMINAL-FAILED (dead_letter / cancelled) can never become 'succeeded', so the dependent
+        can never run -> 'cancelled' ('failed' is transient/retryable, so it is NOT terminal -> the
+        dependent waits, 'blocked'). An unknown/missing dep id falls to 'blocked' via the length guard.
+
+        **ADR-0046 (wedge 3) — `FOR NO KEY UPDATE`.** Unlocked, this read was a TOCTOU: a concurrent
+        `complete(P)` could commit between the read and the child's INSERT, and its dependent-unblock
+        cannot see a child that does not exist yet, so the child committed 'blocked' with NO remaining
+        blocked->queued writer. Locking the dep rows makes the concurrent `complete`/`cancel_cascade`
+        wait for THIS transaction's commit, after which its own fresh statement snapshot sees the child.
+
+        **Lock strength is deliberately NO KEY UPDATE, not UPDATE.** It is the minimum that conflicts
+        with the plain `UPDATE neuro.jobs` those callers issue (which itself takes NO KEY UPDATE, since
+        `state` is not a key column), and — unlike `FOR UPDATE` — it does NOT conflict with the implicit
+        RI `FOR KEY SHARE` that a concurrent `INSERT INTO neuro.job_dependencies` takes on these very
+        rows. `FOR UPDATE` here opened a real jobs<->jobs deadlock against that FK path.
+
+        **`ORDER BY job_id`** keeps acquisition ascending. Every jobs-row acquirer in this file is now
+        ascending by construction (a dependent is enqueued after its parents, so a child's job_id always
+        exceeds its parents'), which is what makes the whole locking pass cycle-free.
+
+        ⚠ VISIBLE SIDE EFFECT, stated not glossed: `claim()` uses `FOR UPDATE SKIP LOCKED`, so while
+        this lock is held a 'queued' dep is SKIPPED by a concurrent claim — `claim()` can return None
+        with a claimable job present, and its lowest-queued-id order is best-effort under concurrency.
+        Nothing is lost or double-claimed (the row stays 'queued' with no lease and is claimed on the
+        next poll), but keep this transaction short: hold time is queue-visibility cost."""
+        dep_states = (
+            conn.execute(
+                text(
+                    "SELECT state FROM neuro.jobs WHERE job_id = ANY(:ids) ORDER BY job_id FOR NO KEY UPDATE"
+                ),
+                {"ids": list(depends_on)},
+            )
+            .scalars()
+            .all()
+        )
+        if any(s in ("dead_letter", "cancelled") for s in dep_states):
+            return "cancelled"
+        if len(dep_states) == len(set(depends_on)) and all(s == "succeeded" for s in dep_states):
+            return "queued"
+        return "blocked"
 
     def state_of(self, job_id: int) -> str:
         with self.engine.connect() as conn:
@@ -1105,28 +1138,39 @@ class Repository:
 
     # --- CAS-guarded, ownership-checked mutations -----------------------------------------------
     def heartbeat(self, *, job_id: int, claim_token: uuid.UUID) -> bool:
-        # R4: the join on jobs requires the job to still be in-flight, so a CANCELLED job's heartbeat
-        # returns False (the worker learns it has been preempted). UPDATE..FROM locks only work_leases
-        # (jobs is read, not locked) — no jobs/leases lock-order conflict with the reaper.
-        #
-        # FIX #6 (a): `l.expires_at >= now()` — a worker can NEVER renew an ALREADY-EXPIRED lease. An
-        # expired lease belongs to the reaper; renewing it was the wedge trigger (a heartbeat landing
-        # during the reaper's sweep renewed the lease while the job was requeued -> queued job + active
-        # lease -> next claim hits work_leases_active_uq -> un-claimable). Now an expired lease's heartbeat
-        # returns False and the reaper alone requeues it.
         with self.engine.begin() as conn:
-            res = conn.execute(
-                text(
-                    "UPDATE neuro.work_leases l SET last_heartbeat = now(), "
-                    "expires_at = now() + make_interval(secs => :lease) "
-                    "FROM neuro.jobs j "
-                    "WHERE l.job_id = :job AND l.claim_token = :tok AND l.released_at IS NULL "
-                    "AND l.expires_at >= now() "
-                    "AND j.job_id = l.job_id AND j.state IN ('claimed', 'running')"
-                ),
-                {"job": job_id, "tok": claim_token, "lease": LEASE_SECONDS},
-            )
-            return res.rowcount == 1
+            return self._renew_lease(conn, job_id=job_id, claim_token=claim_token)
+
+    @staticmethod
+    def _renew_lease(conn, *, job_id: int, claim_token: uuid.UUID) -> bool:
+        """The lease-renewal statement itself (heartbeat's body, on a caller-supplied connection).
+
+        R4: the join on jobs requires the job to still be in-flight, so a CANCELLED job's heartbeat
+        returns False (the worker learns it has been preempted). UPDATE..FROM locks only work_leases
+        (jobs is read, not locked) — no jobs/leases lock-order conflict with the reaper.
+
+        FIX #6 (a): `l.expires_at >= now()` — a worker can NEVER renew an ALREADY-EXPIRED lease. An
+        expired lease belongs to the reaper; renewing it was the wedge trigger (a heartbeat landing
+        during the reaper's sweep renewed the lease while the job was requeued -> queued job + active
+        lease -> next claim hits work_leases_active_uq -> un-claimable). Now an expired lease's
+        heartbeat returns False and the reaper alone requeues it.
+
+        ⚑ Split out from `heartbeat` so the ADR-0046 near-expiry hammer can hold this statement's row
+        lock open across a latch while driving the REAL SQL. A hammer that re-implements the statement
+        it is proving would be a fabricated green (precedent 14); `_cascade_cancel` is the file's
+        shipped precedent for a connection-taking helper."""
+        res = conn.execute(
+            text(
+                "UPDATE neuro.work_leases l SET last_heartbeat = now(), "
+                "expires_at = now() + make_interval(secs => :lease) "
+                "FROM neuro.jobs j "
+                "WHERE l.job_id = :job AND l.claim_token = :tok AND l.released_at IS NULL "
+                "AND l.expires_at >= now() "
+                "AND j.job_id = l.job_id AND j.state IN ('claimed', 'running')"
+            ),
+            {"job": job_id, "tok": claim_token, "lease": LEASE_SECONDS},
+        )
+        return res.rowcount == 1
 
     def checkpoint(self, *, job_id: int, claim_token: uuid.UUID, checkpoint_ref: str) -> bool:
         with self.engine.begin() as conn:
@@ -1158,21 +1202,66 @@ class Repository:
                 ),
                 {"job": job_id, "tok": claim_token},
             )
-            conn.execute(
-                text(
-                    """
-                    UPDATE neuro.jobs j SET state = 'queued', updated_at = now()
-                     WHERE j.state = 'blocked'
-                       AND j.job_id IN (SELECT job_id FROM neuro.job_dependencies WHERE depends_on = :job)
-                       AND NOT EXISTS (
-                           SELECT 1 FROM neuro.job_dependencies d
-                             JOIN neuro.jobs dep ON dep.job_id = d.depends_on
-                            WHERE d.job_id = j.job_id AND dep.state <> 'succeeded')
-                    """
-                ),
-                {"job": job_id},
-            )
+            self._unblock_ready_dependents(conn, job_id)
             return True
+
+    @staticmethod
+    def _unblock_ready_dependents(conn, job_id: int) -> None:
+        """Flip this job's now-ready dependents 'blocked' -> 'queued' (the C2 AND-gate).
+
+        **ADR-0046 §6 — the dependent-unblock WRITE-SKEW.** Two parents of one AND-gated child running
+        `complete()` concurrently at READ COMMITTED each evaluated the NOT-EXISTS predicate against a
+        snapshot excluding the other's uncommitted 'succeeded', so each SKIPPED the child — and the skip
+        path touches no row (the qual is evaluated in the scan Filter below ModifyTable, so a row that
+        fails it is never locked), giving no conflict and no EvalPlanQual recheck. The child was
+        stranded 'blocked' forever; the only other blocked->queued writer is enqueue-time C20.
+        ⚠ An isolation bump does NOT fix write-skew — ADR-0046 §6 says so in its own text.
+
+        THE FIX IS TWO STATEMENTS, AND BOTH PROPERTIES ARE LOAD-BEARING:
+
+        1. **The lock is taken on the CANDIDATE set, never the READY set.** The locking SELECT below
+           carries NO readiness predicate on purpose. Move the NOT-EXISTS into it and the losing parent
+           selects zero rows, locks NOTHING, and the write-skew survives with a `FOR NO KEY UPDATE`
+           sitting right there looking like a fix.
+        2. **The lock and the unblock must stay SEPARATE `conn.execute` calls.** Fusing them into one
+           data-modifying CTE would put both under ONE snapshot, so the NOT-EXISTS would again be
+           evaluated against a pre-commit view of the sibling parent and the skew would survive. (The
+           shipped code was a single statement, so "collapse these two" reads as a strict improvement —
+           which is exactly why it is written down here and mutation-pinned.)
+
+        Serialisation: whichever parent locks the child first necessarily commits first (the blocked
+        contender cannot commit before its blocker), so the LAST holder of the child lock runs the
+        UPDATE under a fresh per-statement snapshot that includes every earlier parent's commit plus
+        its own write. `ORDER BY j.job_id` keeps acquisition ascending, consistent with every other
+        jobs-row acquirer in this file.
+
+        ⚠ The UPDATE deliberately keeps its OWN dep-subquery predicate rather than being narrowed to
+        the locked id set: a child that materialises between the two statements must still be unblocked,
+        and narrowing would make this fix silently depend on `_initial_state_for_deps`'s lock to be
+        correct. Locking is this statement's job; deciding readiness is the UPDATE's."""
+        conn.execute(
+            text(
+                "SELECT j.job_id FROM neuro.jobs j "
+                " WHERE j.state = 'blocked' "
+                "   AND j.job_id IN (SELECT job_id FROM neuro.job_dependencies WHERE depends_on = :job) "
+                " ORDER BY j.job_id FOR NO KEY UPDATE"
+            ),
+            {"job": job_id},
+        )
+        conn.execute(
+            text(
+                """
+                UPDATE neuro.jobs j SET state = 'queued', updated_at = now()
+                 WHERE j.state = 'blocked'
+                   AND j.job_id IN (SELECT job_id FROM neuro.job_dependencies WHERE depends_on = :job)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM neuro.job_dependencies d
+                         JOIN neuro.jobs dep ON dep.job_id = d.depends_on
+                        WHERE d.job_id = j.job_id AND dep.state <> 'succeeded')
+                """
+            ),
+            {"job": job_id},
+        )
 
     def fail_permanent(self, *, job_id: int, claim_token: uuid.UUID, detail: str) -> bool:
         """Dead-letter a permanent failure (CAS + ownership), then cascade-cancel its dependents.
@@ -1203,6 +1292,26 @@ class Repository:
 
     def cancel_cascade(self, job_id: int) -> int:
         with self.engine.begin() as conn:
+            # ADR-0046 (wedge 3's SIBLING vector): take the SEED's row lock in its OWN statement first.
+            # `_cascade_cancel` is a single statement whose recursive `deps` CTE is materialised under
+            # ONE snapshot, and EvalPlanQual re-checks only the TARGET row's qual — never the CTE — so a
+            # dependent enqueued concurrently is absent from `deps` and is stranded 'blocked' against a
+            # 'cancelled' parent FOREVER (no blocked->queued writer can ever reach it: complete() needs
+            # 'succeeded', and enqueue-time C20 only runs for a brand-new job). The seed lock makes the
+            # concurrent enqueue commit FIRST, so the cascade statement's snapshot sees the new edge.
+            # ⚑ `fail_permanent` needs no such lock for the SAME vector: its cascade is already a SECOND
+            # statement after the dead-letter UPDATE, so it takes a fresh snapshot for free.
+            # ⚠ SCOPE, STATED NOT GLOSSED: this closes the vector where the concurrent enqueue names the
+            # SEED. An enqueue naming an INTERMEDIATE node of the cascade set locks that node instead, and
+            # the `deps` CTE is still materialised under a snapshot fixed before LockRows blocks — so a
+            # depth>=2 dependent can still be stranded. That hole is PRE-EXISTING (nothing serialised any
+            # of this before) and is strictly NARROWED, not introduced, here; closing it needs the whole
+            # cascade set locked before the CTE is computed, which is a REGISTERED FOLLOW-ON, not this
+            # unit. The same residual applies to `fail_permanent`.
+            conn.execute(
+                text("SELECT job_id FROM neuro.jobs WHERE job_id = :j FOR NO KEY UPDATE"),
+                {"j": job_id},
+            )
             return self._cascade_cancel(conn, job_id, include_self=True)
 
     @staticmethod
@@ -1217,18 +1326,45 @@ class Repository:
             else ("job_id FROM neuro.job_dependencies WHERE depends_on = :job")
         )
         # jobs FIRST (consistent jobs-before-leases lock order, R5).
-        sql = (
+        deps_cte = (
             "WITH RECURSIVE deps AS ("
             + (f"  SELECT {seed} AS job_id" if include_self else f"  SELECT {seed}")
             + "  UNION "
             "  SELECT d.job_id FROM neuro.job_dependencies d JOIN deps ON d.depends_on = deps.job_id"
             ") "
+        )
+        # ADR-0046: LOCK the target jobs rows in ASCENDING job_id order BEFORE updating them. An UPDATE
+        # cannot carry an ORDER BY, so the shipped single statement acquired its row locks in PLAN order
+        # (heap order under the measured Seq Scan) — the ONE jobs-row acquirer in this file with no
+        # deterministic order. Harmless while nothing else locked jobs rows; once `_initial_state_for_deps`
+        # takes an ascending lock (wedge 3) that un-ordered acquisition closes a real jobs<->jobs cycle,
+        # REPRODUCED as a PostgreSQL `DeadlockDetected` in the pre-build vet against a live postgres:18,
+        # with a clean pre-fix control on the identical schedule. The pre-lock makes EVERY jobs-row
+        # acquirer here ascending, so no cycle can form.
+        locked = (
+            conn.execute(
+                text(
+                    deps_cte + "SELECT j.job_id FROM neuro.jobs j "
+                    "WHERE j.job_id IN (SELECT job_id FROM deps) "
+                    "  AND j.state NOT IN ('succeeded', 'cancelled', 'dead_letter') "
+                    "ORDER BY j.job_id FOR NO KEY UPDATE"
+                ),
+                {"job": job_id},
+            )
+            .scalars()
+            .all()
+        )
+        if not locked:
+            return 0
+        # The state predicate is re-asserted as a belt: the rows are already locked, so it can only be a
+        # no-op here — but a locked-set UPDATE with no qual would silently widen if the lock ever moved.
+        sql = (
             "UPDATE neuro.jobs SET state = 'cancelled', updated_at = now() "
-            "WHERE job_id IN (SELECT job_id FROM deps) "
+            "WHERE job_id = ANY(:ids) "
             "  AND state NOT IN ('succeeded', 'cancelled', 'dead_letter') "
             "RETURNING job_id"
         )
-        cancelled = [r[0] for r in conn.execute(text(sql), {"job": job_id}).all()]
+        cancelled = [r[0] for r in conn.execute(text(sql), {"ids": locked}).all()]
         # R4: release any active lease the cancelled (possibly in-flight) jobs held — otherwise the
         # cancelled worker heartbeats forever and the lease never frees. Leases AFTER jobs.
         if cancelled:
@@ -1246,57 +1382,99 @@ class Repository:
         """Requeue jobs whose lease expired. Clearing claim_token + bumping claim_seq fences the
         original (now-dead) claimant: its stale token no longer matches, so its complete() CAS fails.
 
-        FIX #6 (b): the requeue AND the lease-release are ONE atomic statement (a data-modifying CTE chain),
-        so within THIS transaction the two halves can never straddle a concurrent heartbeat. Combined with
-        the heartbeat's `expires_at >= now()` guard (#6a), this closes the ORIGINAL wedge vector — but NOT the
-        residual near-expiry one below; it is no longer claimed to close the wedge entirely.
+        FIX #6 (b) IS SUPERSEDED BY THE ROW LOCK BELOW — recorded because it is the derivation, not because
+        it still describes this method. It made the requeue and the lease-release ONE atomic statement (a
+        data-modifying CTE chain); the shipped body is now FOUR statements over one locked set, which gives
+        the same guarantee structurally instead of relying on statement atomicity.
 
         BLOCK-2 finding (2026-06-28), CORRECTED by Panel #2 (2026-06-29): #6a (the heartbeat
         `expires_at >= now()` guard) is the LOAD-BEARING fix and closes the ORIGINAL vector — a dead worker's
         heartbeat renewing an ALREADY-EXPIRED lease mid-reap, which #6a unconditionally refuses. A hand-driven
         heartbeat-at-the-midpoint of the two-statement reaper does NOT wedge with #6a present and DOES wedge
-        with #6a removed (verified); #6b is correct DEFENSE-IN-DEPTH for that vector — SUBSUMED by #6a (no
-        distinct observable failure mode), so it is kept but NOT probe-pinned.
+        with #6a removed (verified). #6a REMAINS in `_renew_lease` and remains load-bearing.
 
-        RESIDUAL — near-expiry renewal vs the reaper (NOT closed by #6a OR #6b; empirically reproduced
-        2026-06-29): a heartbeat renewing a NOT-yet-expired lease at its OWN txn `now()` (so #6a ALLOWS it)
-        can commit AFTER the reaper's LATER `now()` reads the same lease as expired. The reaper's `requeued`
-        CTE sees the lease expired at the statement snapshot and sets the job `queued`, while the `released`
-        CTE re-evaluates the now-renewed lease (EvalPlanQual, after the heartbeat committed) as no-longer-
-        expired and skips it -> `queued` job + an active, unreleased lease -> the next `claim()` hits
-        `work_leases_active_uq` -> an un-claimable wedge. BOTH reaper forms wedge identically here, so #6b
-        does not close it either. This residual is reachable only under the DEFERRED concurrent renewal-loop
-        topology (`workers/runtime.py`); it is the READ COMMITTED class whose structural fix (`FOR UPDATE` on
-        the contended lease row, or `SERIALIZABLE`) is ADR-0046 (OPEN). #6a + #6b remain the regression net
-        for the original vector.
+        ★ THE RESIDUAL IS CLOSED (ADR-0046 wedge 1, this session) — the history is kept because it is the
+        derivation. WAS: a heartbeat renewing a NOT-yet-expired lease at its OWN txn `now()` (so #6a ALLOWS
+        it) could commit AFTER the reaper's LATER `now()` had read the same lease as expired. The two-CTE
+        form's `requeued` CTE saw the lease expired at the statement snapshot and set the job `queued`,
+        while the `released` CTE re-evaluated the now-renewed lease under EvalPlanQual as no-longer-expired
+        and SKIPPED the release -> `queued` job + an active, unreleased lease -> the next `claim()` hits
+        `work_leases_active_uq` -> an un-claimable wedge. Both CTE forms wedged identically, so #6b did not
+        close it; it needed the row lock. Reachable only under a concurrent renewal LOOP, which is why the
+        fix lands with B-4 (`workers/runtime.py`) and not before — the hammer had no concurrent target.
 
-        R5 (deadlock-free): jobs-before-leases lock order is preserved — the `requeued` CTE updates `jobs`
-        first (and the `released` CTE consumes its output, so it runs after), then releases the leases.
-        complete() / fail_permanent() / _cascade_cancel() all lock jobs before leases too: no lock cycle."""
+        THE FIX — ONE LOCKED READ DECIDES BOTH HALVES. Four statements in one transaction:
+          1. lock the candidate JOBS rows (`ORDER BY j.job_id FOR NO KEY UPDATE`);
+          2. lock the LEASE rows and RE-READ expiry UNDER that lock — `FOR NO KEY UPDATE` makes
+             EvalPlanQual re-apply the WHERE to the NEWEST row version, so a lease renewed in the interim
+             is EXCLUDED HERE rather than requeued now and skipped later;
+          3. requeue exactly step 2's set;  4. release exactly step 2's set.
+        Requeue-set == release-set == step 2's set, and both relations are locked before either write, so
+        the two halves can never disagree and the wedge signature is unreachable.
+
+        ⚠ STEP 1 IS NOT OPTIONAL. A lease-only lock would make the reaper leases-then-jobs against
+        complete()/fail_permanent()/_cascade_cancel()'s jobs-then-leases — the plan's named "lock-order
+        deadlock from a piecemeal lease-only FOR UPDATE" risk. `heartbeat` stays leases-only (its
+        `UPDATE..FROM` locks only its target), so it cannot enter a cycle.
+
+        ⚠ LOCK STRENGTH IS `NO KEY UPDATE`, NOT `UPDATE`. That is exactly what the shipped UPDATEs already
+        took (none of the columns written here is a key column), so it is strength-preserving; `FOR UPDATE`
+        would newly conflict with the implicit RI `FOR KEY SHARE` that `INSERT INTO neuro.job_dependencies`
+        takes on these same jobs rows, opening a deadlock this method never had.
+
+        ⚠ STEPS 3 AND 4 KEEP THEIR FULL PREDICATES. Under the lock they can only be no-ops — but they are
+        what makes dropping step 2's lock OBSERVABLE (without them, a mutated step 2 still releases the
+        renewed lease and the wedge never appears, so the fix's central lock would be unpinned).
+
+        R5 (deadlock-free): jobs-before-leases lock order is preserved — steps 1+3 touch `jobs`, steps 2+4
+        touch `work_leases`. complete() / fail_permanent() / _cascade_cancel() / enqueue lock jobs first
+        too, and every jobs-row acquirer in this file is now ASCENDING by job_id: no lock cycle."""
         with self.engine.begin() as conn:
-            requeued = (
+            candidates = (
                 conn.execute(
                     text(
-                        "WITH requeued AS ("
-                        "  UPDATE neuro.jobs j SET state = 'queued', claim_token = NULL, claimed_by = NULL, "
-                        "    claim_seq = claim_seq + 1, expiry_count = expiry_count + 1, updated_at = now() "
-                        "  WHERE j.state IN ('claimed', 'running') AND EXISTS ("
-                        "    SELECT 1 FROM neuro.work_leases l "
+                        "SELECT j.job_id FROM neuro.jobs j "
+                        " WHERE j.state IN ('claimed', 'running') AND EXISTS ("
+                        "   SELECT 1 FROM neuro.work_leases l "
                         "    WHERE l.job_id = j.job_id AND l.released_at IS NULL AND l.expires_at < now()) "
-                        "  RETURNING j.job_id"
-                        "), released AS ("
-                        "  UPDATE neuro.work_leases l SET released_at = now() "
-                        "  WHERE l.job_id IN (SELECT job_id FROM requeued) "
-                        "    AND l.released_at IS NULL AND l.expires_at < now() "
-                        "  RETURNING l.job_id"
-                        ") "
-                        "SELECT job_id FROM requeued"
+                        " ORDER BY j.job_id FOR NO KEY UPDATE"
                     )
                 )
                 .scalars()
                 .all()
             )
-            return len(requeued)
+            if not candidates:
+                return 0  # the common sweep: nothing expired, no further statements
+            expired = (
+                conn.execute(
+                    text(
+                        "SELECT l.job_id FROM neuro.work_leases l "
+                        " WHERE l.job_id = ANY(:ids) AND l.released_at IS NULL AND l.expires_at < now() "
+                        " ORDER BY l.job_id FOR NO KEY UPDATE"
+                    ),
+                    {"ids": list(candidates)},
+                )
+                .scalars()
+                .all()
+            )
+            if not expired:
+                return 0  # every candidate's lease was renewed under our nose — nothing to reap
+            requeued = conn.execute(
+                text(
+                    "UPDATE neuro.jobs j SET state = 'queued', claim_token = NULL, claimed_by = NULL, "
+                    "  claim_seq = claim_seq + 1, expiry_count = expiry_count + 1, updated_at = now() "
+                    " WHERE j.job_id = ANY(:ids) AND j.state IN ('claimed', 'running')"
+                ),
+                {"ids": list(expired)},
+            ).rowcount
+            conn.execute(
+                text(
+                    "UPDATE neuro.work_leases l SET released_at = now() "
+                    " WHERE l.job_id = ANY(:ids) AND l.released_at IS NULL AND l.expires_at < now()"
+                ),
+                {"ids": list(expired)},
+            )
+            return requeued
 
     def expire_lease_now(self, job_id: int) -> None:
         """Test hook: force a lease to be already-expired so the reaper picks it up deterministically
