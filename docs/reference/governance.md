@@ -30,9 +30,9 @@ _49 ADRs._
 - Accepted (from pole A): 2
 - Accepted (from pole A, resize NOT adopted): 1
 - Accepted (schema) / Reserved-seam (code): 1
+- Accepted — COMPLETE: targeted row-locking (C1), the in-schema state guards (C2), and the worker/registrar role split with both column-immutability arms (C3, 2026-08-01) are all IMPLEMENTED: 1
 - Accepted — Phase 5 red-team correction (FIX #1 + #7): 1
 - Accepted — no code change (ADR-accept #3): 1
-- Accepted — targeted row-locking IMPLEMENTED (sessions C1/C2, 2026-07-27); the worker/registrar role split and its two column-immutability arms remain open: 1
 - Author-discretion — **RESOLVED 2026-06-16, owner ACCEPTED** (no longer an open DoF): 2
 - Layer (a) BUILT 2026-07-14 (drift-guard landed); layer (b) owner-scoped keys still deferred (ADR-accept #5): 1
 - Reserved-seam: 6
