@@ -176,7 +176,17 @@ def test_rt_ladder_is_walkable_statement_by_statement(seeded):
     holding GRANT UPDATE (state, ...) marks a job succeeded with no claim_token, no lease and no work.
     0003 does NOT close that; the role split does. This probe asserts the residual EXISTS so the guarantee
     can never be silently over-claimed — if a future unit really closes it, this test reddens and its
-    author is forced to update the claim rather than quietly inherit a stale one."""
+    author is forced to update the claim rather than quietly inherit a stale one.
+
+    ★ STILL TRUE AFTER ADR-0046 SESSION C3, AND DELIBERATELY SO — the probe is unchanged, its SCOPE is now
+    stated. C3 revoked `UPDATE (state, ...) ON jobs` from `neuro_writer`, so no untrusted worker can walk
+    this ladder any more. It runs on `repo.engine`, i.e. as ADMIN, which holds the grant **by nature** and
+    always will: an admin can rewrite any row in the schema, and pretending otherwise would be the
+    over-claim this pin exists to prevent. So the residual it names is now ROLE-SCOPED — walkable as admin,
+    closed for the writer — and that is the strongest true statement available.
+    The writer-side half is `tests/redteam/test_rt_role_split.py`, which proves BOTH that the raw ladder is
+    permission-denied AND that a narrower residual survives there (claim_job + complete_job still reaches
+    'succeeded' with no work, attributably)."""
     repo, run_id = seeded["repo"], seeded["run_id"]
     with repo.engine.begin() as conn:
         j = _job(conn, run_id, key="k#walk", state="queued")

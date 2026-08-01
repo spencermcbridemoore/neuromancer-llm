@@ -17,15 +17,38 @@ pytestmark = pytest.mark.pg
 
 
 def test_rt_writer_column_update_boundary(provisioned_roles, role_url, rt):
-    """L7 (C3): as neuro_writer, the GRANTED lifecycle/lease columns UPDATE; the identity / integrity / wire
+    """L7 (C3): as neuro_writer, the GRANTED lifecycle columns UPDATE; the identity / integrity / wire
     columns are DENIED. A grant widened to all columns on artifacts would let a worker rewrite sha256/uri
-    (an L6 sin) — this pins the exact boundary."""
+    (an L6 sin) — this pins the exact boundary.
+
+    ★ THREE ASSERTIONS INVERTED AT ADR-0046 C3, and the inversion IS the unit's headline. `neuro.jobs` and
+    `neuro.work_leases` were in the GRANTED half here, which is exactly what made 0003's state ladder
+    WALKABLE — `queued -> claimed -> succeeded` in two legal hops with no token, no lease and no work. The
+    role split revokes the whole jobs UPDATE and the whole work_leases INSERT+UPDATE, and returns that
+    capability as five SECURITY DEFINER entry points instead. `runs.fingerprint_id` goes the same way (the
+    identity-adjacent adoption column, which nothing in src/ writes).
+
+    These are the assertions that would have gone stale SILENTLY if the grants had changed without them:
+    they asserted a positive, so a revocation reddens them loudly rather than leaving a weaker gate green.
+    The positive half now lives in `test_rt_role_split.py`, against the functions."""
     w = role_url(provisioned_roles, "neuro_writer")
-    # GRANTED (operational lifecycle / lease / tombstone-state)
-    assert rt.exec_as(w, "UPDATE neuro.jobs SET state='queued' WHERE job_id=-1") is True
-    assert rt.exec_as(w, "UPDATE neuro.work_leases SET last_heartbeat=now() WHERE job_id=-1") is True
+    # GRANTED (operational lifecycle / tombstone-state) — the surface the writer legitimately still owns
     assert rt.exec_as(w, "UPDATE neuro.artifacts SET deleted_at=now() WHERE artifact_id=-1") is True
     assert rt.exec_as(w, "UPDATE neuro.bundles SET state='sealed' WHERE bundle_id=-1") is True
+    assert rt.exec_as(w, "UPDATE neuro.runs SET finalized_at=now() WHERE run_id=-1") is True
+    # ★ REVOKED at C3 — the walking kit and the lease surface, now reachable only through the functions
+    assert rt.exec_as(w, "UPDATE neuro.jobs SET state='queued' WHERE job_id=-1") is False
+    assert rt.exec_as(w, "UPDATE neuro.jobs SET claim_token=claim_token WHERE job_id=-1") is False
+    assert rt.exec_as(w, "UPDATE neuro.work_leases SET last_heartbeat=now() WHERE job_id=-1") is False
+    assert (
+        rt.exec_as(
+            w,
+            "INSERT INTO neuro.work_leases (job_id, claim_token, leased_by) "
+            "VALUES (-1, gen_random_uuid(), -1)",
+        )
+        is False
+    )
+    assert rt.exec_as(w, "UPDATE neuro.runs SET fingerprint_id=fingerprint_id WHERE run_id=-1") is False
     # DENIED (identity / integrity / wire bytes / non-granted columns). Self-reference (SET col=col) keeps
     # the value well-typed so the PERMISSION check is what fails, not a type cast.
     assert rt.exec_as(w, "UPDATE neuro.artifacts SET sha256=sha256 WHERE artifact_id=-1") is False

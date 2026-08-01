@@ -115,11 +115,18 @@ def test_rt_migrated_schema_is_complete(engine):
                 "WHERE n.nspname='neuro' AND p.proname='assert_assign_once'"
             )
         ).scalar_one()
-        has_trigger = conn.execute(
+        # ⚠ NAME-SCOPED, NOT `LIKE '%assign_once%'`. It WAS the LIKE, asserting == 1, and migration 0004
+        # adds a SECOND assign-once trigger (bundles_manifest_assign_once) that the pattern matches — so the
+        # LIKE form reddens. The fix is NOT to bump the count to 2: a LIKE-scoped count is satisfied by ANY
+        # two matching triggers, so bumping it would silently destroy the net (a dropped
+        # runs_fingerprint_assign_once could then hide behind an unrelated future `*_assign_once`). Pinning
+        # both BY NAME is the same idiom the 0003 block below already uses, for the same reason.
+        assign_once_triggers = conn.execute(
             text(
                 "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
                 "JOIN pg_namespace n ON n.oid=c.relnamespace "
-                "WHERE n.nspname='neuro' AND NOT t.tgisinternal AND t.tgname LIKE '%assign_once%'"
+                "WHERE n.nspname='neuro' AND NOT t.tgisinternal AND t.tgname IN "
+                "('runs_fingerprint_assign_once', 'bundles_manifest_assign_once')"
             )
         ).scalar_one()
         # 0003 (ADR-0046 P-4): the jobs/bundles state-CAS guards + the capture_events.model_id bind.
@@ -139,6 +146,27 @@ def test_rt_migrated_schema_is_complete(engine):
                 "WHERE n.nspname='neuro' AND NOT t.tgisinternal AND t.tgname IN "
                 "('jobs_state_transition', 'bundles_state_transition', 'bundles_state_insert', "
                 "'capture_events_model_bind')"
+            )
+        ).scalar_one()
+        # 0004 (ADR-0046 C3): the SECURITY DEFINER queue surface + the fencing trigger function. Same
+        # name-scoped idiom. The five DEFINER entry points, the two INVOKER internals, and the fencing
+        # trigger function — `assert_bundle_insert_state` is deliberately ABSENT from this list because
+        # 0004 REPLACES 0003's function rather than adding one, so it is counted by `c2_fns` below and the
+        # object total does not move.
+        c3_fns = conn.execute(
+            text(
+                "SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace "
+                "WHERE n.nspname='neuro' AND p.proname IN ('claim_job', 'renew_lease', 'checkpoint_job', "
+                "'complete_job', 'fail_job_permanent', 'unblock_ready_dependents', 'cascade_cancel_jobs', "
+                "'assert_job_claim_fencing')"
+            )
+        ).scalar_one()
+        c3_triggers = conn.execute(
+            text(
+                "SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace "
+                "WHERE n.nspname='neuro' AND NOT t.tgisinternal AND t.tgname IN "
+                "('jobs_claim_fencing', 'bundles_manifest_assign_once')"
             )
         ).scalar_one()
         core = (
@@ -168,11 +196,17 @@ def test_rt_migrated_schema_is_complete(engine):
             .scalars()
             .all()
         )
-    # 0003 adds NEITHER a table NOR an enum (its guards are functions + triggers), so these two do not
-    # move — the `call_failures` satellite was declined from 0003 for exactly that reason (it adds a TABLE).
+    # NEITHER 0003 NOR 0004 adds a table or an enum (their objects are functions + triggers), so these two
+    # do not move — the `call_failures` satellite was declined from 0003 for exactly that reason (it adds a
+    # TABLE), and 0004 adds no column either. Asserted rather than assumed, both times.
     assert tables == 45, f"expected 45 neuro tables, got {tables}"
     assert enums == 13, f"expected 13 neuro enums, got {enums}"
-    assert has_fn == 1 and has_trigger == 1  # the in-schema assign-once guard is materialized
+    assert has_fn == 1  # the ONE reusable assign-once function (0001), still one implementation
+    assert assign_once_triggers == 2, (  # runs.fingerprint_id (0001) + bundles.manifest_sha256 (0004)
+        f"expected both assign-once triggers by name, got {assign_once_triggers}"
+    )
     assert c2_fns == 4, f"expected 4 migration-0003 guard functions, got {c2_fns}"
     assert c2_triggers == 4, f"expected 4 migration-0003 guard triggers, got {c2_triggers}"
+    assert c3_fns == 8, f"expected 8 migration-0004 role-split functions, got {c3_fns}"
+    assert c3_triggers == 2, f"expected 2 migration-0004 triggers, got {c3_triggers}"
     assert len(core) == 16  # every core table is present

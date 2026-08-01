@@ -1100,41 +1100,43 @@ class Repository:
 
     # --- claim: SKIP LOCKED + fencing + lease (one transaction) ---------------------------------
     def claim(self, *, actor_id: int, queue: str = "default", gpu_class: str | None = None) -> Claim | None:
-        token = uuid.uuid4()
+        """Claim the lowest-id queued job, fencing it and opening its lease — ATOMICALLY, in the schema.
+
+        ★ ADR-0046 C3: the SQL this method used to hold now lives in `neuro.claim_job` (SECURITY DEFINER,
+        migration 0004) and this method is its CALLER. That is the whole point of the role split — the
+        statement is one an untrusted `neuro_writer` can invoke but cannot rewrite, because the grant that
+        let it write `state`/`claim_token`/`claim_seq`/`claimed_by` directly is REVOKED (db/sql/grants.sql).
+        Keeping a second copy of the statement here would be the drift bug the split exists to prevent, so
+        there is exactly one implementation and it is the function's.
+
+        The `FOR UPDATE SKIP LOCKED` hot path is preserved verbatim inside it (§A·56 puts it explicitly out
+        of scope for the ADR-0046 locking pass), as is the lease INSERT that must land in the same
+        transaction. `p_lease_seconds` is PASSED, never hard-coded in the migration: `LEASE_SECONDS` stays
+        the single source of truth for the TTL that `resolve_renew_interval` derives the ADR-0039 renewal
+        cadence from.
+
+        ⚠ The claim token is now minted by `gen_random_uuid()` inside the function rather than by
+        `uuid.uuid4()` here — a deliberate hardening, not an accident of the move: the token is the
+        capability the whole split hangs on, so the database mints it and the caller cannot choose it."""
         with self.engine.begin() as conn:
             row = (
                 conn.execute(
                     text(
-                        """
-                    UPDATE neuro.jobs
-                       SET state = 'claimed', claim_token = :tok, claim_seq = claim_seq + 1,
-                           claimed_by = :actor, updated_at = now()
-                     WHERE job_id = (
-                         SELECT job_id FROM neuro.jobs
-                          WHERE state = 'queued' AND queue = :queue
-                            AND (CAST(:gpu AS text) IS NULL OR gpu_class IS NOT DISTINCT FROM :gpu)
-                          ORDER BY job_id
-                          FOR UPDATE SKIP LOCKED
-                          LIMIT 1
-                     )
-                    RETURNING job_id, claim_token, claim_seq
-                    """
+                        "SELECT out_job_id, out_claim_token, out_claim_seq "
+                        "FROM neuro.claim_job(:actor, :queue, :gpu, :lease)"
                     ),
-                    {"tok": token, "actor": actor_id, "queue": queue, "gpu": gpu_class},
+                    {"actor": actor_id, "queue": queue, "gpu": gpu_class, "lease": LEASE_SECONDS},
                 )
                 .mappings()
                 .first()
             )
             if row is None:
                 return None
-            conn.execute(
-                text(
-                    "INSERT INTO neuro.work_leases (job_id, claim_token, leased_by, expires_at) "
-                    "VALUES (:job, :tok, :actor, now() + make_interval(secs => :lease))"
-                ),
-                {"job": row["job_id"], "tok": row["claim_token"], "actor": actor_id, "lease": LEASE_SECONDS},
+            return Claim(
+                job_id=row["out_job_id"],
+                claim_token=row["out_claim_token"],
+                claim_seq=row["out_claim_seq"],
             )
-            return Claim(job_id=row["job_id"], claim_token=row["claim_token"], claim_seq=row["claim_seq"])
 
     # --- CAS-guarded, ownership-checked mutations -----------------------------------------------
     def heartbeat(self, *, job_id: int, claim_token: uuid.UUID) -> bool:
@@ -1158,137 +1160,80 @@ class Repository:
         ⚑ Split out from `heartbeat` so the ADR-0046 near-expiry hammer can hold this statement's row
         lock open across a latch while driving the REAL SQL. A hammer that re-implements the statement
         it is proving would be a fabricated green (precedent 14); `_cascade_cancel` is the file's
-        shipped precedent for a connection-taking helper."""
-        res = conn.execute(
-            text(
-                "UPDATE neuro.work_leases l SET last_heartbeat = now(), "
-                "expires_at = now() + make_interval(secs => :lease) "
-                "FROM neuro.jobs j "
-                "WHERE l.job_id = :job AND l.claim_token = :tok AND l.released_at IS NULL "
-                "AND l.expires_at >= now() "
-                "AND j.job_id = l.job_id AND j.state IN ('claimed', 'running')"
-            ),
-            {"job": job_id, "tok": claim_token, "lease": LEASE_SECONDS},
+        shipped precedent for a connection-taking helper.
+
+        ★ ADR-0046 C3: the statement itself moved into `neuro.renew_lease` (SECURITY DEFINER, migration
+        0004) and this stays its caller. **The connection-taking shape is PRESERVED DELIBERATELY** — a
+        function call runs inside the caller's transaction, so the row lock the renewal takes is still held
+        by `conn` across the hammer's latch, and `test_rt_near_expiry_renewal_vs_reaper_no_wedge` drives
+        the production statement unchanged, with no edit to the hammer."""
+        return bool(
+            conn.execute(
+                text("SELECT neuro.renew_lease(:job, :tok, :lease)"),
+                {"job": job_id, "tok": claim_token, "lease": LEASE_SECONDS},
+            ).scalar_one()
         )
-        return res.rowcount == 1
 
     def checkpoint(self, *, job_id: int, claim_token: uuid.UUID, checkpoint_ref: str) -> bool:
+        """Record the A4 resume pointer (CAS + ownership).
+
+        ★ ADR-0046 C3: moved to `neuro.checkpoint_job`. This verb was NOT in the C3 charter's list of four,
+        and it had to move anyway — it writes `state = 'running'`, so leaving it in Python would have made
+        revoking `UPDATE (state) ON jobs` impossible. Enumerating the writers, rather than taking the four
+        as given, is what surfaced it."""
         with self.engine.begin() as conn:
-            res = conn.execute(
-                text(
-                    "UPDATE neuro.jobs SET state = 'running', checkpoint_ref = :ref, updated_at = now() "
-                    "WHERE job_id = :job AND claim_token = :tok AND state IN ('claimed', 'running')"
-                ),
-                {"job": job_id, "tok": claim_token, "ref": checkpoint_ref},
+            return bool(
+                conn.execute(
+                    text("SELECT neuro.checkpoint_job(:job, :tok, :ref)"),
+                    {"job": job_id, "tok": claim_token, "ref": checkpoint_ref},
+                ).scalar_one()
             )
-            return res.rowcount == 1
 
     def complete(self, *, job_id: int, claim_token: uuid.UUID) -> bool:
-        """Succeed a job (CAS + ownership). On success, flip ready dependents 'blocked' -> 'queued'."""
+        """Succeed a job (CAS + ownership). On success, flip ready dependents 'blocked' -> 'queued'.
+
+        ★ ADR-0046 C3: the CAS, the lease release and the wedge-2 dependent-unblock now live in
+        `neuro.complete_job` (SECURITY DEFINER, migration 0004), which calls
+        `neuro.unblock_ready_dependents` internally. `Repository._unblock_ready_dependents` is GONE from
+        this file rather than kept as a wrapper, because a wrapper would be dead code pretending to be a
+        seam.
+
+        ⚑ THE C1 ENVELOPE PROPERTY IS NOW STRUCTURAL. What closed the wedge-2 write-skew was that the
+        child's row lock is still HELD when the unblock runs and commits; C1 had to pin that by AST
+        containment, because hoisting the helper into its own `engine.begin()` looked like a
+        connection-hygiene improvement and silently restored the skew. Inside one function, inside one
+        statement, inside one transaction, that hoist is not expressible.
+        ⚠ AND THE SNAPSHOT PROPERTY IS NOW A VOLATILITY PROPERTY: the two statements inside
+        `unblock_ready_dependents` get their own snapshots only because the function is VOLATILE (MEASURED:
+        the same body marked STABLE re-reads the caller's snapshot and the skew returns). That is pinned by
+        `provolatile`, not by a comment."""
         with self.engine.begin() as conn:
-            res = conn.execute(
-                text(
-                    "UPDATE neuro.jobs SET state = 'succeeded', updated_at = now() "
-                    "WHERE job_id = :job AND claim_token = :tok AND state IN ('claimed', 'running')"
-                ),
-                {"job": job_id, "tok": claim_token},
+            return bool(
+                conn.execute(
+                    text("SELECT neuro.complete_job(:job, :tok)"),
+                    {"job": job_id, "tok": claim_token},
+                ).scalar_one()
             )
-            if res.rowcount != 1:
-                return False  # wrong token / not in-flight / already stolen-and-fenced
-            conn.execute(
-                text(
-                    "UPDATE neuro.work_leases SET released_at = now() "
-                    "WHERE job_id = :job AND claim_token = :tok AND released_at IS NULL"
-                ),
-                {"job": job_id, "tok": claim_token},
-            )
-            self._unblock_ready_dependents(conn, job_id)
-            return True
-
-    @staticmethod
-    def _unblock_ready_dependents(conn, job_id: int) -> None:
-        """Flip this job's now-ready dependents 'blocked' -> 'queued' (the C2 AND-gate).
-
-        **ADR-0046 §6 — the dependent-unblock WRITE-SKEW.** Two parents of one AND-gated child running
-        `complete()` concurrently at READ COMMITTED each evaluated the NOT-EXISTS predicate against a
-        snapshot excluding the other's uncommitted 'succeeded', so each SKIPPED the child — and the skip
-        path touches no row (the qual is evaluated in the scan Filter below ModifyTable, so a row that
-        fails it is never locked), giving no conflict and no EvalPlanQual recheck. The child was
-        stranded 'blocked' forever; the only other blocked->queued writer is enqueue-time C20.
-        ⚠ An isolation bump does NOT fix write-skew — ADR-0046 §6 says so in its own text.
-
-        THE FIX IS TWO STATEMENTS, AND BOTH PROPERTIES ARE LOAD-BEARING:
-
-        1. **The lock is taken on the CANDIDATE set, never the READY set.** The locking SELECT below
-           carries NO readiness predicate on purpose. Move the NOT-EXISTS into it and the losing parent
-           selects zero rows, locks NOTHING, and the write-skew survives with a `FOR NO KEY UPDATE`
-           sitting right there looking like a fix.
-        2. **The lock and the unblock must stay SEPARATE `conn.execute` calls.** Fusing them into one
-           data-modifying CTE would put both under ONE snapshot, so the NOT-EXISTS would again be
-           evaluated against a pre-commit view of the sibling parent and the skew would survive. (The
-           shipped code was a single statement, so "collapse these two" reads as a strict improvement —
-           which is exactly why it is written down here and mutation-pinned.)
-
-        Serialisation: whichever parent locks the child first necessarily commits first (the blocked
-        contender cannot commit before its blocker), so the LAST holder of the child lock runs the
-        UPDATE under a fresh per-statement snapshot that includes every earlier parent's commit plus
-        its own write. `ORDER BY j.job_id` keeps acquisition ascending, consistent with every other
-        jobs-row acquirer in this file.
-
-        ⚠ The UPDATE deliberately keeps its OWN dep-subquery predicate rather than being narrowed to
-        the locked id set: a child that materialises between the two statements must still be unblocked,
-        and narrowing would make this fix silently depend on `_initial_state_for_deps`'s lock to be
-        correct. Locking is this statement's job; deciding readiness is the UPDATE's."""
-        conn.execute(
-            text(
-                "SELECT j.job_id FROM neuro.jobs j "
-                " WHERE j.state = 'blocked' "
-                "   AND j.job_id IN (SELECT job_id FROM neuro.job_dependencies WHERE depends_on = :job) "
-                " ORDER BY j.job_id FOR NO KEY UPDATE"
-            ),
-            {"job": job_id},
-        )
-        conn.execute(
-            text(
-                """
-                UPDATE neuro.jobs j SET state = 'queued', updated_at = now()
-                 WHERE j.state = 'blocked'
-                   AND j.job_id IN (SELECT job_id FROM neuro.job_dependencies WHERE depends_on = :job)
-                   AND NOT EXISTS (
-                       SELECT 1 FROM neuro.job_dependencies d
-                         JOIN neuro.jobs dep ON dep.job_id = d.depends_on
-                        WHERE d.job_id = j.job_id AND dep.state <> 'succeeded')
-                """
-            ),
-            {"job": job_id},
-        )
 
     def fail_permanent(self, *, job_id: int, claim_token: uuid.UUID, detail: str) -> bool:
         """Dead-letter a permanent failure (CAS + ownership), then cascade-cancel its dependents.
 
         DEFER (Stage 2): there is no TRANSIENT-`failed` producer yet. When the Stage-2 failure path lands,
         define a transient failure's effect on dependents (retry vs cascade) and have the reaper stamp
-        error_class='lease_expired' on expiry. Note only — not built now."""
+        error_class='lease_expired' on expiry. Note only — not built now.
+
+        ★ ADR-0046 C3: moved to `neuro.fail_job_permanent`, which performs the CAS, releases the lease and
+        calls `neuro.cascade_cancel_jobs(job, false)` internally. The writer holds EXECUTE on this function
+        but NOT on `cascade_cancel_jobs` itself, so a cascade is reachable only as a consequence of
+        dead-lettering a job whose token the caller actually holds — never as a bare call against an
+        arbitrary job_id."""
         with self.engine.begin() as conn:
-            res = conn.execute(
-                text(
-                    "UPDATE neuro.jobs SET state = 'dead_letter', error_class = 'permanent', "
-                    "error_detail = :d, attempt_count = attempt_count + 1, updated_at = now() "
-                    "WHERE job_id = :job AND claim_token = :tok AND state IN ('claimed', 'running')"
-                ),
-                {"job": job_id, "tok": claim_token, "d": detail},
+            return bool(
+                conn.execute(
+                    text("SELECT neuro.fail_job_permanent(:job, :tok, :d)"),
+                    {"job": job_id, "tok": claim_token, "d": detail},
+                ).scalar_one()
             )
-            if res.rowcount != 1:
-                return False
-            conn.execute(
-                text(
-                    "UPDATE neuro.work_leases SET released_at = now() "
-                    "WHERE job_id = :job AND claim_token = :tok AND released_at IS NULL"
-                ),
-                {"job": job_id, "tok": claim_token},
-            )
-            self._cascade_cancel(conn, job_id)
-            return True
 
     def cancel_cascade(self, job_id: int) -> int:
         with self.engine.begin() as conn:
@@ -1316,66 +1261,26 @@ class Repository:
 
     @staticmethod
     def _cascade_cancel(conn, job_id: int, *, include_self: bool = False) -> int:
-        # Recursive cascade over the dependency edge set: cancel every transitive dependent (and,
-        # if include_self, the job itself) that is not already in a terminal state.
-        # CAST(:job AS bigint), not :job::bigint — SQLAlchemy text() mis-parses a named param adjacent
-        # to the :: cast operator (the param goes unbound). CAST(...) keeps the colon unambiguous.
-        seed = (
-            "CAST(:job AS bigint)"
-            if include_self
-            else ("job_id FROM neuro.job_dependencies WHERE depends_on = :job")
-        )
-        # jobs FIRST (consistent jobs-before-leases lock order, R5).
-        deps_cte = (
-            "WITH RECURSIVE deps AS ("
-            + (f"  SELECT {seed} AS job_id" if include_self else f"  SELECT {seed}")
-            + "  UNION "
-            "  SELECT d.job_id FROM neuro.job_dependencies d JOIN deps ON d.depends_on = deps.job_id"
-            ") "
-        )
-        # ADR-0046: LOCK the target jobs rows in ASCENDING job_id order BEFORE updating them. An UPDATE
-        # cannot carry an ORDER BY, so the shipped single statement acquired its row locks in PLAN order
-        # (heap order under the measured Seq Scan) — the ONE jobs-row acquirer in this file with no
-        # deterministic order. Harmless while nothing else locked jobs rows; once `_initial_state_for_deps`
-        # takes an ascending lock (wedge 3) that un-ordered acquisition closes a real jobs<->jobs cycle,
-        # REPRODUCED as a PostgreSQL `DeadlockDetected` in the pre-build vet against a live postgres:18,
-        # with a clean pre-fix control on the identical schedule. The pre-lock makes EVERY jobs-row
-        # acquirer here ascending, so no cycle can form.
-        locked = (
+        """Cancel every transitive dependent (and, if include_self, the job itself) not already terminal.
+
+        ★ ADR-0046 C3: the recursive cascade moved to `neuro.cascade_cancel_jobs` (migration 0004). The
+        connection-taking static shape is PRESERVED so `cancel_cascade`'s seed lock and this call stay in
+        one transaction, and so `fail_permanent`'s in-function call and this one are the SAME statement.
+
+        Two details the move had to preserve, both recorded because the obvious simplification breaks them:
+          * The ASCENDING pre-lock (`ORDER BY j.job_id FOR NO KEY UPDATE`) before the UPDATE. An UPDATE
+            cannot carry an ORDER BY, so the pre-C1 single statement acquired locks in PLAN order — the one
+            jobs-row acquirer with no deterministic order — which closed a real jobs<->jobs cycle against
+            enqueue's ascending dep lock, REPRODUCED as a `DeadlockDetected` in the C1 pre-build vet.
+          * The TWO SEEDS. The Python built two different SQL strings: include_self seeded {job}, otherwise
+            {direct dependents}. Collapsing them to one seed plus a `job_id <> p_job_id` filter is NOT
+            equivalent on a CYCLIC edge set, so the function keeps both seeds as a UNION subquery."""
+        return int(
             conn.execute(
-                text(
-                    deps_cte + "SELECT j.job_id FROM neuro.jobs j "
-                    "WHERE j.job_id IN (SELECT job_id FROM deps) "
-                    "  AND j.state NOT IN ('succeeded', 'cancelled', 'dead_letter') "
-                    "ORDER BY j.job_id FOR NO KEY UPDATE"
-                ),
-                {"job": job_id},
-            )
-            .scalars()
-            .all()
+                text("SELECT neuro.cascade_cancel_jobs(:job, :self)"),
+                {"job": job_id, "self": include_self},
+            ).scalar_one()
         )
-        if not locked:
-            return 0
-        # The state predicate is re-asserted as a belt: the rows are already locked, so it can only be a
-        # no-op here — but a locked-set UPDATE with no qual would silently widen if the lock ever moved.
-        sql = (
-            "UPDATE neuro.jobs SET state = 'cancelled', updated_at = now() "
-            "WHERE job_id = ANY(:ids) "
-            "  AND state NOT IN ('succeeded', 'cancelled', 'dead_letter') "
-            "RETURNING job_id"
-        )
-        cancelled = [r[0] for r in conn.execute(text(sql), {"ids": locked}).all()]
-        # R4: release any active lease the cancelled (possibly in-flight) jobs held — otherwise the
-        # cancelled worker heartbeats forever and the lease never frees. Leases AFTER jobs.
-        if cancelled:
-            conn.execute(
-                text(
-                    "UPDATE neuro.work_leases SET released_at = now() "
-                    "WHERE job_id = ANY(:ids) AND released_at IS NULL"
-                ),
-                {"ids": cancelled},
-            )
-        return len(cancelled)
 
     # --- reaper: requeue expired leases, fencing the original claimant --------------------------
     def reap_expired(self) -> int:

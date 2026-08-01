@@ -43,7 +43,19 @@ __all__ = [
 
 def reap(repo: Repository) -> int:
     """Run one reaper sweep: requeue jobs whose lease expired (fencing the dead claimant). Returns the
-    number of jobs requeued. The runtime calls this on the REAPER_SECONDS cadence."""
+    number of jobs requeued. The runtime calls this on the REAPER_SECONDS cadence.
+
+    ⚠⚠ THE REAPER NEEDS A CONTROL-PLANE DSN, NOT THE WORKER'S (ADR-0046 session C3). `reap_expired` writes
+    `jobs.state` / `claim_token` / `claim_seq` DIRECTLY — it is deliberately the one queue verb that did NOT
+    move into a SECURITY DEFINER function, because it is VM-side and trusted — and C3 REVOKED all of those
+    columns from `neuro_writer`. A reaper wired to the worker DSN therefore gets `permission denied for
+    table jobs` on every sweep.
+    ⚠ And it would fail QUIETLY-ish: `ReaperLoop` records-and-continues past a sweep error by design (C1a),
+    so the loop would spin, `last_error` would be set, and nothing would ever be reaped. Nothing is broken
+    TODAY — B-4/B-4b are BUILT but UNDEPLOYED, and none of the 8 timers armed on canonical is a reaper — so
+    this is a bring-up requirement, not a live fault. The P-8 DSN-wiring runbook makes the reaper's
+    control-plane DSN a numbered, verified step, and a preflight that fails LOUD on a privilege denial is a
+    registered follow-on (changing C1a's records-and-continue contract is not this unit's call)."""
     return repo.reap_expired()
 
 

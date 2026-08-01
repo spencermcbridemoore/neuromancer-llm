@@ -346,11 +346,17 @@ def test_rt_two_parents_complete_concurrently_child_unblocks(seeded):
 
         # A runs the production unblock. Post-fix it LOCKS the child (and skips the update, since p2 is
         # not yet 'succeeded' from A's snapshot); pre-fix it locks nothing at all.
-        Repository._unblock_ready_dependents(conn_a, p1)  # noqa: SLF001
+        # ⚑ ADR-0046 C3: the statement moved into `neuro.unblock_ready_dependents` (migration 0004), so the
+        # hammer drives THE FUNCTION on its own connection. This is the SAME one-line substitution
+        # production made, and it preserves the property the hammer exists for: a function call runs inside
+        # the CALLER'S transaction, so the child row lock is still held by conn_a across the interleave.
+        # Re-implementing the two statements here instead would be a fabricated green (precedent 14).
+        unblock = text("SELECT neuro.unblock_ready_dependents(:j)")
+        conn_a.execute(unblock, {"j": p1})
 
         def _b() -> None:
             try:
-                Repository._unblock_ready_dependents(conn_b, p2)  # noqa: SLF001
+                conn_b.execute(unblock, {"j": p2})
             except BaseException as exc:  # surfaced below; never swallowed
                 err_b.append(exc)
             finally:
@@ -527,10 +533,59 @@ def _fn_sql(fn) -> str:
     )
 
 
+def _strip_sql_comments(sql: str) -> str:
+    """A pg_get_functiondef body with `--` line comments REMOVED, whitespace-normalised.
+
+    ★ LOAD-BEARING, AND MEASURED. `pg_get_functiondef` returns the body VERBATIM, comments included, so a
+    naive substring pin over it is satisfiable by PROSE — the exact failure this file's AST idiom exists to
+    prevent, reappearing one layer down now that the SQL lives in the schema instead of in Python string
+    constants. MEASURED on postgres 18.4: a function whose body contains `FOR NO KEY UPDATE` ONLY inside a
+    `--` comment still yields that phrase from pg_get_functiondef. Every schema-side pin below reads
+    THROUGH this, and `test_rt_definer_pin_is_not_satisfied_by_prose` pins the stripper itself."""
+    lines = [line.split("--", 1)[0] for line in sql.splitlines()]
+    return " ".join(" ".join(lines).split())
+
+
+def _definer_sql(engine, signature: str) -> str:
+    """The live, comment-stripped definition of a schema function, read from the DATABASE.
+
+    ★ ADR-0046 C3 re-homing. The statements these pins guard MOVED out of `db/repository.py` and into
+    migration 0004, so a pin that kept reading Python source would be pinning an empty method and going
+    quietly green — the SKIP-ANCHOR failure wearing yet another face. Reading `pg_get_functiondef` pins what
+    is ACTUALLY IN THE SCHEMA, which is also immune to source-vs-deployed drift; it is NOT, on its own,
+    'stronger' than the AST pin it replaces, because it is prose-satisfiable until the comments are
+    stripped (see `_strip_sql_comments`)."""
+    with engine.connect() as conn:
+        return _strip_sql_comments(
+            conn.execute(
+                text("SELECT pg_get_functiondef(CAST(:sig AS regprocedure))"), {"sig": signature}
+            ).scalar_one()
+        )
+
+
+def _assert_lock_shape(sql: str, name: str, required: list[str]) -> None:
+    """The three assertions every jobs-row acquirer must satisfy, applied identically to a Python source
+    body and to a schema function body so the move cannot weaken them."""
+    for clause in required:
+        assert clause in sql, f"{name} must take its lock as `... {clause}`"
+    assert "FOR UPDATE" not in sql.replace("FOR NO KEY UPDATE", ""), (
+        f"{name} must NOT use bare FOR UPDATE - it conflicts with the FK's implicit FOR KEY SHARE"
+    )
+    assert sql.count("FOR NO KEY UPDATE") == len(required), (
+        f"{name} has {sql.count('FOR NO KEY UPDATE')} locks but {len(required)} are pinned by name - "
+        f"a new lock site must be added to the pin table, not left unpinned"
+    )
+
+
 # EVERY lock this pass takes, named EXPLICITLY per site. ⚠ A single "does an ordered lock appear
 # anywhere in this function?" search is NOT enough and was MEASURED to be a hole: `reap_expired` takes
 # TWO locks, so dropping the jobs-side one left the leases-side one for the search to find and the pin
 # went GREEN on a mutation that inverts the whole jobs-before-leases order.
+#
+# ★ ADR-0046 C3 SPLIT THIS TABLE IN TWO, and the split IS the role boundary. The three sites below stay in
+# Python because they are CONTROL-PLANE verbs that no untrusted worker runs: `reap_expired` (the VM-side
+# reaper), `_initial_state_for_deps` (enqueue's C20 dep read) and `cancel_cascade`'s seed lock. The two that
+# moved into migration 0004 are pinned identically in `_FN_REQUIRED_LOCKS`, against the live schema.
 _REQUIRED_LOCKS = {
     "reap_expired": (
         Repository.reap_expired,
@@ -540,16 +595,43 @@ _REQUIRED_LOCKS = {
         Repository._initial_state_for_deps,  # noqa: SLF001
         ["ORDER BY job_id FOR NO KEY UPDATE"],
     ),
-    "_unblock_ready_dependents": (
-        Repository._unblock_ready_dependents,  # noqa: SLF001
-        ["ORDER BY j.job_id FOR NO KEY UPDATE"],
-    ),
-    "_cascade_cancel": (
-        Repository._cascade_cancel,  # noqa: SLF001
-        ["ORDER BY j.job_id FOR NO KEY UPDATE"],
-    ),
     "cancel_cascade": (Repository.cancel_cascade, ["FOR NO KEY UPDATE"]),
 }
+
+# The SAME three assertions, re-homed to the two statements that moved into the schema at C3.
+_FN_REQUIRED_LOCKS = {
+    "neuro.unblock_ready_dependents(bigint)": ["ORDER BY j.job_id FOR NO KEY UPDATE"],
+    "neuro.cascade_cancel_jobs(bigint, boolean)": ["ORDER BY j.job_id FOR NO KEY UPDATE"],
+}
+
+
+@pytest.mark.parametrize("signature", sorted(_FN_REQUIRED_LOCKS))
+def test_rt_moved_jobs_lockers_keep_their_ordered_no_key_lock(engine, signature):
+    """★ THE RE-HOMED HALF of the lock-shape pin (ADR-0046 C3). `_unblock_ready_dependents` and
+    `_cascade_cancel` moved into migration 0004, so their locks are now pinned against the LIVE SCHEMA
+    under the identical three assertions — ordered-by-job_id, `NO KEY UPDATE` never bare `FOR UPDATE`, and
+    an EXACT lock count so a new unpinned lock site cannot appear.
+
+    Neither property is weakened by the move, and both are still exactly what a REPRODUCED
+    `DeadlockDetected` in the C1 pre-build vet taught: an UPDATE cannot carry an ORDER BY, so an un-ordered
+    acquisition closes a real jobs<->jobs cycle against enqueue's ascending dep lock."""
+    _assert_lock_shape(_definer_sql(engine, signature), signature, _FN_REQUIRED_LOCKS[signature])
+
+
+def test_rt_definer_pin_is_not_satisfied_by_prose(engine):
+    """The schema-side pins' own matcher, pinned — the `test_rt_ast_matcher_is_not_satisfied_by_prose`
+    idiom, re-applied at the new layer.
+
+    MEASURED on postgres 18.4: `pg_get_functiondef` retains `--` comments verbatim, so an unstripped
+    substring pin over it can be satisfied by a COMMENT. This asserts the stripper actually removes one,
+    and that it does not remove the real statement text sitting beside it — a stripper that ate everything
+    would make every pin above vacuously green in the other direction."""
+    assert _strip_sql_comments("a -- FOR NO KEY UPDATE\nb") == "a b"
+    assert "FOR NO KEY UPDATE" not in _strip_sql_comments("x -- FOR NO KEY UPDATE\n")
+    # and, live: the real function's lock survives stripping while its explanatory comments do not
+    live = _definer_sql(engine, "neuro.unblock_ready_dependents(bigint)")
+    assert "ORDER BY j.job_id FOR NO KEY UPDATE" in live
+    assert "write-skew" not in live, "the stripper must remove the body's prose, or the pins read comments"
 
 
 @pytest.mark.parametrize("name", sorted(_REQUIRED_LOCKS))
@@ -571,21 +653,16 @@ def test_rt_every_jobs_locker_takes_an_ordered_no_key_lock(name):
     Each site is named individually: a function-wide "is there an ordered lock anywhere?" search let a
     dropped jobs-side lock hide behind a surviving leases-side one (MEASURED as a false green)."""
     fn, required = _REQUIRED_LOCKS[name]
-    sql = _fn_sql(fn)
-    for clause in required:
-        assert clause in sql, f"{name} must take its lock as `... {clause}`"
-    assert "FOR UPDATE" not in sql.replace("FOR NO KEY UPDATE", ""), (
-        f"{name} must NOT use bare FOR UPDATE - it conflicts with the FK's implicit FOR KEY SHARE"
-    )
-    assert sql.count("FOR NO KEY UPDATE") == len(required), (
-        f"{name} has {sql.count('FOR NO KEY UPDATE')} locks but {len(required)} are pinned by name - "
-        f"a new lock site must be added to _REQUIRED_LOCKS, not left unpinned"
-    )
+    _assert_lock_shape(_fn_sql(fn), name, required)
 
 
-def test_rt_claim_hot_path_keeps_skip_locked_untouched():
-    """§A·56: `claim()`'s `FOR UPDATE SKIP LOCKED` hot path is explicitly OUT of scope for this pass."""
-    assert "FOR UPDATE SKIP LOCKED" in _fn_sql(Repository.claim)
+def test_rt_claim_hot_path_keeps_skip_locked_untouched(engine):
+    """§A·56: `claim()`'s `FOR UPDATE SKIP LOCKED` hot path is explicitly OUT of scope for this pass.
+
+    ★ RE-HOMED at ADR-0046 C3: the statement now lives in `neuro.claim_job`. This is the ONE place bare
+    `FOR UPDATE` is correct in the whole system, which is why the lock-shape pins above forbid it
+    everywhere else and this pin asserts it here by name."""
+    assert "FOR UPDATE SKIP LOCKED" in _definer_sql(engine, "neuro.claim_job(bigint, text, text, integer)")
 
 
 def test_rt_no_engine_wide_serializable():
@@ -621,9 +698,8 @@ def _the_single_begin_block(fn):
     ("fn", "helper"),
     [
         (Repository.enqueue, "_initial_state_for_deps"),
-        (Repository.complete, "_unblock_ready_dependents"),
     ],
-    ids=["enqueue", "complete"],
+    ids=["enqueue"],
 )
 def test_rt_contended_read_shares_the_writes_transaction(fn, helper):
     """★ THE ENVELOPE PIN - the property that is actually load-bearing, and which no behavioural probe
@@ -664,50 +740,149 @@ def test_rt_heartbeat_delegates_to_the_renewal_statement():
     assert "UPDATE" not in _fn_sql(Repository.heartbeat), "heartbeat must hold no SQL of its own"
 
 
-def test_rt_unblock_is_two_statements_not_one_fused():
+@pytest.mark.parametrize(
+    ("fn", "function_name"),
+    [
+        (Repository.claim, "neuro.claim_job"),
+        (Repository.checkpoint, "neuro.checkpoint_job"),
+        (Repository.complete, "neuro.complete_job"),
+        (Repository.fail_permanent, "neuro.fail_job_permanent"),
+        (Repository._renew_lease, "neuro.renew_lease"),  # noqa: SLF001
+        (Repository._cascade_cancel, "neuro.cascade_cancel_jobs"),  # noqa: SLF001
+    ],
+    ids=["claim", "checkpoint", "complete", "fail_permanent", "_renew_lease", "_cascade_cancel"],
+)
+def test_rt_moved_verbs_are_callers_not_second_copies(fn, function_name):
+    """★ ONE IMPLEMENTATION PER CONCEPT, pinned at the seam ADR-0046 C3 created.
+
+    The whole point of the role split is that these statements live in the SCHEMA, where an untrusted
+    `neuro_writer` can invoke them but cannot rewrite them. A Python method that kept its own copy of the
+    SQL — even a correct copy — would be the drift bug the split exists to prevent: the two would diverge
+    silently, and the copy is the one that would keep passing the unit tests.
+
+    So each method must NAME its function and hold NO write SQL of its own. The check is on the moved
+    write verbs only; `reap_expired`, `enqueue`/`_initial_state_for_deps` and `cancel_cascade`'s seed lock
+    are control-plane and deliberately keep their statements (see `_REQUIRED_LOCKS`)."""
+    sql = _fn_sql(fn)
+    assert function_name in sql, f"{fn.__name__} must call {function_name}"
+    for verb in ("UPDATE neuro.", "INSERT INTO neuro."):
+        assert verb not in sql, (
+            f"{fn.__name__} must hold NO {verb.strip()} of its own - the statement moved to "
+            f"{function_name} and a second copy here is the drift this split exists to prevent"
+        )
+
+
+def _unblock_body_statements(engine) -> list[str]:
+    """The SQL statements of `neuro.unblock_ready_dependents`, comment-stripped and split on `;`.
+
+    The `BEGIN`/`END` wrapper and the trailing `$$ LANGUAGE ...` are dropped, so what remains is exactly
+    the statements the function executes — the plpgsql analogue of counting `conn.execute` calls."""
+    body = _definer_sql(engine, "neuro.unblock_ready_dependents(bigint)")
+    inner = body[body.index("BEGIN") + len("BEGIN") : body.rindex("END;")]
+    return [s.strip() for s in inner.split(";") if s.strip()]
+
+
+def test_rt_unblock_is_two_statements_not_one_fused(engine):
     """The SECOND load-bearing detail of wedge 2: the lock and the unblock must stay separate
     statements. All CTEs of one statement share ONE snapshot, so a fused data-modifying CTE would again
     evaluate the NOT-EXISTS against a pre-commit view of the sibling parent and the write-skew would
-    survive. The shipped code WAS one statement, so 'collapse these two' reads as a strict improvement."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(Repository._unblock_ready_dependents)))  # noqa: SLF001
-    executes = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "execute"
-    ]
-    assert len(executes) == 2, f"the child lock and the unblock must be TWO statements, found {len(executes)}"
+    survive. The shipped code WAS one statement, so 'collapse these two' reads as a strict improvement.
+
+    ★ RE-HOMED at C3 from an `ast.walk` count of `conn.execute` calls to a statement count over the live
+    plpgsql body. Same property, same failure mode, new home — and it now also forbids the data-modifying
+    CTE by name, which the Python-side count could only catch indirectly."""
+    stmts = _unblock_body_statements(engine)
+    assert len(stmts) == 2, f"the child lock and the unblock must be TWO statements, found {len(stmts)}"
+    assert not any(s.upper().startswith("WITH") for s in stmts), (
+        "a data-modifying CTE puts the lock and the unblock under ONE snapshot and the write-skew returns"
+    )
 
 
-def test_rt_unblock_lock_carries_no_readiness_predicate():
+def test_rt_unblock_lock_carries_no_readiness_predicate(engine):
     """★ THE FIRST load-bearing detail of wedge 2: the lock is taken on the CANDIDATE set, never the
-    READY set. Move the NOT-EXISTS into the locking SELECT and the losing parent selects zero rows,
+    READY set. Move the NOT-EXISTS into the locking statement and the losing parent selects zero rows,
     locks NOTHING, and the write-skew survives with a FOR NO KEY UPDATE sitting right there.
 
     ⚠ THIS PIN ONCE READ THE DOCSTRING. `ast.walk` is BREADTH-FIRST, so a function's docstring Constant
-    is yielded BEFORE the SQL Constants nested inside its `conn.execute(text(...))` calls - and this
-    method's docstring happens to contain 'FOR NO KEY UPDATE' while not containing 'UPDATE neuro.jobs',
-    so a `next(...)` over `ast.walk` selected the PROSE and the pin could never fail, for any edit.
-    Caught by the post-build vet, reproduced standalone. It now takes the FIRST `conn.execute`'s SQL
-    positionally and asserts that what it got is really a SELECT - so a selector that ever drifts off
-    the statement reddens instead of going quietly blind."""
-    tree = ast.parse(textwrap.dedent(inspect.getsource(Repository._unblock_ready_dependents)))  # noqa: SLF001
-    executes = [
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "execute"
-    ]
-    lock_sql = " ".join(
-        " ".join(
-            n.value for n in ast.walk(executes[0]) if isinstance(n, ast.Constant) and isinstance(n.value, str)
-        ).split()
-    )
-    assert lock_sql.upper().startswith("SELECT"), (
+    was yielded BEFORE the SQL Constants nested inside its `conn.execute(text(...))` calls, and a
+    `next(...)` over the walk selected the PROSE — the pin could never fail, for any edit. That lesson is
+    why the C3 re-homing reads a COMMENT-STRIPPED definition and asserts positively on the statement's
+    shape rather than trusting a substring search: the prose trap is not specific to Python docstrings,
+    and MEASURED, `pg_get_functiondef` keeps `--` comments too."""
+    lock_sql = _unblock_body_statements(engine)[0]
+    assert lock_sql.upper().startswith("PERFORM"), (
         f"the pin must be reading the LOCKING STATEMENT, not prose - it got {lock_sql[:60]!r}"
     )
     assert "FOR NO KEY UPDATE" in lock_sql
     assert "NOT EXISTS" not in lock_sql.upper(), (
-        "the locking SELECT must NOT carry the readiness predicate - a zero-row SELECT locks nothing"
+        "the locking statement must NOT carry the readiness predicate - a zero-row lock locks nothing"
     )
+    # ...and the readiness predicate must still be on the UPDATE, or the AND-gate is simply gone.
+    assert "NOT EXISTS" in _unblock_body_statements(engine)[1].upper()
+
+
+# --- C3: the properties the SECURITY DEFINER move makes load-bearing for the first time ---------------
+_C3_FUNCTIONS = (
+    "neuro.claim_job(bigint, text, text, integer)",
+    "neuro.renew_lease(bigint, uuid, integer)",
+    "neuro.checkpoint_job(bigint, uuid, text)",
+    "neuro.complete_job(bigint, uuid)",
+    "neuro.fail_job_permanent(bigint, uuid, text)",
+    "neuro.unblock_ready_dependents(bigint)",
+    "neuro.cascade_cancel_jobs(bigint, boolean)",
+    "neuro.assert_job_claim_fencing()",
+)
+_C3_DEFINERS = frozenset(_C3_FUNCTIONS[:5])
+
+
+@pytest.mark.parametrize("signature", _C3_FUNCTIONS)
+def test_rt_c3_functions_are_volatile_and_search_path_pinned(engine, signature):
+    """★ TWO SECURITY-DEFINER FOOT-GUNS, PINNED — and the first one is not a style preference, it is the
+    wedge-2 fix in disguise.
+
+    VOLATILE. MEASURED on postgres 18.4: a VOLATILE plpgsql function takes a FRESH SNAPSHOT PER STATEMENT
+    (two reads across a concurrent commit inside one call returned 0 then 1), while the SAME body marked
+    STABLE returned 0 then 0. `unblock_ready_dependents` is only correct because its two statements see
+    different snapshots, so `ALTER FUNCTION ... STABLE` would silently re-open ADR-0046 §6 with the SQL
+    unchanged and every behavioural test still green until two parents happen to race. Nothing else in the
+    tree would catch it.
+
+    search_path. A SECURITY DEFINER function runs as its owner, so an attacker-controlled search_path is a
+    privilege-escalation vector. Every body here is `neuro.`-qualified, so the path is pinned to
+    `pg_catalog, pg_temp` — with pg_temp named LAST **explicitly**, because omitted it is searched FIRST and
+    a temp object can shadow a catalog one."""
+    with engine.connect() as conn:
+        vol, cfg, secdef = conn.execute(
+            text(
+                "SELECT p.provolatile, p.proconfig, p.prosecdef FROM pg_proc p "
+                "WHERE p.oid = CAST(:sig AS regprocedure)"
+            ),
+            {"sig": signature},
+        ).one()
+    assert vol == "v", f"{signature} must stay VOLATILE (got provolatile={vol!r}) - STABLE restores the skew"
+    assert cfg is not None and "search_path=pg_catalog, pg_temp" in cfg, (
+        f"{signature} must pin its search_path; got {cfg!r}"
+    )
+    assert secdef is (signature in _C3_DEFINERS), (
+        f"{signature}: prosecdef={secdef} contradicts the C3 inventory - only the five worker entry "
+        f"points are SECURITY DEFINER; the internals and the trigger function are INVOKER"
+    )
+
+
+def test_rt_c3_definer_functions_default_deny_to_public(engine):
+    """Migration 0004 revokes EXECUTE from PUBLIC on all seven callables. That REVOKE is the ONLY thing
+    protecting them in the window between `alembic upgrade` and `neuro db roles` — on canonical the
+    migration runs as a SUPERUSER, so a DEFINER function created there and left world-executable would be
+    a superuser-owned function any role could call. PUBLIC is a pseudo-role that always exists, which is
+    why this belongs in the migration and the positive grant does not."""
+    with engine.connect() as conn:
+        for sig in _C3_FUNCTIONS[:7]:
+            assert (
+                conn.execute(
+                    text("SELECT has_function_privilege('public', :sig, 'EXECUTE')"), {"sig": sig}
+                ).scalar_one()
+                is False
+            ), f"PUBLIC must not hold EXECUTE on {sig}"
 
 
 # --- the reaper's own contract under the new 4-step form ------------------------------------------
@@ -749,18 +924,18 @@ def test_rt_reaper_empty_sweep_is_cheap_and_quiet(seeded):
     assert _active_leases(repo.engine, job) == 1
 
 
-def test_rt_migration_set_is_the_three_of_record():
+def test_rt_migration_set_is_the_four_of_record():
     """The migration set of record, pinned by IDENTITY so a stray or misnamed revision reddens.
 
     ⚠ This was `assert len(migrations) == 2` with the docstring "ADR-0046's locking arm carries NO schema
-    change (the 0003 trigger migration is a later unit)". Session C2 IS that later unit, so that clause is
-    DISCHARGED and leaving it asserting 2 would ship a checkable falsehood (precedent 15). The pin is not
-    deleted and not bumped to a bare count — it is the only migration-set assertion in the tree, and an
-    exact list is what keeps its value once the count stops being the point.
+    change (the 0003 trigger migration is a later unit)". Session C2 WAS that later unit and session C3 adds
+    `0004`, so a stale count would ship a checkable falsehood (precedent 15). The pin is not deleted and not
+    bumped to a bare count — it is the only migration-set assertion in the tree, and an exact list is what
+    keeps its value once the count stops being the point.
 
-    The OTHER clause of the original docstring stands UNCHANGED and is load-bearing for 0003 itself:
-    parity stays 0001-scoped (test_migration_ddl_parity upgrades to `0001_initial_schema`, not head), so
-    0003 is invisible to it and `tests/reference/phase3-ddl.sql` stays pristine."""
+    The OTHER clause of the original docstring stands UNCHANGED and is load-bearing for `0003` and `0004`
+    alike: parity stays 0001-scoped (test_migration_ddl_parity upgrades to `0001_initial_schema`, not head),
+    so both are invisible to it and `tests/reference/phase3-ddl.sql` stays pristine."""
     import pathlib  # noqa: PLC0415
 
     root = pathlib.Path(inspect.getfile(repo_mod)).parent.parent.parent.parent
@@ -769,4 +944,5 @@ def test_rt_migration_set_is_the_three_of_record():
         "0001_initial_schema.py",
         "0002_external_records_stamp.py",
         "0003_state_transition_triggers.py",
+        "0004_worker_registrar_role_split.py",
     ], f"unexpected migration set: {migrations}"

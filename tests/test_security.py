@@ -242,15 +242,22 @@ def test_registrar_active_version_grant_is_column_scoped(engine, provisioned_rol
     )
 
 
-def test_writer_out_of_ladder_state_update_is_rejected_by_the_schema(seeded, provisioned_roles, role_url):
-    """★ P-5 (ADR-0046): a bare out-of-ladder UPDATE by the REAL `neuro_writer` role is refused BY THE
-    SCHEMA, not by a missing grant — the distinction the whole 0003 migration exists to make.
+def test_out_of_ladder_state_update_is_rejected_by_the_schema_not_the_grant(seeded):
+    """★ P-5 (ADR-0046): an out-of-ladder UPDATE is refused BY THE SCHEMA, not by a missing grant — the
+    distinction the whole 0003 migration exists to make.
 
-    The writer DOES hold `GRANT UPDATE (state, ...) ON jobs` (grants.sql), which is precisely why the
-    software CAS in db/repository.py was bypassable once an untrusted worker connects directly. So the
-    probe must prove two things in one shot: the LEGAL rung succeeds as the writer (the grant is real and
-    this is not a permission test in disguise), and the illegal rung is refused with the TRIGGER'S OWN
-    message.
+    ⚠ RE-HOMED FROM `neuro_writer` TO ADMIN AT SESSION C3, AND THE REASON IS THE POINT. This probe used to
+    run as the real `neuro_writer` and its FIRST assertion was that the LEGAL rung SUCCEEDS — proof that the
+    grant was real and that this was "not a permission test in disguise". C3 REVOKES `UPDATE ON jobs` from
+    `neuro_writer` entirely, so that assertion is now falsified by the fix itself: as the writer, BOTH rungs
+    are permission-denied and the schema-vs-grant distinction becomes undemonstrable.
+
+    The property has not weakened — it has moved to the role that can still exercise it. The trigger is a
+    belt UNDER the revocation (grants are provisioning-mutable, triggers are schema), so what P-5 asserts is
+    now asserted against ADMIN, which holds the grant BY NATURE and always will. The writer-side closure
+    that replaced the old first assertion is
+    `tests/redteam/test_rt_role_split.py::test_rt_writer_cannot_walk_the_ladder_only_the_functions_can`,
+    which proves the denial is the GRANT's and that the functions still work.
 
     ⚠ Deliberately NOT written with `_exec_as`: that helper re-raises anything that is not a permission
     denial, so a trigger RAISE would surface as a test ERROR rather than an assertion — and per the
@@ -259,19 +266,15 @@ def test_writer_out_of_ladder_state_update_is_rejected_by_the_schema(seeded, pro
     message). It also acts on a REAL seeded row: the sibling role probes target `job_id = -1`, which
     matches zero rows, and a row-level trigger never fires on an empty result set."""
     repo, run_id = seeded["repo"], seeded["run_id"]
-    job = repo.enqueue(run_id=run_id, job_key="k#p5-writer")
+    job = repo.enqueue(run_id=run_id, job_key="k#p5-admin")
     assert repo.state_of(job) == "queued"
 
-    weng = create_engine(role_url(provisioned_roles, "neuro_writer"), future=True)
-    try:
-        # the LEGAL rung: the writer's grant genuinely permits a state UPDATE
-        with weng.begin() as conn:
-            conn.execute(text("UPDATE neuro.jobs SET state = 'claimed' WHERE job_id = :j"), {"j": job})
-        # the ILLEGAL rung: refused in-schema, and the message says which transition
-        with pytest.raises(Exception) as excinfo, weng.begin() as conn:  # noqa: PT011 — message asserted below
-            conn.execute(text("UPDATE neuro.jobs SET state = 'blocked' WHERE job_id = :j"), {"j": job})
-    finally:
-        weng.dispose()
+    # the LEGAL rung: the grant genuinely permits a state UPDATE for this role
+    with repo.engine.begin() as conn:
+        conn.execute(text("UPDATE neuro.jobs SET state = 'claimed' WHERE job_id = :j"), {"j": job})
+    # the ILLEGAL rung: refused in-schema, and the message says which transition
+    with pytest.raises(Exception) as excinfo, repo.engine.begin() as conn:  # noqa: PT011 — message asserted
+        conn.execute(text("UPDATE neuro.jobs SET state = 'blocked' WHERE job_id = :j"), {"j": job})
     assert "illegal job_state transition" in str(excinfo.value).lower()
     assert "permission denied" not in str(excinfo.value).lower()  # rejected by the TRIGGER, not the grant
     assert repo.state_of(job) == "claimed"
