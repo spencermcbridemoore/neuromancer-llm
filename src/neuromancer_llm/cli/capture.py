@@ -373,6 +373,11 @@ def campaign(
     tokenizer_hash: str | None = typer.Option(
         None, help="tokenizer identity hash as hex (use instead of --tokenizer-file)"
     ),
+    campaign_key: str = typer.Option(
+        ...,
+        help="campaign coordinate every run is filed under (ADR-0037); composes the run_key, so a NEW dtype "
+        "needs a NEW key (wave-1 bf16 used 'estela-order-bias') — no default, fail closed",
+    ),
     actor_key: str = typer.Option("owner", help="actor stamped on every run + capture (phase0 Q13)"),
     origin: str | None = typer.Option(None, help="origin stamp (defaults to the hostname)"),
     lake_root: str = typer.Option("./_lake", help="local lake root for the derived logprob parquet shards"),
@@ -451,6 +456,7 @@ def campaign(
             dtype_quant=dtype_quant,
             serving_stack=serving_stack,
             serving_version=serving_version,
+            campaign_key=campaign_key,
             corpus_commit=corpus_commit,
             expected_lane=lane,
             n_logprobs=n_logprobs,
@@ -471,8 +477,8 @@ def campaign(
         raise typer.Exit(code=1) from exc
 
     typer.echo(
-        f"campaign corpus={result.corpus_commit} complete: {result.permutations_captured} permutations over "
-        f"{result.questions_captured} questions"
+        f"campaign={result.campaign_key} corpus={result.corpus_commit} complete: "
+        f"{result.permutations_captured} permutations over {result.questions_captured} questions"
     )
     typer.echo(f"  method_version_id={result.method_version_id} censored_cells={result.censored_cells_total}")
     typer.echo(f"  {result.preflight_grid_note}")  # §D Layer-2: the controlled-probe grid observation

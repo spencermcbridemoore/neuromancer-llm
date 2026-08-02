@@ -4,9 +4,17 @@ An in-process loop over the REAL ``capture_logprob`` (one engine / one Repositor
 the answer-order-permutation sweep over the pinned public MCQ bank: for each in-scope question, enumerate its
 k! answer orders (the pinned lexicographic rule), render the labeled prompt (the pinned byte template), capture
 the next-token logprobs to the canonical DB + local-lake, and write the versioned answer-letter projection to
-``run_metrics`` (D4b, shape A). D2: run-per-permutation, organized as ``campaign_key="estela-order-bias"`` /
-``work_slug=<uid>`` / ``variant_digest=<perm-index>`` (one capture_event per run). D5: recomputable — the three
-pins (template, enumeration, batch-invariance) live here + at the server launch.
+``run_metrics`` (D4b, shape A). D2: run-per-permutation, organized as ``campaign_key`` / ``work_slug=<uid>`` /
+``variant_digest=<perm-index>`` (one capture_event per run). D5: recomputable — the three pins (template,
+enumeration, batch-invariance) live here + at the server launch.
+
+⚠ ``campaign_key`` is a REQUIRED CALLER COORDINATE, not a module constant. It was hardcoded to
+``"estela-order-bias"`` (wave-1's value) until the wave-2 fp16 re-capture, which cannot run under wave-1's key:
+``compose_run_key`` derives ``<campaign_key>/<uid>/<perm-index>``, so re-using it makes every one of the 6,000
+run_keys collide with a wave-1 row, and ``get_or_create_run`` then raises ``IdentityMismatchError`` on the
+``fingerprint_id`` compare (fp16 mints a different ``model_identity_hash`` -> fingerprint). A NEW dtype is a NEW
+model identity BY DESIGN, so it needs its own campaign. The wave-1 value is recorded here as HISTORY and is
+deliberately NOT importable — a constant would invite the hardcode back.
 
 The testable core (``run_campaign``) takes an INJECTED ``repo``/``backend``/``backend_id``/``client``/
 ``tokenizer_hash`` so a GPU-free test can substitute a fake client; the thin ``neuro capture campaign`` CLI verb
@@ -33,6 +41,7 @@ from .determinism import DEFAULT_TARGET_PROMPT
 from .events import (
     assert_substrate_matches_wire,
     capture_logprob,
+    require_campaign_key,
     require_dtype_quant,
     require_substrate,
 )
@@ -43,8 +52,6 @@ if TYPE_CHECKING:
     from ..storage.backends import StorageBackend
     from .adapters.vllm import VLLMClient
 
-#: The campaign coordinates (D2). Fixed for the whole ESTELA order-bias sweep.
-CAMPAIGN_KEY = "estela-order-bias"
 #: Injected answer labels A, B, C, ... (the campaign assigns its OWN labels; §1 of the readiness doc).
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 #: Charter scope: answer-order permutations for k <= this (owner scope; k>5 banks are excluded).
@@ -83,6 +90,13 @@ class EstelaQuestion:
 class CampaignResult:
     """The end-state summary of one campaign run (for the runbook transcript + the state-doc bank)."""
 
+    # The caller's coordinate, threaded through. ⚠ It is NOT read back from the written rows — deliberately
+    # unlike `PromotionResult`, whose ids ARE "read back from its row, never echoed from the caller's input"
+    # (importer/promote.py:172-173). This field carries no independent evidence: it is the SAME local passed to
+    # capture_logprob, which is exactly what makes the CLI's `campaign=` line render-honest (it cannot diverge
+    # from the rows), and is also why it CANNOT detect a typo. The typo residual's one home is
+    # `require_campaign_key`'s docstring, which states the detector is post-run verification, not code.
+    campaign_key: str
     corpus_commit: str
     method_version_id: int
     questions_captured: int
@@ -262,6 +276,7 @@ def run_campaign(
     dtype_quant: str,
     serving_stack: str,
     serving_version: str,
+    campaign_key: str,
     corpus_commit: str,
     expected_lane: str = "canonical",
     n_logprobs: int = 64,
@@ -274,11 +289,15 @@ def run_campaign(
 
     ``n_logprobs`` defaults to 64 (owner nod 2026-07-20, amends D4b's top-20 -> §G): near-exact for k<=5 and
     frozen-at-capture (unrecoverable without a GPU re-run), so it is set high here."""
-    # Fail closed FAST on an absent/blank dtype/substrate grade — before the corpus scan, the method-version
-    # INSERT, and the capture loop — so a mislabeled campaign never registers a method or writes a single
-    # identity row. require_substrate is the SUBSTRATE-axis sibling of require_dtype_quant.
+    # Fail closed FAST on an absent/blank dtype grade, substrate grade, or campaign coordinate — before the
+    # corpus scan, the method-version INSERT, and the capture loop — so a mislabeled campaign never registers a
+    # method or writes a single identity row. require_substrate is the SUBSTRATE-axis sibling of
+    # require_dtype_quant; require_campaign_key is the COORDINATE-axis one (all three are re-checked inside
+    # capture_logprob, the choke point — these are the fail-FAST copies, hoisted so a 6,000-capture sweep
+    # cannot spend a method-version INSERT before refusing).
     require_dtype_quant(dtype_quant)
     require_substrate(serving_stack=serving_stack, serving_version=serving_version)
+    require_campaign_key(campaign_key)
     # DERIVE cross-check at campaign start, BEFORE any durable write (register_answer_letter_method below is a
     # method-version registration + active-pointer repoint) or GPU cost: the declared substrate must match the
     # adapter self-report + the server's wire /version, else RAISE before anything is persisted. It needs only
@@ -338,7 +357,7 @@ def run_campaign(
                 serving_stack=serving_stack,
                 serving_version=serving_version,
                 tokenizer_hash=tokenizer_hash,
-                campaign_key=CAMPAIGN_KEY,
+                campaign_key=campaign_key,
                 work_slug=q.uid,
                 variant_digest=str(perm_index),
                 actor_key=actor_key,
@@ -357,6 +376,7 @@ def run_campaign(
                 progress(done, total)
 
     return CampaignResult(
+        campaign_key=campaign_key,
         corpus_commit=corpus_commit,
         method_version_id=method_version_id,
         questions_captured=len(kept),

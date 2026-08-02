@@ -208,6 +208,31 @@ def test_no_churn_pinned_wave1_model_identity_hash():
     assert h == "fab3766c94f641e2c5e8275a12cdd916bed22c5d32c00745db03369f4ec91107"
 
 
+# --- the DTYPE SPLIT: wave-2's fp16 re-capture must be a DISTINCT model identity ----------------------
+def test_dtype_quant_splits_the_model_identity_three_ways():
+    """Changing ONLY `dtype_quant` must change `model_identity_hash` — the guarantee the whole wave-2 fp16
+    re-capture rests on. If dtype did NOT fold into the identity, an fp16 campaign would silently reuse
+    wave-1's `model_id=1`, pooling two different runtimes under one identity and making the 8x-finer logprob
+    grid unattributable.
+
+    Three grades, pairwise distinct, not two: a two-grade inequality can pass on an unrelated change, whereas
+    dropping `dtype_quant` from the hash entirely collapses ALL THREE to one value and reddens here.
+
+    Deliberately does NOT restate the wave-1 pinned literal — that lives once, in the NO-CHURN sibling above,
+    which is the churn detector and must not be re-authored (a second copy of a pin is a second home, and
+    re-deriving it would fabricate a green). This probe pins the SPLIT; that one pins the ANCHOR."""
+    common = dict(
+        hf_repo="mistralai/Mistral-7B-v0.3",
+        hf_revision="caa1feb0e54d415e2df31207e5f4e273e33509b1",
+        tokenizer_hash=bytes.fromhex("11" * 32),  # fixed: isolates the DTYPE axis
+        serving_stack=PINNED_STACK,
+        serving_version=PINNED_VERSION,
+        arch_family="llama",
+    )
+    hashes = {g: model_identity_hash(dtype_quant=g, **common).hex() for g in ("bf16", "fp16", "fp32")}
+    assert len(set(hashes.values())) == 3, f"dtype_quant does not split the model identity: {hashes}"
+
+
 # --- the operator surface: --serving-stack / --serving-version REQUIRED on every capture command -------
 # Each command is invoked with all its OTHER required options provided, so the ONLY missing required option
 # is the one under test -> typer refuses with a usage error (exit 2) naming it, BEFORE the body runs (no
@@ -247,6 +272,13 @@ _REQUIRED = {
         "abc",
         "--hf-revision",
         "rev",
+        # `campaign` also requires --campaign-key (the wave-2 coordinate belt). It is listed here so these
+        # probes stay PLACEMENT-INDEPENDENT: click names only the EARLIEST-DECLARED missing required option,
+        # so an unlisted required option declared ahead of the one under test would be reported INSTEAD of it
+        # and redden this fixture — a failure mode invisible in a diff, since it is a property of parameter
+        # ORDER, not of any line's content.
+        "--campaign-key",
+        "ck",
     ],
 }
 

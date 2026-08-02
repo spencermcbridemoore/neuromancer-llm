@@ -26,7 +26,6 @@ from neuromancer_llm.capture.answer_letter import (
     write_answer_letter_projection,
 )
 from neuromancer_llm.capture.campaign import (
-    CAMPAIGN_KEY,
     EstelaCampaignError,
     EstelaQuestion,
     enumerate_permutations,
@@ -43,6 +42,11 @@ from neuromancer_llm.storage.backends import LocalFsBackend
 
 # --- fake vLLM client with a prefix-stable toy tokenizer + a fixed sample ----------------------------
 LETTER_TOKEN_ID = {"A": 2001, "B": 2002, "C": 2003, "D": 2004, "E": 2005}
+
+#: This suite's campaign coordinate. Deliberately NOT the wave-1 production key: `campaign_key` is a REQUIRED
+#: caller argument (the wave-2 coordinate belt), so a module constant named for the production campaign would
+#: re-create the hardcode these tests exist to prevent.
+_TEST_CAMPAIGN_KEY = "test-order-bias"
 
 
 def _sample_with_letters(letters: dict[str, float]) -> LogprobSample:
@@ -385,6 +389,7 @@ def test_run_campaign_full_loop(repo, tmp_path) -> None:
         dtype_quant="bf16",
         serving_stack="vllm",
         serving_version="0.23.0",
+        campaign_key=_TEST_CAMPAIGN_KEY,
         corpus_commit="158a8c3-test",
         expected_lane="test",
         n_logprobs=64,
@@ -407,7 +412,7 @@ def test_run_campaign_full_loop(repo, tmp_path) -> None:
                     "(SELECT count(*) FROM neuro.runs WHERE work_slug = 'q2') AS q2, "
                     "(SELECT count(*) FROM neuro.campaigns WHERE campaign_key = :ck) AS campaigns"
                 ),
-                {"ck": CAMPAIGN_KEY},
+                {"ck": _TEST_CAMPAIGN_KEY},
             )
             .mappings()
             .one()
@@ -451,6 +456,7 @@ def test_run_campaign_populates_preflight_grid_note(repo, tmp_path) -> None:
         dtype_quant="bf16",
         serving_stack="vllm",
         serving_version="0.23.0",
+        campaign_key=_TEST_CAMPAIGN_KEY,
         corpus_commit="c-test",
         expected_lane="test",
         n_logprobs=64,
@@ -482,6 +488,7 @@ def test_run_campaign_preflight_raises_on_fp32_over_claim(repo, tmp_path) -> Non
             dtype_quant="fp32",
             serving_stack="vllm",
             serving_version="0.23.0",
+            campaign_key=_TEST_CAMPAIGN_KEY,
             corpus_commit="c-test",
             expected_lane="test",
             n_logprobs=64,

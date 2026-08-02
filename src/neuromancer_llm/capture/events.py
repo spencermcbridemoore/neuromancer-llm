@@ -490,6 +490,31 @@ def require_substrate(*, serving_stack: str, serving_version: str) -> None:
             )
 
 
+def require_campaign_key(campaign_key: str) -> None:
+    """Fail-closed guard for the caller-asserted campaign coordinate (the third sibling of
+    `require_dtype_quant` / `require_substrate`).
+
+    `campaign_key` is the experiment coordinate every run is filed under: it composes the `run_key`
+    (`composer.compose_run_key`) and owns the `campaigns` row. `campaigns.campaign_key` is `text NOT NULL
+    UNIQUE` with **no non-empty CHECK** (`phase3-ddl.sql:226`), so a blank grade is accepted by the schema —
+    `get_or_create_campaign("")` mints a campaign keyed `""` and every run_key becomes `"/<slug>/<digest>"`,
+    all of them fresh. Nothing collides, nothing raises, and a whole sweep lands under an empty campaign.
+    Refused HERE, fail closed, per the D1 "no default-clean member" idiom (`importer/ingress.py`).
+
+    ⚠ THE RESIDUAL, STATED: this closes the BLANK case ONLY. A wrong-but-present key that is NOVEL (a typo
+    like `estela-order-bias-fp16x`) collides with nothing either, so a sweep completes silently under it. That
+    is NOT mechanically detectable — a closed vocab is the wrong instrument for the same reason `dtype_quant`
+    is a free string (a valid label on the wrong thing passes any vocab check; log:245), and refusing an
+    already-existing key would forbid the legitimate resume. What this guard buys is a CONSCIOUS declaration;
+    the typo is caught by post-run verification of the counts under the intended key, not by code."""
+    if not campaign_key or not campaign_key.strip():
+        raise ConfigurationError(
+            "campaign_key is REQUIRED and must be a non-empty experiment coordinate; it composes the run_key "
+            "and owns the campaigns row, and the column carries no non-empty CHECK — refusing an absent/blank "
+            "key (fail closed; a blank key files the whole sweep under an empty campaign, silently)."
+        )
+
+
 def compose_serving_version_tag(serving_stack: str, serving_version: str) -> str:
     """The fingerprint's `serving_version_tag` COMPOSED from the substrate components — ONE implementation,
     never a free third assertion.
@@ -586,6 +611,10 @@ def capture_logprob(
     # Fail closed on an absent/blank runtime dtype grade BEFORE any wire call or durable write — it folds into
     # the model identity below and must be a conscious caller assertion, never a silent default (D1 idiom).
     require_dtype_quant(dtype_quant)
+    # Same belt for the CAMPAIGN coordinate: it composes the run_key and owns the campaigns row, and the column
+    # carries no non-empty CHECK, so a blank key files the capture under an empty campaign with nothing
+    # colliding and nothing raising. The choke point carries the gate.
+    require_campaign_key(campaign_key)
     # Same belt for the SUBSTRATE axis (serving_stack/serving_version): required + non-defaulted, refused blank
     # here — fail closed before any identity decision. The fingerprint's serving_version_tag is COMPOSED from
     # the SAME two components (one source), so it can never contradict the identity (was a free third kwarg).

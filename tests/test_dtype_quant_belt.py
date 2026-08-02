@@ -98,8 +98,33 @@ def test_require_dtype_quant_accepts_a_grade(grade):
     [
         pytest.param(["logprob", "--hf-revision", "rev"], id="logprob"),
         pytest.param(["replay", "--hf-revision", "rev"], id="replay"),
+        # This row lists EVERY required option of `campaign` except --dtype-quant -- all SIX (measured off
+        # typer.main.get_command: campaign requires 7, logprob/replay 4). Not a delta: --serving-stack and
+        # --serving-version are SHARED with logprob/replay, so they are not "extra", yet omitting them breaks
+        # this row just as surely as omitting the three that ARE campaign-only (--corpus-root,
+        # --corpus-commit, --campaign-key). Listing all six is what makes the comment above TRUE for this row
+        # and the probe PLACEMENT-INDEPENDENT: click names only the EARLIEST-DECLARED missing required option,
+        # so any unlisted one declared ahead of --dtype-quant is reported INSTEAD of it and reddens this test
+        # -- a failure mode invisible in a diff, because it is a property of parameter ORDER, not of any
+        # line's content. (Before the wave-2 --campaign-key option this row passed only because --dtype-quant
+        # happens to be declared first. ⚠ The logprob/replay rows below are still minus-three and so remain
+        # placement-dependent -- a PRE-EXISTING gap, not introduced here; registered, not fixed in this unit.)
         pytest.param(
-            ["campaign", "--corpus-root", "/tmp", "--corpus-commit", "abc", "--hf-revision", "rev"],
+            [
+                "campaign",
+                "--serving-stack",
+                "vllm",
+                "--serving-version",
+                "0.23.0",
+                "--campaign-key",
+                "ck",
+                "--corpus-root",
+                "/tmp",
+                "--corpus-commit",
+                "abc",
+                "--hf-revision",
+                "rev",
+            ],
             id="campaign",
         ),
     ],
