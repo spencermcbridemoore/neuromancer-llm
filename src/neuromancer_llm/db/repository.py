@@ -124,6 +124,79 @@ class SpendReport:
     total_usd: Decimal
 
 
+#: The three nullable assets columns THIS API CAN SET, for `Repository._assert_no_asset_backfill`'s loop.
+#: ⚠ The table has FOUR nullable columns. `sae_training_run_id` is deliberately absent: it is not a
+#: parameter of `register_asset` at all, so it is unsettable here and stays permanently NULL — ADR-0032
+#: defers the trainer entirely and no `sae_training_runs` row exists to reference. Named so the omission
+#: reads as a decision rather than an oversight, and so this tuple is never mistaken for "the nullable
+#: columns of `assets`".
+_ASSET_NULLABLE = ("sha256", "hf_repo", "hf_revision")
+
+_SHA256_DIGEST_BYTES = 32
+
+
+def require_asset_coordinates(*, asset_key: str, asset_type: str, loader_format: str) -> None:
+    """Fail-closed guard for the three NOT NULL assets coordinates (the `require_substrate` /
+    `require_campaign_key` shape, applied to a registry row instead of a capture grade).
+
+    `assets.asset_key` is `text NOT NULL UNIQUE` with **no non-empty CHECK** — measured against the frozen
+    DDL, and structurally identical to `campaigns.campaign_key`, where wave-2 Phase 1 established that a
+    blank mints a real row keyed `""` that collides with nothing and raises nothing. Here that row would be
+    PERMANENT: there is no delete verb for assets anywhere in `src/` (the only DELETE is `bundles/gc.py`, on
+    unsealed bundles). `asset_type` and `loader_format` are likewise NOT NULL with no CHECK, and ADR-0031
+    makes `loader_format` mandatory day-one precisely so an inert row still records how to load it — an
+    empty string satisfies the column and defeats the ADR.
+
+    This guard forbids the ABSENT and the BLANK value only. A WRONG-but-present value is not detectable
+    here: `asset_type`'s vocabulary lives in a `--` SOURCE comment in the schema file — there is no
+    `COMMENT ON` for `assets` anywhere, so it is invisible to the database — and not in a PG enum (unlike
+    `artifact_kind`, which the database itself enforces). Nothing in the schema can adjudicate it. Stated so
+    the belt is not read as validation.
+
+    ⚠ `.strip()` is used to TEST, never to store: the value is written as given, so two keys differing only
+    in surrounding whitespace are two distinct permanent rows. Trimming here would silently rewrite a
+    caller's identity input, which this repo refuses on principle (the `require_dtype_quant` no-normalize
+    ruling)."""
+    for name, value in (
+        ("asset_key", asset_key),
+        ("asset_type", asset_type),
+        ("loader_format", loader_format),
+    ):
+        if not value or not value.strip():
+            raise ConfigurationError(
+                f"{name} is REQUIRED and must be non-empty; `assets` has no non-empty CHECK and no delete "
+                "verb, so a blank would mint a PERMANENT row (fail closed)."
+            )
+
+
+def require_asset_sha256(sha256: bytes | None) -> None:
+    """Fail-closed guard for the materialized-identity hash. Two SEPARATE single-purpose checks, never a
+    conjunct: (1) it is not a `str`, and (2) it is exactly 32 bytes.
+
+    The length check is the load-bearing half and the type check alone does NOT subsume it. A caller holding
+    a hex digest who reaches for `.encode()` instead of `bytes.fromhex()` produces 64 bytes of ASCII, which
+    IS `bytes`, passes any isinstance test, and lands in the `bytea` column as a permanent "identity" that
+    matches nothing and can never be reconciled against real digest bytes. `db/identity.py::sha256_bytes` —
+    the house producer — returns `.digest()`, so a correct caller always has 32 bytes.
+
+    NULL is permitted here (the column is nullable; ADR-0031's row may exist before its bytes are hashed).
+    ⚠ But a NULL is PERMANENT — see `_assert_no_asset_backfill`."""
+    if sha256 is None:
+        return
+    if isinstance(sha256, str):
+        raise ConfigurationError(
+            "sha256 must be the 32 RAW bytes of the digest, never hex — use bytes.fromhex(...) or "
+            "db/identity.py::sha256_bytes (a .encode()d hex string stores 64 ASCII bytes as an identity "
+            "that matches nothing)."
+        )
+    if len(sha256) != _SHA256_DIGEST_BYTES:
+        raise ConfigurationError(
+            f"sha256 must be a {_SHA256_DIGEST_BYTES}-byte sha256 digest; got {len(sha256)} bytes. A "
+            f"{2 * _SHA256_DIGEST_BYTES}-byte value is the hex string .encode()d — decode it with "
+            "bytes.fromhex(...) instead (fail closed; the stored value is a permanent identity)."
+        )
+
+
 class Repository:
     def __init__(
         self, engine: Engine, *, expected_lane: str, expected_uuid: uuid.UUID | str | None = None
@@ -902,6 +975,157 @@ class Repository:
                     {"v": mv_id, "m": method_id},
                 )
             return mv_id
+
+    def register_asset(
+        self,
+        *,
+        asset_key: str,
+        asset_type: str,
+        loader_format: str,
+        sha256: bytes | None = None,
+        hf_repo: str | None = None,
+        hf_revision: str | None = None,
+    ) -> int:
+        """Register an ADR-0031/0032 assets row (SAE / steering vector / transcoder / probe). INSERT-only,
+        keep-first on `asset_key`; a divergent re-register RAISES. The FIRST writer into `neuro.assets`.
+
+        The vocabulary lives in `registry/assets.py` (`AssetSpec` + its named constants) and the write lives
+        here, following the `registry/metric_keys.py` + `seed_metric_key` split — ONE prior vocabulary-module
+        instance, not a universal house pattern; `registry/backends.py` corroborates only the weaker half
+        (it holds no INSERT either, its write being `get_or_create_storage_backend`), being a logic module
+        rather than a spec module. `assets` INSERT is registrar/admin-only, and ⚠ NEITHER SIDE NAMES
+        `assets`: the registrar's INSERT rides the blanket `ON ALL TABLES` grant, and `neuro_writer`'s
+        default-deny rides OMISSION from the enumerated operational-table list. So the posture is real but
+        inherited, not asset-specific — a future edit to either line moves it silently. This runs on the
+        control plane.
+
+        SCOPE, stated so it can never be mistaken for coverage — five things this does NOT do:
+
+        (1) `sha256` is CALLER-COMPUTED and this path NEVER OPENS THE FILE. The drift check below compares
+            an incoming CLAIM to a stored CLAIM; it can never detect changed BYTES. Nothing in this
+            repository recomputes an asset's digest — the ADR-0031 `.pt` loader is deferred — so a caller
+            who hashes the wrong file registers a wrong identity that reads green forever.
+        (2) Idempotency is keyed on `asset_key` ALONE. The SAME file registered under a SECOND `asset_key`
+            mints a second permanent `asset_id` and is NOT detected: `assets` carries no unique on `sha256`.
+            This is deliberate, not an oversight. The tokenizer-identity label-collision guard does NOT
+            transfer: there the UNIQUE sits on the durable identity (`tokenizer_hash`), so the damaging
+            "right label, wrong file" case is unreachable by any ON CONFLICT arbiter and needs an explicit
+            second lookup. Here the UNIQUE sits on the caller-chosen LABEL, so the damaging "right key,
+            wrong bytes" case lands ON the conflict branch and the sha256 comparison below already catches
+            it. Porting that guard would raise on two honest keys for one file — an E-8 false-loud.
+        (3) `asset_type` is FREE TEXT against a DDL comment, not a PG enum (unlike `artifacts.kind`, which
+            the database enforces). No vocabulary validation is performed and none is claimed.
+        (4) Concurrency: same-key registrations SERIALIZE on the `asset_key` UNIQUE index, not on a row
+            lock — this path takes none. MEASURED on postgres 18 at the engine's default level: a second
+            registration of a key another transaction is still inserting waits it out, and the re-SELECT
+            then takes a fresh statement snapshot and sees the winner, so neither the drift raise nor the
+            backfill raise can be silently skipped. That fail-loud outcome does not depend on the wait —
+            a re-SELECT finding nothing would raise, not return a green. What concurrency does NOT close
+            is (2): two registrars minting two keys for one file still mint two permanent rows, and no
+            lock would help.
+        (5) The two NULLABLE label columns (`hf_repo`, `hf_revision`) are NOT blank-checked. The guard
+            above covers the three NOT NULL coordinates, and here "unspecified" is already expressible as
+            None (the parameter default), so a caller who explicitly passes `""` stores a blank
+            permanently. Every RE-register direction stays fail-closed and NAMES the offending value
+            (stored `''` against an incoming real value raises on the drift arm quoting `hf_repo=''`; a
+            stored NULL against an incoming `''` raises on the backfill arm). ⚠ Those two directions are
+            established BY CODE READING — the author's and an independent verifier's — and are NOT pinned
+            by a probe; a registered follow-on adds the two. Read them as reasoned, not measured. This is
+            the same convention as `register_tokenizer_identity`, which carries the identical two columns.
+
+        Raises ConfigurationError on an absent/blank coordinate or a malformed `sha256`;
+        IdentityMismatchError on divergent drift or an attempted NULL backfill."""
+        require_asset_coordinates(asset_key=asset_key, asset_type=asset_type, loader_format=loader_format)
+        require_asset_sha256(sha256)
+        with self.engine.begin() as conn:
+            # One unit of work on one connection: the re-SELECT below cannot miss the row this call's own
+            # INSERT conflicted with. It buys NO rollback of a minted row — on the inserted branch there is
+            # nothing to compare, so the drift path is reachable ONLY on the conflict branch.
+            inserted = conn.execute(
+                text(
+                    "INSERT INTO neuro.assets "
+                    "(asset_key, asset_type, loader_format, sha256, hf_repo, hf_revision) "
+                    "VALUES (:k, :t, :lf, :sha, :repo, :rev) "
+                    "ON CONFLICT (asset_key) DO NOTHING RETURNING asset_id"
+                ),
+                {
+                    "k": asset_key,
+                    "t": asset_type,
+                    "lf": loader_format,
+                    "sha": sha256,
+                    "repo": hf_repo,
+                    "rev": hf_revision,
+                },
+            ).scalar_one_or_none()
+            if inserted is not None:
+                return inserted
+            existing = (
+                conn.execute(
+                    text(
+                        "SELECT asset_id, asset_type, loader_format, sha256, hf_repo, hf_revision "
+                        "FROM neuro.assets WHERE asset_key = :k"
+                    ),
+                    {"k": asset_key},
+                )
+                .mappings()
+                .one()
+            )
+            incoming = {
+                "asset_type": asset_type,
+                "loader_format": loader_format,
+                "sha256": sha256,
+                "hf_repo": hf_repo,
+                "hf_revision": hf_revision,
+            }
+            self._assert_no_asset_backfill(asset_key, existing, incoming)
+            # ⚠ TWO SURVIVORS-BY-CONSTRUCTION live in this unit and BOTH are deliberately uncounted
+            # (precedent 11); the other is `not value or ` in require_asset_coordinates, which `.strip()`
+            # already subsumes for every str input. Recorded here so the belt ACCOUNTING is honest — a
+            # record claiming one survivor while shipping two is the overclaim, one layer up.
+            #
+            # ⚠ `existing[field] is not None` is a BELT, UNPINNABLE BY CONSTRUCTION, and deliberately NOT
+            # counted in the mutation matrix (precedent 11). The backfill guard immediately above already
+            # raises on (incoming non-NULL, stored NULL), and `want is not None` short-circuits the
+            # (NULL, NULL) case, so no input can reach this conjunct with a stored NULL — MEASURED: deleting
+            # it leaves all 48 probes green. It is kept because it states the NULL-means-unspecified
+            # convention where a reader meets it, and it keeps this loop correct on its own terms if the
+            # guard above is ever reordered. Claiming it as a pinned guard would be the overclaim
+            # precedent 11 exists to prevent.
+            for field, want in incoming.items():
+                if want is not None and existing[field] is not None and existing[field] != want:
+                    raise IdentityMismatchError(
+                        f"asset {asset_key!r} already exists with {field}={existing[field]!r}, not {want!r} "
+                        "— refusing to silently keep-first a divergent re-register (ADR-0005 register-first, "
+                        "raise-on-drift). Reconcile deliberately, or register under a new asset_key."
+                    )
+            return existing["asset_id"]
+
+    @staticmethod
+    def _assert_no_asset_backfill(asset_key: str, existing, incoming) -> None:
+        """Raise when a caller supplies a value for a nullable column that is stored NULL.
+
+        THE FAIL-OPEN THIS CLOSES. The per-field drift loop treats a NULL as "unspecified" — the
+        `register_tokenizer_identity` convention — and that convention is SAFE only where the caller can
+        eventually write the column. Here it cannot: this API is INSERT-only (`ON CONFLICT DO NOTHING`) and
+        no UPDATE path for `assets` exists in `src/`. So a later call carrying a real `sha256` against a row
+        stored with `sha256 NULL` would match no drift, raise nothing, RETURN AN ID — and leave the column
+        NULL FOREVER while the caller reads the green as "the identity is now materialized". Silence would
+        be a lie about what happened; this raises and names the only real remedy.
+
+        It is the RETURN-VALUE form of the render-honesty rule: a green that means "nothing happened" where
+        the caller reads "it worked" is the defect, not a nicety.
+
+        The MIRROR case is deliberately NOT a raise: incoming NULL against a stored value is the caller
+        asserting nothing, which is genuinely "unspecified" and keeps first. Both asymmetric NULL directions
+        are therefore decided explicitly, per the standing both-NULL-cases obligation."""
+        for field in _ASSET_NULLABLE:
+            if incoming[field] is not None and existing[field] is None:
+                raise IdentityMismatchError(
+                    f"asset {asset_key!r} is already registered with {field} NULL, and this API is "
+                    f"INSERT-only — it CANNOT backfill {field} and would otherwise return a green while "
+                    "leaving the column NULL forever. Correct the row with an admin UPDATE, or register "
+                    "the materialized asset under its own asset_key (fail closed)."
+                )
 
     def link_replicate(self, *, original_run_id: int, replicate_run_id: int) -> int:
         """Link a replicate run to its original (ADR-0004 MEASURED). Idempotent on the UNIQUE pair; the
