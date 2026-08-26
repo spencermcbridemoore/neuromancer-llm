@@ -45,12 +45,26 @@ if TYPE_CHECKING:
 
 class Confidentiality(StrEnum):
     """D1 confidentiality grade (owner-ratified 2026-07-15). Closed vocabulary with NO default-clean member — an
-    unstamped write is refused, never defaulted to 'open' (spec D1: a gap reads DIRTY, not clean)."""
+    unstamped write is refused, never defaulted to 'open' (spec D1: a gap reads DIRTY, not clean).
+
+    ⚠ 2026-08-11 (owner ruling R-A) — THE GRADE IS RETIRED AS A DISCRIMINATING AXIS. Every import batch from
+    this date stamps `OPEN`, permanently; no further per-corpus grade call is made. **The MECHANISM below is
+    UNCHANGED and that is the point**: the stamp stays REQUIRED and non-defaulted, and the isinstance check in
+    `open_import_batch` still REFUSES an unstamped or out-of-vocabulary write, so a gap still cannot read
+    clean. What retires is what the VALUE claims, not the guard. See ADR-0049's 2026-08-11 addendum; the
+    `confidentiality` column itself is a registered DROP rider on the next real migration (that column only —
+    `derived_by_predecessor` stays)."""
 
     EXAM_RESTRICTED = (
         "exam_restricted"  # midterm exam content (the MCQ corpora); phase0 soft rule, made mechanical
     )
-    OPEN = "open"  # found data with no confidentiality concern
+    # ⚠ 2026-08-11 (R-A): for batches from this date, OPEN means "UNGRADED BY POLICY" — it does NOT assert
+    # absence-of-concern. The corpus-import lane stamps `open` on 387 rows whose upstream manifest recorded
+    # `exam_restricted`; their historical grade survives only in `external_records.payload_jsonb`. Rows stamped
+    # BEFORE this date (the 360 MOSART records) carry the older, discriminating reading and are true as written.
+    OPEN = (
+        "open"  # ungraded by policy since 2026-08-11; previously: found data with no confidentiality concern
+    )
 
 
 class SourceSystem(StrEnum):
@@ -132,3 +146,56 @@ def open_import_batch(
     return ImportBatchHandle(
         import_batch_id=int(batch_id), source_system=source_system, confidentiality=confidentiality
     )
+
+
+def close_import_batch(repo: Repository, handle: ImportBatchHandle) -> bool:
+    """Stamp `import_batches.finished_at` for THIS invocation's batch. Returns True if this call
+    stamped it, False if it was already stamped (idempotent, never an error).
+
+    WHY IT EXISTS. `finished_at` has been in the schema since 0001 and, until this writer, NOTHING in
+    `src/` ever wrote it — so a sweep that died at row 900 of 1,753 left NO SIGNAL AT ALL that it had
+    died, on tables with no delete verb. The schema already carried the affordance; the code declined
+    to use it. ⚠ Say it that way and not "permanently indistinguishable": with the stamp, a NULL and
+    a set value are distinguishable, but as the scope note below records, a STAMPED batch still does
+    not prove coverage — so "distinguishable" and "verified complete" are different claims and an
+    earlier draft of this paragraph blurred them.
+
+    ⚠ WHAT `finished_at` DOES AND DOES NOT MEAN — read this before relying on it:
+
+    * It is **PER-INVOCATION, NOT PER-CORPUS.** It records that THE RUN THAT OPENED THIS BATCH reached
+      its end without raising. A second full run opens a SECOND batch and stamps that one; two stamped
+      batches over one corpus is the EXPECTED shape, not a duplicate import (the rows themselves
+      keep-first on their own natural keys).
+    * **It is NOT a coverage statement.** `artifacts` carries no `import_batch_id`, so nothing joins
+      the pointer rows back to a batch, and a stamped batch does NOT assert that every intended row
+      landed. Only the per-tranche counts establish coverage; this establishes that the process
+      finished.
+    * ⚠ **NULL MEANS *NEVER CLOSED*, NOT *CRASHED*.** The shipped `neuro importer promote` verb opens
+      batches through `open_import_batch` and has no close, so batches predating this writer — the
+      already-executed canonical MOSART import among them — are NULL forever and were never
+      incomplete. Reading NULL as "this run died" is false for every batch older than this function.
+
+    GRANT SURFACE, and it is the reason the driver must preflight. ⚠ STATED CORRECTLY, because an
+    earlier draft of this paragraph had it BACKWARDS in both halves: this is NOT the importer's first
+    UPDATE (`neuro importer promote` reaches `register_method_version`, which UPDATEs
+    `methods.active_version_id`), and `neuro_registrar` is NOT UPDATE-less (that same
+    `methods.active_version_id` is precisely the one UPDATE it holds). The true and narrower fact is
+    what matters here: **the registrar holds no UPDATE on `import_batches`**, so a registrar-DSN run
+    would land all its permanent rows and only THEN fail at the close, with nothing to roll back.
+    The driver therefore proves THIS column's privilege before opening a batch
+    (`ops/corpus-import/register_corpus.py`, via `has_column_privilege`), which is the only ordering
+    in which that failure is free."""
+    if not isinstance(handle, ImportBatchHandle):
+        raise ImporterIngressError(
+            "handle must be an ImportBatchHandle from open_import_batch — a raw id is refused (fail "
+            "closed; the batch a caller closes must be one it actually opened)."
+        )
+    with repo.engine.begin() as conn:
+        stamped = conn.execute(
+            text(
+                "UPDATE neuro.import_batches SET finished_at = now() "
+                "WHERE import_batch_id = :b AND finished_at IS NULL RETURNING import_batch_id"
+            ),
+            {"b": handle.import_batch_id},
+        ).scalar_one_or_none()
+    return stamped is not None
