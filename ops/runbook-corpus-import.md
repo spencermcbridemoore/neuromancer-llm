@@ -60,14 +60,36 @@ and a filter written that way silently registers 22,825 permanent rows.
 
 1. **Run desktop-side.** The bytes live here; `pg_hba` on canonical is loopback-only, so reach the
    database over an SSH `-L` tunnel. ⚠ **Check the tunnel path BEFORE anything expensive** — see §2.
-2. **Durability green.** `assert_backup_fresh` branch 4 blocks on **status** before staleness, so a
-   blocked row fails the FIRST capture regardless of how fresh the backups are.
-   ⚠ **NordVPN on this desktop silently kills the VM→desktop tailnet path** — every port times out
-   while every Tailscale surface still reads healthy. Disconnect it before checking.
-3. **Admin DSN.** `close_import_batch` is the importer's ONLY UPDATE and is admin-only by grant.
+2. **The VM is a REACHABLE TAILNET PEER.** ⚠ **This is THE CONDITION.** NordVPN is only *one* of the
+   causes that breaks it, and naming a cause instead of the condition is what let a 13-day block go
+   misdiagnosed twice. Test the condition, on **both ends**:
+
+   ```bash
+   tailscale status | grep -i neuro-canonical-pg   # on the desktop: the VM must be LISTED AT ALL
+   # on the VM:  tailscale status | grep -i desktop-      (each end prints the other's 100.x address)
+   timeout 5 bash -c 'cat </dev/null >/dev/tcp/<peer-100.x>/22'; echo $?   # 0 = open, 124 = blocked
+   ```
+
+   **Three causes are on record and they are distinguishable:**
+   - **(i) the peer is ABSENT from `tailscale status`** — an ACL/netmap exclusion, **not** a down host: a
+     down peer is still LISTED, as `offline`. Confirm at `login.tailscale.com/admin/machines` —
+     **Connected** there while absent locally **is** the exclusion — then read `admin/logs` for the policy
+     edit. ⚠ **Measure before you repair:** `tailscale up` re-authenticates the node and erases the reason
+     it left. ⚠ An exclusion also blocks **Tailscale SSH** on its own grant layer, so being unable to `ssh`
+     the VM is *confirmation*, not a second fault.
+   - **(ii) listed, but the probe still returns 124** (timeout, never `refused`) while every Tailscale
+     surface reads healthy — a **VPN holding the desktop default route** (NordVPN here), so SYN-ACKs leave
+     the wrong way. Disconnect it.
+   - **(iii) the desktop OpenSSH endpoint is down** — `Get-Service sshd` on the desktop.
+3. **Durability green.** `assert_backup_fresh` branch 4 blocks on **status** before staleness, so a
+   blocked row fails the FIRST write regardless of how fresh the backups are. ⚠ **Precondition 2 is
+   upstream of this one:** the freshness probe's failing step *is* the sftp push to the desktop, so an
+   unreachable peer surfaces here as a blocked row. Clear 2 first, then re-run the units — do not
+   re-diagnose the same fault twice.
+4. **Admin DSN.** `close_import_batch` is the importer's ONLY UPDATE and is admin-only by grant.
    The driver proves the privilege before opening a batch (§3), which is the only ordering where
    that failure is free.
-4. ⚠ **NEUTRALIZE THE SUPERSEDED SHIM.** `C:\Users\spenc\Downloads\neuromancer_import\
+5. ⚠ **NEUTRALIZE THE SUPERSEDED SHIM.** `C:\Users\spenc\Downloads\neuromancer_import\
    neuromancer_register_in_place.py` still exists beside a copy of the manifest, and its READMEs
    document a one-command path that imports **all 24,859 rows**. A repo denylist cannot reach a file
    outside the repo. Rename it and add a banner:
@@ -111,8 +133,26 @@ dry run: no database was contacted
 
 ⚠ Any other row count is a **STOP**: the driver's belt refuses a drifted manifest rather than
 registering a different corpus than the one reviewed. Do not "fix" it by editing
-`import_manifest.csv` — the suite asserts `concat(part_*.csv) == import_manifest.csv`, so patch the
-part and rebuild by concatenation.
+`import_manifest.csv` — `tests/test_corpus_manifest.py` asserts the parts rebuild it exactly, so patch
+the part and rebuild.
+
+⚠⚠ **THE REBUILD IS HEADER-STRIPPED CONCATENATION, NOT `cat part_*.csv`.** Every one of the nine parts
+carries its own header row, so a naive `cat` produces **eight extra header lines** — one per part after
+the first — and the belt refuses the result. Take the header from the first part and the BODIES from the
+rest, which is exactly what the suite test does:
+
+```bash
+{ head -n 1 ops/corpus-import/part_01_mi_core.csv
+  for p in ops/corpus-import/part_*.csv; do tail -n +2 "$p"; done
+} > ops/corpus-import/import_manifest.csv
+```
+
+⚠ **No byte figure is pinned here, on purpose.** The size of the naive-`cat` surplus depends on your
+checkout's line endings — the header is **113 B with LF, 114 B with CRLF** — so the surplus is **904 B on
+a fresh clone and 912 B on a tree whose parts are CRLF**. Both MEASURED; `.gitattributes` is
+`* text=auto eol=lf`, so a fresh clone gets LF. This is the same reason
+`test_the_nine_parts_concatenate_to_the_manifest_exactly` pins the RELATIONSHIP and deliberately pins no
+sha256: *"a pinned digest here would be a checkable falsehood the first time anyone cloned."*
 
 ---
 
@@ -143,8 +183,23 @@ uv run neuro db roles
 uv run python ops/corpus-import/register_corpus.py --lane test --family mi-intervention --limit 1
 ```
 
-**Expect:** `preflight OK: postgres may stamp finished_at`, then
-`batch local-fs: done (1 rows), finished_at stamped`, then `1 newly registered, 0 idempotent no-ops`.
+**Expect, IN THIS ORDER:**
+
+```
+1 rows across 1 batch(es) (by source_system — the grade is retired):
+    local-fs           rows=1
+  preflight OK: postgres may stamp finished_at
+  batch local-fs: done (1 rows), finished_at stamped
+done — 1 newly registered, 0 idempotent no-ops
+```
+
+⚠ **The row counts print BEFORE `preflight OK`** — the driver reports its selection before it opens a
+connection. A transcript that begins at `preflight OK` is a truncated log, not a different run.
+
+⚠ **There is no `belt OK` line here, and its absence is CORRECT.** The manifest-drift belt runs on the
+FULL set only (`full_set = not (args.family or args.limit or opted_in)`), so every `--family` / `--limit`
+run — this one and §4 — is deliberately unbelted. §3's expected block *does* show `belt OK`, and comparing
+the two without this note reads as a check that failed silently.
 
 **Then exercise the guards that only exist here** — each must REFUSE, and refusing is the pass:
 
@@ -186,8 +241,16 @@ uv run python ops/corpus-import/register_corpus.py --lane canonical --family mi-
 `bibliography` — so this names one rather than implying it is uniquely smallest. Any of the three
 does the job.
 
-Expect `preflight OK`, then `batch local-fs: done (1 rows), finished_at stamped`, then
-`1 newly registered, 0 idempotent no-ops`.
+**Expect, IN THIS ORDER** — the same shape as §3b (row counts first; no `belt OK`, because `--family`
+unbelts), with `preflight OK` naming the DSN's role rather than `postgres`:
+
+```
+1 rows across 1 batch(es) (by source_system — the grade is retired):
+    local-fs           rows=1
+  preflight OK: neuro_orch may stamp finished_at
+  batch local-fs: done (1 rows), finished_at stamped
+done — 1 newly registered, 0 idempotent no-ops
+```
 
 **Verify the triple before going further.** ⚠ `family` is NOT a database column — it lives only in
 the sidecar, so verify by that or by uri prefix, never by a `family` column:
