@@ -1,0 +1,43 @@
+[Unit]
+# ⚠⚠ THIS FILE IS NEW TO VERSION CONTROL (2026-08-28) AND IS NOT AUTOMATICALLY THE TRUTH.
+# The LIVE unit has run on the canonical VM since 2026-07-11 and has never been tracked here — only its
+# timer was (ops/neuro-backup.timer, committed 2026-07-19 so verify-config assertion 5 could assert against
+# something in the repo). This copy is drafted from the A2-16 runbook's recorded shape plus the repo3
+# additions, and it is DELIBERATELY NOT INSTALLED BLIND: ops/runbook-repo3-b2.md §2 reconciles LIVE -> ops/
+# first (`systemctl cat` for the text, `systemctl show` for the PARSED view that actually runs), and the
+# live file wins on any divergence that is not a deliberate repo3 addition. Direction matters: this file
+# has never been the source of truth and does not become it by being committed.
+#
+# WHAT THIS UNIT DOES: one base-backup cycle across every configured pgbackrest repository, then the
+# durability probes that record what happened.
+Description=neuro base backup (all repos) + the durability freshness probes
+OnFailure=neuro-alert@%n.service
+
+[Service]
+Type=oneshot
+User=postgres
+EnvironmentFile=/etc/neuro/env
+# A hang must become a FAILURE so OnFailure= actually fires (the A2-16 §8 fold-5 rule: a sleeping endpoint
+# mid-transfer is the single most likely failure mode). Reconcile the live value at deploy rather than
+# assuming this one.
+TimeoutStartSec=7200
+
+# --- the backups: ONE repo per ExecStart, because a bare `pgbackrest backup` targets repo1 ONLY (A2-7
+# --- §4.4). Each repo therefore mints its OWN backup label, seconds apart — do not read a narrow
+# --- `pgbackrest info | tail` as "repo1 is missing".
+ExecStart=/usr/bin/pgbackrest --stanza=neuro --repo=1 --type=full backup
+ExecStart=/usr/bin/pgbackrest --stanza=neuro --repo=2 --type=full backup
+# ★ repo3 (Backblaze B2, §A·72) carries the IGNORE-FAILURE `-` PREFIX and the two proven repos do NOT.
+# That asymmetry IS the notify-only mechanism at the systemd layer: an unproven third repo must never fail
+# this unit, because failing it would skip the ExecStartPost below and stall the GATING backup_freshness
+# bump — i.e. an unproven arm would close the ADR-0020 gate, which is exactly what the ruling forbids.
+# ⚠ Promotion (a later owner ruling) removes this `-` AND moves GATE_BASIS_REPOS. Two edits, both deliberate.
+ExecStart=-/usr/bin/pgbackrest --stanza=neuro --repo=3 --type=full backup
+
+# --- the probes. ORDER AND PREFIXES ARE LOAD-BEARING; do not reorder.
+# systemd runs ExecStartPost lines in order and STOPS at the first one that fails without a `-` prefix.
+# The repo3 probe therefore runs FIRST and ignore-failure, so it can never suppress the gating probe below;
+# the gating backup_freshness probe runs LAST and unprefixed, so its failure still fails the unit and still
+# fires OnFailure= — unchanged from what has shipped since A2-16.
+ExecStartPost=-/home/ubuntu/neuromancer-llm/.venv/bin/neuro probe run --key repo3_freshness --lane canonical
+ExecStartPost=/home/ubuntu/neuromancer-llm/.venv/bin/neuro probe run --key backup_freshness --lane canonical

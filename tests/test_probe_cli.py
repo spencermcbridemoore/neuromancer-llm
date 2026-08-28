@@ -24,12 +24,19 @@ _runner = CliRunner()
 
 # A minimal PASSING conf for the CLI-delegate tests (the VERBATIM runbook fixture — inline comments, the
 # tee-appended key — lives in tests/test_provisioning_invariants.py, where the parser contract is pinned).
+# ⚠ repo2 IS REQUIRED HERE SINCE 2026-08-28 and its absence is not a shortcut: verify-config assertion 8
+# asserts `GATE_BASIS_REPOS <= the configured repos`, so a repo1-only conf is no longer a "minimal" version
+# of production — it is a conf that has LOST a repo the ADR-0020 gate stands on, which the assertion exists
+# to refuse. That refusal firing here is the invariant working, not fixture friction.
 _MINIMAL_CONF = """[global]
 archive-async=y
 archive-push-queue-max=32GiB
 repo1-path=/pgdata/pgbackrest
 repo1-retention-full-type=time
 repo1-retention-full=30
+repo2-type=azure
+repo2-retention-full-type=time
+repo2-retention-full=30
 
 [neuro]
 pg1-path=/pgdata/18/main

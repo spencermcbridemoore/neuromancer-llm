@@ -110,3 +110,32 @@ def test_quota_absent_price_pin_raises(monkeypatch):
     monkeypatch.setattr(price_pin, "STORAGE_PRICE_PIN", expired)
     with pytest.raises(ConfigurationError):
         quota.check_quota(tripwire, prefix="artifacts-prod", backend_ids=[1])
+
+
+# ---- the repo3 budget line: NO FAKE GUARD (§A·72, 2026-08-28) --------------------------------------------
+
+
+def test_no_non_azure_repo_prefix_has_entered_the_R3_map():
+    """★ THE HONEST-REGISTER PIN (precedent E-4 made falsifiable): repo3's spend is bounded by a
+    PROVIDER-SIDE spending cap and an owner-ruled figure in ops/runbook-repo3-b2.md, NOT by this map — and a
+    future author must meet that reasoning before adding a prefix here.
+
+    ⚠ READ THE REASON, BECAUSE THE OBVIOUS ONE IS WRONG. It is NOT "nothing routes pgbackrest bytes through
+    QuotaGuardedBackend": that is true, but `db-backups` — the repo2 Azure container, written by pgbackrest
+    and by nothing else — is ALREADY in this map, and `test_quota_wiring` pins that it reports
+    `used_bytes == 0` for exactly that reason. So a documentary budget line for a pgbackrest cloud repo is an
+    ACCEPTED shape here and db-backups is the precedent. What does not transfer is the CEILING'S DERIVATION:
+    `byte_ceiling_for_prefix` resolves `storage/price_pin.py`, an Azure Hot-LRS eastus2 meter, so a B2 prefix
+    would silently inherit a byte ceiling computed from the wrong provider's rate — a number that looks
+    authoritative and is not.
+
+    Adding any such prefix reddens this."""
+    prefixes = {p.lower() for p in quota._CEILING_USD}
+    for token in quota._NON_AZURE_REPO_PREFIXES_DELIBERATELY_ABSENT:
+        assert not any(token in p for p in prefixes), (
+            f"a prefix matching {token!r} entered _BUDGET_GROUPS: its byte ceiling would be derived from the "
+            "Azure price pin, which is the wrong provider's rate. See the comment beside _BUDGET_GROUPS."
+        )
+    # non-vacuity (the D3 empty-glob idiom): the scan must actually be looking at a populated map, or the
+    # loop above passes green while examining nothing.
+    assert "db-backups" in prefixes and len(prefixes) == 5

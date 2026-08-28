@@ -55,6 +55,21 @@ _BUDGET_GROUPS: tuple[tuple[tuple[str, ...], Decimal], ...] = (
     (("db-backups",), Decimal("2.00")),
     (("upload-staging",), Decimal("0.50")),
 )
+# ⚠ repo3 (Backblaze B2, §A·72) IS DELIBERATELY ABSENT FROM THIS MAP, AND THE REASON IS THE PRICE BASIS —
+# NOT ROUTING. It would be easy to write "nothing routes pgbackrest bytes through QuotaGuardedBackend", and
+# that is true, but it is not the discriminator: `db-backups` above IS the repo2 pgbackrest container, no
+# code routes ITS bytes through the guard either, and `test_quota_wiring` pins that it reports
+# `used_bytes == 0` for exactly that reason. So a documentary budget line for a pgbackrest cloud repo is an
+# ACCEPTED shape here, and db-backups is the precedent.
+# What does NOT transfer is the ceiling's derivation: `byte_ceiling_for_prefix` resolves
+# `storage/price_pin.py`, a repo-pinned AZURE Hot-LRS eastus2 meter. A B2 prefix would silently inherit a
+# byte ceiling computed from the wrong provider's rate — a number that looks authoritative and is not.
+# The repo3 spend is therefore bounded elsewhere: ops/runbook-repo3-b2.md §2e makes a provider-side spending
+# cap a REQUIRED deploy step, and §A·39 makes the ceiling an owner figure recorded at execution. ⚠ Neither
+# exists YET — the runbook is drafted and not executed — so this comment says where that bound WILL live, not
+# that it is already in place. A test pins this absence so a future author cannot add a B2 prefix without
+# meeting this reasoning.
+_NON_AZURE_REPO_PREFIXES_DELIBERATELY_ABSENT = ("repo3", "b2", "backblaze")
 # container prefix -> its budget group's dollar ceiling / member prefixes (derived; one source of truth).
 _CEILING_USD: dict[str, Decimal] = {prefix: usd for members, usd in _BUDGET_GROUPS for prefix in members}
 _GROUP_MEMBERS: dict[str, tuple[str, ...]] = {

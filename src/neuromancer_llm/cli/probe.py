@@ -1,11 +1,12 @@
-"""`neuro probe` — run | report | verify-config | escalate | lake-escalate | disk. The timers' entry points (ADR-0015/0020).
+"""`neuro probe` — run | report | verify-config | escalate | lake-escalate | repo3-escalate | disk. The timers' entry points (ADR-0015/0020).
 
 `run` drives ONE registered durability producer (the registry lives in governance/probe_registry.py, keyed
 by the same constants as DURABILITY_ROWS — a future arm is a one-surface append); `report` is the
 SELECT-only operational rendering (system_health + the last N probe_reports); `verify-config` is the
 ruling-§3.5 provisioning-invariant assertion over the REAL pgbackrest config (+ the installed backup and
 archiver-probe timer cadences when --timer-file / --archiver-timer-file are passed — the latter is wal D4);
-`escalate` re-alerts on a PERSISTENT backup_freshness block (mirror-arm hardening, 2026-07-17); `disk` alarms
+`escalate` re-alerts on a PERSISTENT backup_freshness block (mirror-arm hardening, 2026-07-17);
+`repo3-escalate` does the same for the notify-only repo3 third copy (§A·72, 2026-08-28); `disk` alarms
 on /pgdata disk pressure (the automated `df` watch, A2-8 follow-on). All thin delegates (GO-D-timer, owner GO
 2026-07-11; escalate + disk are the mirror-arm-precedent follow-ons).
 """
@@ -16,14 +17,15 @@ import typer
 
 app = typer.Typer(
     no_args_is_help=True,
-    help="Operator probes: run | report | verify-config | escalate | lake-escalate | disk.",
+    help="Operator probes: run | report | verify-config | escalate | lake-escalate | repo3-escalate | disk.",
 )
 
 
 @app.command()
 def run(
     key: str = typer.Option(
-        ..., help="the durability row to produce: backup_freshness | wal_lag | lake_mirror_freshness"
+        ...,
+        help="the durability row to produce: backup_freshness | wal_lag | lake_mirror_freshness | repo3_freshness",
     ),
     lane: str = typer.Option(
         "canonical",
@@ -69,6 +71,7 @@ def run(
     )
     from ..governance.probe_registry import PROBE_RUNNERS, ProbeContext
     from ..governance.probes import BackupProbeError
+    from ..governance.repo3_probe import Repo3ProbeError
     from ..governance.wal_archiving import WalArchiverProbeError
     from ..registry.backends import make_backend
 
@@ -124,6 +127,10 @@ def run(
         BackupProbeError,
         WalArchiverProbeError,
         LakeMirrorProbeError,
+        # repo3 (§A·72): without this arm a blocked repo3 read would escape as an unhandled traceback
+        # instead of the clean exit-1 that `OnFailure=` alerting keys on — the same contract every other
+        # producer already has here.
+        Repo3ProbeError,
     ) as exc:
         typer.secho(f"probe {key} failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1) from exc
@@ -138,9 +145,32 @@ def report(
         help="expected DB lane verified before the read (fail closed)",
     ),
     limit: int = typer.Option(10, help="how many recent probe_reports rows to show"),
+    key: str | None = typer.Option(
+        None,
+        help="restrict the probe_reports listing to ONE probe key (e.g. repo3_freshness). Without it the "
+        "wal_lag archiver probe, which records a row every 15 minutes, crowds out every other arm's "
+        "reason within a couple of hours — so the escalation alerts name this flag.",
+    ),
 ) -> None:
     """Render the operational durability state: every system_health durability row + recent probe reports
-    (SELECT-only; `neuro db durability status` is the PROVISIONING check — this is the operational one)."""
+    (SELECT-only; `neuro db durability status` is the PROVISIONING check — this is the operational one).
+
+    ⚠ WHY `--key` EXISTS (added 2026-08-28 with the repo3 arm). Every escalation alert's triage opens with
+    "read the recorded reason first" and points here. That step was UNRUNNABLE in practice for any arm but
+    wal_lag: this listing had no per-key predicate, defaults to 10 rows, and `governance/wal_archiving.py`
+    writes a probe_reports row on EVERY run of a 15-minute timer (~96/day) — so the default view covers
+    roughly the last two hours and is entirely wal_lag, while a backup or repo3 reason is DAYS old by
+    construction (their cadence is 2 days). The alerts named a command that could not surface what they
+    told the operator to look for. One optional predicate fixes it for all four arms at once.
+    ⚠ AND `system_health.detail` IS RENDERED HERE TOO (same unit), which CLOSES the residual
+    `governance/alert_triage.py` had registered rather than fixed. Two states write NO probe_reports row at
+    all and were therefore unreachable from step (0) by any flag: a GATE-origin flip (stale_after drift /
+    staleness), whose reason `governance/health.py::_flip_and_notify` writes ONLY to `detail`, and a
+    freshly-SEEDED row, born blocked carrying its provisioning detail. Both now appear on the `detail=`
+    field of their system_health line, so every arm's "read the recorded reason first" is followable.
+    ⚠ This paragraph previously said the opposite -- that `detail` is never rendered -- thirty lines above
+    the code that renders it, in the same unit that added it. Typer prints this docstring as `--help`, so it
+    was an operator-facing falsehood about the very function carrying it (precedent 15)."""
     from sqlalchemy import text
 
     from ..db.lanes import ConfigurationError, LaneAssertionError
@@ -153,10 +183,15 @@ def report(
             rows = status_all(conn)
             reports = conn.execute(
                 text(
+                    # ⚠ CAST(:k AS text), not a bare `:k IS NULL`: Postgres cannot infer a parameter's type
+                    # from `$1 IS NULL` alone and raises AmbiguousParameter (measured here). And it is
+                    # CAST(...) rather than `:k::text`, because the `:param::cast` form MIS-PARSES in
+                    # SQLAlchemy's text() — a trap this repo has already hit twice and documented.
                     "SELECT probe_key, status, reported_at, report_text FROM neuro.probe_reports "
+                    "WHERE (CAST(:k AS text) IS NULL OR probe_key = CAST(:k AS text)) "
                     "ORDER BY probe_report_id DESC LIMIT :n"
                 ),
-                {"n": limit},
+                {"n": limit, "k": key},
             ).all()
     except (ConfigurationError, LaneAssertionError) as exc:
         typer.secho(f"probe report failed: {exc}", fg=typer.colors.RED, err=True)
@@ -164,8 +199,16 @@ def report(
 
     for r in rows:
         state = f"status={r.status}" if r.present else "MISSING (run `neuro db durability seed`)"
-        typer.echo(f"{r.health_key}: {state} measured_at={r.measured_at}")
-    typer.echo(f"--- last {len(reports)} probe report(s) ---")
+        # ⚠ `detail` IS RENDERED (added 2026-08-28 with the repo3 arm), and it closes a residual
+        # `governance/alert_triage.py` had registered rather than fixed. Two states are visible ONLY here:
+        # a GATE-origin flip (stale_after drift / staleness) writes no probe_reports row at all, and a
+        # freshly-SEEDED row is born blocked with its provisioning detail and no probe row either. Every
+        # arm's triage opens with "read the recorded reason first" — without this line that instruction was
+        # unfollowable for both states, and an operator would read a born-blocked row as an outage.
+        detail = f" detail={r.detail!r}" if r.present and r.detail else ""
+        typer.echo(f"{r.health_key}: {state} measured_at={r.measured_at}{detail}")
+    scope = f" for {key}" if key else ""
+    typer.echo(f"--- last {len(reports)} probe report(s){scope} ---")
     for rep in reports:
         typer.echo(f"[{rep.reported_at}] {rep.probe_key}: {rep.status} — {(rep.report_text or '')[:120]}")
 
@@ -197,7 +240,10 @@ def verify_config(
     from pathlib import Path
 
     from ..db.lanes import ConfigurationError
-    from ..governance.provisioning_invariants import verify_pgbackrest_config
+    from ..governance.provisioning_invariants import (
+        resolve_gate_basis_repos,
+        verify_pgbackrest_config,
+    )
 
     try:
         timer_text = Path(timer_file).read_text(encoding="utf-8") if timer_file else None
@@ -214,6 +260,16 @@ def verify_config(
 
     days = ", ".join(f"repo{k}={v}d" for k, v in sorted(report.retention_days.items()))
     typer.echo(f"verify-config OK: repos {list(report.repos)}; retention {days}")
+    # Assertion 8's REPORTED half. Printing it is what makes "repo3 is deliberately non-gating" an
+    # operational fact an operator sees on the daily run, rather than a claim in a comment — and it is why
+    # provisioning_invariants.py is entitled to say the daily verify-config run prints it.
+    if report.non_gating_repos:
+        typer.echo(
+            f"gate basis: {sorted(resolve_gate_basis_repos())}; NON-GATING (reported only): "
+            f"{list(report.non_gating_repos)}"
+        )
+    else:
+        typer.echo(f"gate basis: {sorted(resolve_gate_basis_repos())}; every configured repo gates")
     _echo_cadence(report.timer_checked, "backup timer", "BASE_BACKUP_INTERVAL", "--timer-file")
     _echo_cadence(
         report.archiver_timer_checked,
@@ -325,6 +381,56 @@ def lake_escalate(
     # neuro-alert@ fires as the fallback ping. The alert IS the record; escalation writes nothing to the DB.
     notify(message)
     typer.secho(f"probe lake-escalate (lane={lane}): ESCALATED — {message}", fg=typer.colors.YELLOW)
+
+
+@app.command("repo3-escalate")
+def repo3_escalate(
+    lane: str = typer.Option(
+        "canonical",
+        envvar="NEURO_EXPECTED_LANE",
+        help="expected DB lane verified before the read (fail closed)",
+    ),
+    escalate_after_hours: float | None = typer.Option(
+        None,
+        help="override the pinned escalation onset (BASE_BACKUP_INTERVAL + PROVISIONING_MARGIN) for THIS "
+        "call only — an explicit operator/diagnostic knob; the daily timer passes none (pin-governed). "
+        "e.g. 0 to alert on any current block (the induced-failure test).",
+    ),
+) -> None:
+    """Re-alert on a PERSISTENT repo3 block (the daily escalation; repo3 has no per-cycle OnFailure ping).
+
+    Fires an ntfy alert when repo3_freshness has read 'blocked' longer than the pinned onset, with a message
+    stating the CONSEQUENCE + a DISCRIMINATING procedure for an object-store repository. READ-ONLY against
+    system_health; a no-op (exit 0, prints its decision) when not blocked or still within the onset. The
+    daily neuro-repo3-escalate.timer's ExecStart.
+
+    NOTIFY-ONLY: the repo3_freshness row is not consulted by the ADR-0020 gate. ⚠ That is a statement about
+    the ROW — a failing repo3 can still refuse canonical writes through `wal_lag`, because pgbackrest pushes
+    WAL to every configured repository. The alert copy says so; see governance/repo3_freshness.py."""
+    import datetime as _dt
+
+    from ..db.lanes import ConfigurationError, LaneAssertionError
+    from ..db.session import make_verified_engine
+    from ..governance.notify import notify
+    from ..governance.repo3_escalation import evaluate_repo3_block_escalation
+
+    try:
+        override = _dt.timedelta(hours=escalate_after_hours) if escalate_after_hours is not None else None
+        engine = make_verified_engine(expected_lane=lane)
+        message = evaluate_repo3_block_escalation(engine, escalate_after=override)
+    except (ConfigurationError, LaneAssertionError) as exc:
+        typer.secho(f"probe repo3-escalate failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+    if message is None:
+        typer.echo(
+            f"probe repo3-escalate (lane={lane}): repo3_freshness is not in a persistent-block state — "
+            "no alert."
+        )
+        return
+    # notify() is fail-LOUD (ADR-0019): a broken channel raises -> non-zero exit -> the unit's OnFailure=
+    # neuro-alert@ fires as the fallback ping. The alert IS the record; escalation writes nothing to the DB.
+    notify(message)
+    typer.secho(f"probe repo3-escalate (lane={lane}): ESCALATED — {message}", fg=typer.colors.YELLOW)
 
 
 @app.command()

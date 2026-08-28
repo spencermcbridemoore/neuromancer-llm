@@ -23,9 +23,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import text
-
-from .alert_triage import ESCALATION_ARMS, compose_block_alert
+from .alert_triage import ESCALATION_ARMS
+from .block_escalation import evaluate_block_escalation
 from .lake_freshness import LAKE_MIRROR_FRESHNESS_KEY, resolve_lake_mirror_block_escalate_after
 
 if TYPE_CHECKING:
@@ -40,34 +39,17 @@ def evaluate_lake_mirror_block_escalation(
     """Return an ACTIONABLE alert message iff `lake_mirror_freshness` has read 'blocked' longer than the onset
     bound; else None. READ-ONLY (a plain SELECT — no flip, no write).
 
+    ⚠ THE BODY MOVED, THE BEHAVIOUR DID NOT (2026-08-28, the repo3 unit) — the four-branch chain and its SQL
+    now live ONCE in `governance/block_escalation.py`; this module supplies only what is this arm's own.
+
     `escalate_after` overrides the pinned onset for THIS call only — an explicit operator/diagnostic knob (the
     daily timer passes none, so AUTOMATED escalation is pin-governed and fail-closed via
     resolve_lake_mirror_block_escalate_after; e.g. 0 to alert on any current block — the induced-failure test).
-
-    The staleness comparison runs IN SQL (`now() - measured_at > :bound`) over the NOT-NULL `measured_at` — the
-    governance/escalation.py idiom. Branches (each returns None = no alert):
-      - row missing         -> None (a never-seeded signal is `neuro db durability seed`'s concern);
-      - status != 'blocked' -> None (nothing to escalate — a fresh/ok mirror);
-      - blocked but within the onset -> None (a single just-recorded block is not yet persistent);
-      - blocked AND older than the onset -> the message.
     """
-    bound = escalate_after if escalate_after is not None else resolve_lake_mirror_block_escalate_after()
-    with engine.connect() as conn:
-        row = (
-            conn.execute(
-                text(
-                    "SELECT status, measured_at, (now() - measured_at) AS blocked_for, "
-                    "(now() - measured_at) > :bound AS blocked_too_long "
-                    "FROM neuro.system_health WHERE health_key = :k"
-                ),
-                {"bound": bound, "k": LAKE_MIRROR_FRESHNESS_KEY},
-            )
-            .mappings()
-            .one_or_none()
-        )
-    if row is None or row["status"] != "blocked" or not row["blocked_too_long"]:
-        return None
-    days = row["blocked_for"].days
-    return compose_block_alert(
-        arm=ESCALATION_ARMS[LAKE_MIRROR_FRESHNESS_KEY], days=days, measured_at=row["measured_at"]
+    return evaluate_block_escalation(
+        engine,
+        health_key=LAKE_MIRROR_FRESHNESS_KEY,
+        arm=ESCALATION_ARMS[LAKE_MIRROR_FRESHNESS_KEY],
+        resolve_onset=resolve_lake_mirror_block_escalate_after,
+        escalate_after=escalate_after,
     )

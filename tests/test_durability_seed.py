@@ -39,6 +39,7 @@ from neuromancer_llm.governance.health import (
     assert_durability_ok,
 )
 from neuromancer_llm.governance.lake_freshness import LAKE_MIRROR_FRESHNESS_KEY
+from neuromancer_llm.governance.repo3_freshness import REPO3_FRESHNESS_KEY
 from neuromancer_llm.governance.wal_freshness import WAL_LAG_KEY
 
 _EPOCH = _dt.datetime(1970, 1, 1, tzinfo=_dt.UTC)
@@ -85,6 +86,7 @@ def test_seed_all_seeds_backup_freshness_born_blocked(repo):
         BACKUP_FRESHNESS_KEY: True,
         WAL_LAG_KEY: True,
         LAKE_MIRROR_FRESHNESS_KEY: True,
+        REPO3_FRESHNESS_KEY: True,
     }
     row = _read(repo.engine)
     assert row is not None
@@ -130,11 +132,13 @@ def test_seed_all_idempotent(repo):
         BACKUP_FRESHNESS_KEY: True,
         WAL_LAG_KEY: True,
         LAKE_MIRROR_FRESHNESS_KEY: True,
+        REPO3_FRESHNESS_KEY: True,
     }
     assert _seed(repo.engine) == {
         BACKUP_FRESHNESS_KEY: False,
         WAL_LAG_KEY: False,
         LAKE_MIRROR_FRESHNESS_KEY: False,
+        REPO3_FRESHNESS_KEY: False,
     }  # already present
     row = _read(repo.engine)
     assert row is not None and row["measured_at"] == _EPOCH  # undisturbed
@@ -178,6 +182,7 @@ def test_reconcile_realigns_drift_but_leaves_status_and_measured_at(repo):
         BACKUP_FRESHNESS_KEY: (True, 1),
         WAL_LAG_KEY: (True, 0),
         LAKE_MIRROR_FRESHNESS_KEY: (True, 0),
+        REPO3_FRESHNESS_KEY: (True, 0),
     }
     row = _read(repo.engine)
     assert row is not None
@@ -205,6 +210,7 @@ def test_reconcile_never_fills_null_sentinel_gate_stays_blocked(repo):
         BACKUP_FRESHNESS_KEY: (True, 0),
         WAL_LAG_KEY: (False, 0),
         LAKE_MIRROR_FRESHNESS_KEY: (False, 0),
+        REPO3_FRESHNESS_KEY: (False, 0),
     }
     row = _read(repo.engine)
     assert row is not None and row["stale_after"] is None  # still NULL
@@ -218,9 +224,14 @@ def test_reconcile_never_fills_null_sentinel_gate_stays_blocked(repo):
 @pytest.mark.pg
 def test_status_reports_missing_then_ok_then_drift(repo):
     st = _status(repo.engine)  # unseeded (repo truncated)
-    # registry order: backup_freshness, wal_lag, lake_mirror_freshness (B-7 appended)
-    assert len(st) == 3 and st[0].health_key == BACKUP_FRESHNESS_KEY
-    assert st[0].present is False and st[1].present is False and st[2].present is False
+    # ⚠ A KEYSET PIN, NOT A COUNT (converted 2026-08-28 with the repo3 arm). `len(st) == 3` was the fourth
+    # literal in this file encoding "how many durability rows exist", and a count says nothing about WHICH —
+    # it would stay green if an arm were swapped for another. Keying on DURABILITY_KEYS makes the next arm a
+    # pure append here, which is the property the whole one-surface registry exists to have. The registry
+    # ORDER is pinned separately, because status_all's output order is what the CLI renders.
+    assert {s.health_key for s in st} == DURABILITY_KEYS
+    assert st[0].health_key == BACKUP_FRESHNESS_KEY  # registry order: backup first
+    assert all(s.present is False for s in st)
     _seed(repo.engine)
     st0 = _status(repo.engine)[0]
     assert st0.present is True and st0.drift is False and st0.status == "blocked"
@@ -284,8 +295,9 @@ def test_cli_seed_status_reconcile_on_test_lane(repo):
     # repo truncates system_health; the CLI hits the SAME session DB (lane='test') via NEURO_DATABASE_URL.
     assert _runner.invoke(app, ["db", "durability", "status", "--lane", "test"]).exit_code == 1  # unseeded
     r = _runner.invoke(app, ["db", "durability", "seed", "--lane", "test"])
-    # backup_freshness + wal_lag + lake_mirror_freshness (B-7), one surface
-    assert r.exit_code == 0 and "3 inserted" in r.stdout
+    # backup_freshness + wal_lag + lake_mirror_freshness (B-7) + repo3_freshness (§A·72), ONE surface —
+    # derived from the registry so a future arm does not need a fifth edit of a bare literal here.
+    assert r.exit_code == 0 and f"{len(DURABILITY_KEYS)} inserted" in r.stdout
     r = _runner.invoke(app, ["db", "durability", "status", "--lane", "test"])
     assert r.exit_code == 0 and "provisioned + consistent" in r.stdout
     assert _runner.invoke(app, ["db", "durability", "reconcile", "--lane", "test"]).exit_code == 0

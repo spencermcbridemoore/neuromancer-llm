@@ -13,6 +13,8 @@ import datetime as _dt
 import pytest
 
 from neuromancer_llm.db.lanes import ConfigurationError
+from neuromancer_llm.governance import provisioning_invariants as pi
+from neuromancer_llm.governance.freshness import resolve_backup_stale_after
 from neuromancer_llm.governance.provisioning_invariants import (
     _parse_systemd_span,
     resolve_base_backup_interval,
@@ -318,3 +320,101 @@ def test_retention_shape_failure_does_not_echo_value(conf, tmp_path):
         _verify(conf, tmp_path)
     msg = str(ei.value)
     assert "repo1-retention-full" in msg and sentinel not in msg
+
+
+# ---- assertion 8 + the repo3-bearing conf (the repo3 unit, §A·72, 2026-08-28) ----------------------------
+
+# The VERBATIM conf with the repo3 (Backblaze B2 via S3) block the deploy runbook seats. ⚠ It is spliced
+# BEFORE `[neuro]`, not appended, because a `tee -a` lands at end-of-file — i.e. INSIDE the stanza section —
+# which the a2-7 execution recorded as a real placement bug. The fixture is built the way the runbook does it
+# so the checker is exercised against the shape the live file will actually have.
+_REPO3_BLOCK = """repo3-type=s3
+repo3-path=/neuro
+repo3-s3-bucket=EXAMPLE-BUCKET
+repo3-s3-endpoint=s3.example.invalid
+repo3-s3-region=example-region
+repo3-s3-uri-style=path
+repo3-retention-full-type=time
+repo3-retention-full=30
+repo3-bundle=y
+"""
+
+
+def _with_repo3(block: str = _REPO3_BLOCK) -> str:
+    head, sep, tail = VERBATIM_CONF.partition("[neuro]")
+    assert sep, "the fixture conf must carry a [neuro] stanza section"
+    return head + block + sep + tail
+
+
+def test_a_repo3_bearing_conf_passes_and_reports_it_as_NON_GATING(tmp_path):
+    """★ The landing shape. repo3 is configured, satisfies assertions 1+2 like any other repo, and is
+    REPORTED as outside the gate basis rather than joining it. `repos` grows; `retention_days` grows; the
+    ADR-0020 basis does not."""
+    p = tmp_path / "pgbackrest.conf"
+    p.write_text(_with_repo3(), encoding="utf-8")
+    report = verify_pgbackrest_config(p, legacy_conf_path=tmp_path / "nope.conf")
+    assert report.repos == (1, 2, 3)
+    assert report.retention_days == {1: 30, 2: 30, 3: 30}
+    assert report.non_gating_repos == (3,)
+
+
+def test_todays_two_repo_conf_reports_NO_non_gating_repos(conf, tmp_path):
+    """The no-churn companion: before the conf edit there is nothing outside the basis, and the field is an
+    EMPTY tuple rather than absent — so the daily verify-config run says "every configured repo gates"."""
+    report = verify_pgbackrest_config(conf, legacy_conf_path=tmp_path / "nope.conf")
+    assert report.repos == (1, 2) and report.non_gating_repos == ()
+
+
+def test_assertion_8_fails_loud_when_a_BASIS_repo_is_missing_from_the_conf(tmp_path, monkeypatch):
+    """★ THE INVARIANT THAT STOPS THE PIN BECOMING A SECOND HAND-SET COPY OF THE CONF. The daily
+    verify-config timer measures `basis <= configured` against the REAL file, so the two cannot rot apart in
+    silence — the same two-edit trap assertion 5 closes for the timer cadence. Here the conf has repos 1+2
+    and the basis names a repo4 that does not exist."""
+    monkeypatch.setattr(pi, "GATE_BASIS_REPOS", frozenset({1, 2, 4}))
+    p = tmp_path / "pgbackrest.conf"
+    p.write_text(VERBATIM_CONF, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match=r"gate basis names repo\(s\) \[4\]"):
+        verify_pgbackrest_config(p, legacy_conf_path=tmp_path / "nope.conf")
+
+
+def test_assertion_8_fails_closed_on_an_EMPTY_basis(tmp_path, monkeypatch):
+    """The resolver is called BEFORE the comparison, so an emptied pin refuses to certify rather than
+    vacuously satisfying `<=` (every set contains the empty set — which is exactly how this check would
+    silently pass while asserting nothing)."""
+    monkeypatch.setattr(pi, "GATE_BASIS_REPOS", frozenset())
+    p = tmp_path / "pgbackrest.conf"
+    p.write_text(VERBATIM_CONF, encoding="utf-8")
+    with pytest.raises(ConfigurationError, match="gate basis pin is absent or EMPTY"):
+        verify_pgbackrest_config(p, legacy_conf_path=tmp_path / "nope.conf")
+
+
+def test_repo3_with_a_COUNT_retention_type_reddens_assertion_1(tmp_path):
+    """pgbackrest DEFAULTS to 'count', so a dropped type line silently converts "30" from 30 days to 30
+    BACKUPS. Assertion 1 auto-extends to repo3 — this is the fixture that proves it rather than assuming it.
+    ⚠ The message must name repo3 and must NOT echo the value (the redaction contract)."""
+    p = tmp_path / "pgbackrest.conf"
+    p.write_text(
+        _with_repo3(
+            _REPO3_BLOCK.replace("repo3-retention-full-type=time", "repo3-retention-full-type=count")
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigurationError, match="repo3-retention-full-type is not 'time'") as exc:
+        verify_pgbackrest_config(p, legacy_conf_path=tmp_path / "nope.conf")
+    assert "30" not in str(exc.value)
+
+
+def test_repo3_below_the_retention_floor_reddens_assertion_2(tmp_path):
+    """min() over ALL repos, so a short repo3 makes repo3 the named worst offender. The floor is
+    BACKUP_STALE_AFTER(8d) + BASE_BACKUP_INTERVAL(2d) + PROVISIONING_MARGIN(2d) = 12d, computed from the
+    module's own pins rather than hardcoded here."""
+    p = tmp_path / "pgbackrest.conf"
+    p.write_text(
+        _with_repo3(_REPO3_BLOCK.replace("repo3-retention-full=30", "repo3-retention-full=10")),
+        encoding="utf-8",
+    )
+    floor = (
+        resolve_backup_stale_after() + pi.resolve_base_backup_interval() + pi.resolve_provisioning_margin()
+    ).days
+    with pytest.raises(ConfigurationError, match=rf"repo3-retention-full=10d < the pinned floor {floor}d"):
+        verify_pgbackrest_config(p, legacy_conf_path=tmp_path / "nope.conf")

@@ -23,6 +23,7 @@ import pytest
 from neuromancer_llm.db.lanes import ConfigurationError
 from neuromancer_llm.governance.alert_triage import (
     ESCALATION_ARMS,
+    OBJECT_STORE_REPO_TRIAGE,
     OFF_CLOUD_MIRROR_TRIAGE,
     BlockAlertArm,
     compose_block_alert,
@@ -31,14 +32,26 @@ from neuromancer_llm.governance.alert_triage import (
 from neuromancer_llm.governance.durability import DURABILITY_KEYS
 from neuromancer_llm.governance.freshness import BACKUP_FRESHNESS_KEY
 from neuromancer_llm.governance.lake_freshness import LAKE_MIRROR_FRESHNESS_KEY
+from neuromancer_llm.governance.repo3_freshness import REPO3_FRESHNESS_KEY
 from neuromancer_llm.governance.wal_freshness import WAL_LAG_KEY
 
 _SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "neuromancer_llm"
 
-#: Single unbroken tokens drawn from the triage's own text. ⚠ NEVER a phrase: the constant wraps at the
+#: Single unbroken tokens drawn from each triage's own text. ⚠ NEVER a phrase: the constants wrap at the
 #: 110-col limit, so a sentinel copied from the RENDERED string would straddle an implicit-concatenation
 #: boundary and match nothing in every file forever — a permanent clean green (the false-green family).
+#: ⚠ THIS IS THE EXACT INVERSE OF THE RULE FOR RENDERED-MESSAGE ASSERTIONS, and both are deliberate: a
+#: SOURCE scan must use unbroken TOKENS (the source is wrapped), while an assertion against a COMPOSED
+#: message must use PHRASES (two tokens are not a contrast — the log:274 measurement). Inverting either
+#: produces a permanently green probe.
 _TRIAGE_SENTINELS = ("neuromirror", "preauth", "netmap")
+#: The same, for the object-store triage (repo3). Kept as a SEPARATE tuple so the home-module non-vacuity
+#: check below can prove each triage is present on its own rather than in aggregate.
+#: ⚠ MEASURED, NOT GUESSED. A first draft used ("journalctl", "narrow", "widen") and the scan reddened on
+#: NINE unrelated modules — "narrow"/"widen" are ordinary English that appears all over `src/`. A sentinel
+#: must be a token that is DISTINCTIVE to the triage, or the probe reports a fork that does not exist. Each
+#: of these three was checked against the rest of `src/` and appears in no other module.
+_OBJECT_STORE_SENTINELS = ("journalctl", "P00", "403")
 
 
 # ---- the arm registry: a new escalating arm is a PURE APPEND ---------------------------------------------
@@ -52,7 +65,11 @@ def test_escalation_arms_are_a_subset_of_the_provisioned_durability_rows() -> No
     fabricated arm for it. Every escalating arm must be a provisioned row; not every provisioned row
     escalates."""
     assert frozenset(ESCALATION_ARMS) <= DURABILITY_KEYS
-    assert frozenset(ESCALATION_ARMS) == {BACKUP_FRESHNESS_KEY, LAKE_MIRROR_FRESHNESS_KEY}
+    assert frozenset(ESCALATION_ARMS) == {
+        BACKUP_FRESHNESS_KEY,
+        LAKE_MIRROR_FRESHNESS_KEY,
+        REPO3_FRESHNESS_KEY,
+    }
     # Pin the PROPERNESS itself, so the `<=` above is not silently an `==` a future reader would tighten:
     # wal_lag is provisioned and deliberately un-escalated.
     assert WAL_LAG_KEY in DURABILITY_KEYS and WAL_LAG_KEY not in ESCALATION_ARMS
@@ -67,15 +84,27 @@ def test_every_arm_carries_every_coordinate_non_blank() -> None:
             assert isinstance(value, str) and value.strip(), f"{key}.{field} is blank"
 
 
-def test_the_two_arms_do_not_share_a_rerun_unit_or_headline() -> None:
-    """The likeliest refactor error when folding two hardcoded strings into one composer is an arm SWAP —
-    which would tell an operator to re-run the wrong unit, i.e. this unit's own defect one arm over."""
+def test_the_arms_do_not_share_a_headline_or_label_and_share_a_rerun_unit_only_by_design() -> None:
+    """The likeliest refactor error when folding hardcoded strings into one composer is an arm SWAP — which
+    would tell an operator to re-run the wrong unit, i.e. this unit's own defect one arm over.
+
+    ⚠ `rerun_unit` UNIQUENESS WAS DROPPED AS AN INVARIANT AND REPLACED BY AN EXPLICIT ALLOW-SET, rather than
+    quietly deleted (2026-08-28, the repo3 arm). repo3's backup and probe are extra `ExecStart=-` /
+    `ExecStartPost=-` lines on `neuro-backup.service`, so that genuinely IS the unit to re-run; inventing a
+    distinct name would be a checkable falsehood, and a separate unit would race the main backup for
+    pgbackrest's per-stanza lock. Headline and label stay UNIQUE, so an arm swap is still caught — and the
+    sharing is pinned as a named pair, so a THIRD arm cannot join the shared unit without editing this."""
     headlines = [a.headline for a in ESCALATION_ARMS.values()]
-    reruns = [a.rerun_unit for a in ESCALATION_ARMS.values()]
     labels = [a.no_confirmed_label for a in ESCALATION_ARMS.values()]
     assert len(set(headlines)) == len(headlines)
-    assert len(set(reruns)) == len(reruns)
     assert len(set(labels)) == len(labels)
+    shared = {
+        unit: sorted(k for k, a in ESCALATION_ARMS.items() if a.rerun_unit == unit)
+        for unit in {a.rerun_unit for a in ESCALATION_ARMS.values()}
+    }
+    assert {u: ks for u, ks in shared.items() if len(ks) > 1} == {
+        "neuro-backup.service": sorted([BACKUP_FRESHNESS_KEY, REPO3_FRESHNESS_KEY])
+    }
 
 
 # ---- the composer's contract ------------------------------------------------------------------------------
@@ -141,25 +170,37 @@ def test_the_triage_text_lives_in_exactly_one_module() -> None:
     prevent — specifically the dangerous one, a copy identical on landing day that drifts a year later.
 
     NON-VACUITY PIN FIRST (the D3 empty-glob idiom): assert the sentinels ARE present in the home module, so
-    a mis-resolved `_SRC` or a re-worded constant reddens instead of passing green while matching nothing."""
+    a mis-resolved `_SRC` or a re-worded constant reddens instead of passing green while matching nothing.
+
+    ⚠ BOTH triages are scanned SEPARATELY (2026-08-28). Checking them in aggregate would let a re-worded or
+    deleted second triage hide behind the first one's hits, which is the same aggregation blindness the
+    per-target mutation rule exists to stop."""
     home = "governance/alert_triage.py"
+    all_sentinels = _TRIAGE_SENTINELS + _OBJECT_STORE_SENTINELS
     hits: dict[str, set[str]] = {}
     for py in sorted(_SRC.rglob("*.py")):
         rel = py.relative_to(_SRC).as_posix()
         text = py.read_text(encoding="utf-8")
-        found = {s for s in _TRIAGE_SENTINELS if s in text}
+        found = {s for s in all_sentinels if s in text}
         if found:
             hits[rel] = found
-    assert hits.get(home) == set(_TRIAGE_SENTINELS), (
-        f"the scan did not find every sentinel in {home} (found {hits.get(home)}) — a re-worded triage or a "
-        "mis-resolved src root would make the assertion below vacuously GREEN"
-    )
+    for group, label in ((_TRIAGE_SENTINELS, "off-cloud"), (_OBJECT_STORE_SENTINELS, "object-store")):
+        assert set(group) <= hits.get(home, set()), (
+            f"the scan did not find every {label} sentinel in {home} (found {hits.get(home)}) — a re-worded "
+            "triage or a mis-resolved src root would make the assertion below vacuously GREEN"
+        )
+    assert hits.get(home) == set(all_sentinels)
     assert set(hits) == {home}, f"triage copy found outside {home}: {sorted(set(hits) - {home})}"
 
 
-def test_only_the_two_escalation_arms_consume_the_shared_copy() -> None:
+def test_exactly_the_escalation_arms_and_the_shared_evaluator_consume_the_copy() -> None:
     """★ Makes the `disk_pressure.py` exclusion FALSIFIABLE rather than an in-code assertion, and makes a
-    third arm's arrival LOUD (the fold-7 one-surface-append idiom).
+    NEW arm's arrival LOUD (the fold-7 one-surface-append idiom).
+
+    ⚠ RENAMED 2026-08-28. It was `..._only_the_two_escalation_arms_...` and promised to make "a third arm's
+    arrival LOUD" — the third arm has arrived, so both the name and that phrasing had become false about the
+    set the probe actually pins (three arms plus the extracted evaluator). Renaming rather than leaving a
+    stale name is the point: a probe whose name misdescribes it is read past.
 
     `disk_pressure.py` is deliberately NOT a caller: its ACTION (prune retained fulls / expand the volume) is
     deterministic for its cause, it reads no `system_health` row, and it uses no off-cloud transport. Folding
@@ -178,9 +219,21 @@ def test_only_the_two_escalation_arms_consume_the_shared_copy() -> None:
             )
             if from_import or plain_import:
                 importers.add(rel)
-    assert importers == {"governance/escalation.py", "governance/lake_escalation.py"}, (
+    assert importers == {
+        "governance/escalation.py",
+        "governance/lake_escalation.py",
+        "governance/repo3_escalation.py",
+        # The shared evaluator composes the message, so it imports the copy too. ⚠ THE ARM MODULES ARE STILL
+        # IN THIS SET ON PURPOSE: `evaluate_block_escalation` takes `arm=`, so each arm keeps its own
+        # `ESCALATION_ARMS[...]` lookup and therefore its own import. An earlier draft of the extraction
+        # passed `health_key=` and looked the arm up inside the evaluator — which would have collapsed this
+        # set to {block_escalation} and turned the probe into f(x)-vs-f(x): a fourth arm would have imported
+        # the evaluator instead and this assertion would have stayed GREEN, losing BOTH of the purposes
+        # named above. The signature is what keeps this probe meaningful.
+        "governance/block_escalation.py",
+    }, (
         f"unexpected consumers of the shared alert copy: {sorted(importers)} — a new arm is a registry "
-        "append plus its own evaluator; update this probe only with a justification"
+        "append plus its own delegate; update this probe only with a justification"
     )
 
 
@@ -216,8 +269,27 @@ def test_every_arm_message_is_pure_ascii(key: str) -> None:
     assert msg.isascii(), f"non-ASCII in the {key} alert: {[c for c in msg if not c.isascii()]}"
 
 
-def test_the_shared_triage_is_the_same_object_for_every_arm() -> None:
-    """Identity, not equality: two arms holding equal-but-distinct strings would satisfy `==` while being
-    two implementations. Complements the source scan above from the other direction."""
-    for arm in ESCALATION_ARMS.values():
-        assert arm.triage is OFF_CLOUD_MIRROR_TRIAGE
+def test_each_arm_carries_the_triage_for_its_own_failing_leg() -> None:
+    """★ AN EXACT PARTITION BY FAILING LEG, ASSERTED BY IDENTITY — the replacement for the blanket
+    "every arm carries OFF_CLOUD_MIRROR_TRIAGE" pin, which the repo3 arm legitimately falsifies.
+
+    Identity, not equality: two arms holding equal-but-distinct strings would satisfy `==` while being two
+    implementations. Complements the source scan above from the other direction.
+
+    ⚠ RE-KEYED, NOT LOOSENED, and the difference matters. The tempting weakening is
+    `arm.triage in {OFF_CLOUD_MIRROR_TRIAGE, OBJECT_STORE_REPO_TRIAGE}` — which would let a FOURTH arm on a
+    third kind of leg silently inherit whichever of the two it happened to pick, i.e. ship the exact defect
+    this module was built to repair, one arm over. An exact mapping means a new arm must be added HERE, by a
+    human deciding which leg it is on. That is the `ENTITY_KINDS` rule (flip the exactness in the same unit;
+    never relax it to a containment check) applied to alert copy."""
+    assert {k: a.triage for k, a in ESCALATION_ARMS.items()} == {
+        BACKUP_FRESHNESS_KEY: OFF_CLOUD_MIRROR_TRIAGE,
+        LAKE_MIRROR_FRESHNESS_KEY: OFF_CLOUD_MIRROR_TRIAGE,
+        REPO3_FRESHNESS_KEY: OBJECT_STORE_REPO_TRIAGE,
+    }
+    # identity, arm by arm — `==` on a dict of strings would accept a distinct equal copy
+    assert ESCALATION_ARMS[BACKUP_FRESHNESS_KEY].triage is OFF_CLOUD_MIRROR_TRIAGE
+    assert ESCALATION_ARMS[LAKE_MIRROR_FRESHNESS_KEY].triage is OFF_CLOUD_MIRROR_TRIAGE
+    assert ESCALATION_ARMS[REPO3_FRESHNESS_KEY].triage is OBJECT_STORE_REPO_TRIAGE
+    # and the acceptance criterion stated as its own assertion, so it cannot be lost in a refactor of the above
+    assert ESCALATION_ARMS[REPO3_FRESHNESS_KEY].triage is not OFF_CLOUD_MIRROR_TRIAGE

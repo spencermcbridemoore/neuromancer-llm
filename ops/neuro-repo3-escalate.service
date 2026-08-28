@@ -1,0 +1,26 @@
+[Unit]
+# repo3 (Backblaze B2) persistent-block escalation (§A·72, 2026-08-28) — the third instance of the
+# neuro-freshness-escalate / neuro-lake-mirror-escalate pattern. Re-alerts while
+# system_health['repo3_freshness'] stays 'blocked' longer than the pinned onset
+# (governance/repo3_freshness.py::resolve_repo3_block_escalate_after == BASE_BACKUP_INTERVAL +
+# PROVISIONING_MARGIN). NOTIFY-ONLY: the repo3 row is not consulted by the ADR-0020 durability gate.
+#
+# ⚠ THIS IS repo3's ONLY ALERT, unlike the other two arms. Both of them are ALSO covered by a per-cycle
+# OnFailure= ping on their own producing unit. repo3's backup and probe are extra ExecStart=- /
+# ExecStartPost=- lines on neuro-backup.service carrying systemd's ignore-failure prefix — which is the
+# §A·72 requirement (an unproven arm must never block the gating freshness bump) and which also means a
+# repo3 failure can never fail that unit and can never fire its OnFailure. So this daily timer is the whole
+# alerting story for repo3, and the worst-case time to first alert is about the 2-day backup cadence plus
+# the 4-day onset. Stated here because it is the price of notify-only-by-construction.
+Description=neuro repo3 (B2) persistent-block escalation
+# A notify()-delivery failure exits non-zero -> this fallback fires the generic ping (belt on the alert).
+OnFailure=neuro-alert@%n.service
+
+[Service]
+Type=oneshot
+User=postgres
+EnvironmentFile=/etc/neuro/env
+TimeoutStartSec=120
+# `neuro probe repo3-escalate` is READ-ONLY against system_health + notify(); no --escalate-after-hours here,
+# so the onset is the pinned bound (automated escalation is pin-governed, fail-closed).
+ExecStart=/home/ubuntu/neuromancer-llm/.venv/bin/neuro probe repo3-escalate --lane canonical

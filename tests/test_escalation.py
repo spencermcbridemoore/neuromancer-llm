@@ -90,13 +90,33 @@ def _assert_backup_copy(msg: str | None, *, measured_at) -> None:
     assert "/dev/tcp" in msg
     assert "'refused' would mean you reached the host" in msg
     # (4) step 0 — the recorded reason, which is what scopes steps 1-3 to one of ~13 disjuncts.
-    assert "neuro probe report" in msg
+    # ⚠ REWORDED 2026-08-28 (the repo3 unit's amend), and PINNED AS PHRASES rather than as the bare token
+    # `neuro probe report`, which survived every wording change this step has ever had. Step 0 names TWO
+    # reads because the closure that made it followable has two halves: `detail=` is the ONLY trace of the
+    # states that write no probe_reports row, and `--key` is what makes the probe_reports half reachable past
+    # the 15-minute WAL-archiver probe. The old copy asserted the opposite of the first half.
+    assert "run `neuro probe report`" in msg
+    assert "Every durability row prints a `detail=` field" in msg
+    assert "two states write NO probe_reports row at all and their reason exists ONLY there" in msg
+    assert "`neuro probe report --key <the health_key at the start of that line>`" in msg
+    assert "The flag is not optional in practice" in msg
+    # the NEGATIVE half: the superseded claim must be gone, and it is asserted alongside the positives above
+    # so it cannot pass vacuously on a gutted string (the co-location rule this file already follows).
+    assert "records no reason at all" not in msg
     # (5) the disjunction is disclosed rather than narrowed to the transport. ⚠ ASSERT THE DISCLOSURE, NOT
     #     THE WORD `pgbackrest`: the mutation matrix MEASURED that a bare `"pgbackrest" in msg` SURVIVES
     #     gutting this clause, because step 0's reason list ("recency: / pgbackrest verify / ...") also
     #     contains the token. A probe satisfied by an unrelated part of the same string pins nothing.
     assert "folds SEVERAL checks into one boolean" in msg
-    assert "EVERY configured pgbackrest repo" in msg
+    # ⚠ CHANGED 2026-08-28 (the repo3 unit), and the change was FORCED, not cosmetic. This used to assert
+    # "EVERY configured pgbackrest repo". That was true while the driver derived its repo set from the info
+    # JSON; the GATE_BASIS_REPOS pin made it FALSE, because a configured-but-unpinned repo3 is reported
+    # without setting this row. Leaving the old assertion would have pinned a checkable falsehood in place.
+    # Both halves are asserted as PHRASES: the basis claim, AND the sentence that tells an operator a
+    # non-basis repo has its own row — the second is what stops someone reading "gate basis" as "all repos".
+    assert "every repo in the pinned GATE BASIS" in msg
+    assert "OUTSIDE the basis is reported in this row's detail but does NOT set it" in msg
+    assert "EVERY configured pgbackrest repo" not in msg
     assert "cloud-repo cadence stall lands here too" in msg
     # (6) what worked is preserved: the age and the last-good timestamp, the timestamp READ BACK FROM THE DB
     #     rather than from the message that produced it (written-and-never-read-back).

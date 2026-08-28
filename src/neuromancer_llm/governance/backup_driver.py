@@ -10,11 +10,17 @@ travel as an ssh_config Host ALIAS consumed only through the CommandRunner seam.
 Driver order (every step through the seam, every step with a PINNED timeout — §8 fold 5: a transfer to a
 desktop that sleeps mid-stream must become a loud failure, never a wedged-forever unit):
 
-  0. RECENCY (§8 fold 3 — the headline): `pgbackrest info --output=json`; the newest FULL backup on EACH
-     configured repo must be younger than BASE_BACKUP_INTERVAL + PROVISIONING_MARGIN, else blocked. A
-     mirror of an old-but-intact repo must NEVER bump freshness (that would hold the 8-day gate open
-     forever while base backups have silently stopped) — and per-repo means a stopped repo2 cadence
-     (A2-7 §4.4) goes loud here even though the mirror reads repo1.
+  0. RECENCY (§8 fold 3 — the headline): `pgbackrest info --output=json`; the newest FULL backup on each
+     repo IN THE PINNED GATE BASIS (provisioning_invariants.GATE_BASIS_REPOS) must be younger than
+     BASE_BACKUP_INTERVAL + PROVISIONING_MARGIN, else blocked. A mirror of an old-but-intact repo must
+     NEVER bump freshness (that would hold the 8-day gate open forever while base backups have silently
+     stopped) — and per-repo means a stopped repo2 cadence (A2-7 §4.4) goes loud here even though the
+     mirror reads repo1. ⚠ CHANGED 2026-08-28 (repo3 unit, owner-nodded): the basis is the PIN, not
+     "each CONFIGURED repo". A conf-added repo (repo3 on B2, §A·72) is READ and REPORTED in the detail but
+     does NOT gate — that is what makes it NOTIFY-ONLY — while a repo in the basis that has vanished from
+     the conf now fails CLOSED instead of silently leaving. Anything you say about this step's coverage
+     must be keyed to the basis; `governance/alert_triage.py`'s backup arm is worded that way for the same
+     reason.
   1. VERIFY: `pgbackrest --repo=1 verify` — integrity BEFORE transfer. Honest limit: the mirror is
      TRANSFER-verified, never restore-verified (that is A2-9-real), and it copies a live tree.
   2. MIRROR (manifest-based, so pgbackrest expire's retention pruning propagates): diff the local repo tree
@@ -41,7 +47,11 @@ from pathlib import Path, PurePosixPath
 
 from ..db.lanes import ConfigurationError
 from .probes import BackupOutcome
-from .provisioning_invariants import resolve_base_backup_interval, resolve_provisioning_margin
+from .provisioning_invariants import (
+    resolve_base_backup_interval,
+    resolve_gate_basis_repos,
+    resolve_provisioning_margin,
+)
 from .sftp_transport import (
     CommandResult as CommandResult,
 )
@@ -88,15 +98,30 @@ def _local_manifest(repo_path: Path) -> dict[str, int]:
     return out
 
 
-def _repo_freshness_from_info(
-    info_json: str, *, stanza: str, bound: _dt.timedelta, now: _dt.datetime
-) -> tuple[bool, str]:
-    """Parse `pgbackrest info --output=json`: the newest FULL backup per repo must be younger than `bound`.
-    Any parse surprise fails CLOSED (a recency check that cannot read the evidence must not pass)."""
+class InfoUnreadableError(RuntimeError):
+    """`pgbackrest info --output=json` could not be parsed into (repos, newest-full-per-repo).
+
+    Carries only the EXCEPTION TYPE NAME, never the offending content: the info JSON is derived from a conf
+    that holds account-wide cloud keys, and the redaction contract that governs provisioning_invariants.py
+    applies to anything downstream of that file."""
+
+
+def newest_full_per_repo(
+    info_json: str, *, stanza: str
+) -> tuple[tuple[int, ...], dict[int, tuple[float, str]]]:
+    """Parse `pgbackrest info --output=json` into (configured repo keys, {repo-key: (stop_epoch, label)}).
+
+    ONE implementation of "read the info JSON", TWO callers asking DIFFERENT questions: the gating recency
+    over `GATE_BASIS_REPOS` (`_repo_freshness_from_info` below) and one non-gating repo's own recency
+    (governance/repo3_probe.py). A second parser here would be the one-implementation-per-concept violation
+    this repo keeps correcting, and the two would drift on exactly the edge cases that matter.
+
+    Raises InfoUnreadableError on ANY parse surprise — both callers convert that to a fail-CLOSED blocked
+    outcome, because a recency check that cannot read its evidence must never pass."""
     try:
         stanzas = json.loads(info_json)
         target = next(s for s in stanzas if s.get("name") == stanza)
-        repo_keys = [int(r["key"]) for r in target["repo"]]
+        repo_keys = tuple(int(r["key"]) for r in target["repo"])
         newest_full: dict[int, tuple[float, str]] = {}
         for b in target.get("backup", []):
             if b.get("type") != "full":
@@ -105,12 +130,75 @@ def _repo_freshness_from_info(
             stop = float(b["timestamp"]["stop"])
             if key not in newest_full or stop > newest_full[key][0]:
                 newest_full[key] = (stop, str(b.get("label", "?")))
-    except (ValueError, KeyError, StopIteration, TypeError) as exc:
-        return (False, f"recency: could not read pgbackrest info json ({type(exc).__name__}) — fail closed")
+    except (ValueError, KeyError, StopIteration, TypeError, AttributeError) as exc:
+        # ⚠ AttributeError was ADDED 2026-08-28 and it was a REAL hole, found by the repo3 unit's own
+        # redaction probe rather than reasoned about: `pgbackrest info` is expected to yield a LIST of
+        # stanzas, but a top-level JSON OBJECT parses fine and then iterates as its KEYS — plain strings —
+        # so `s.get(...)` raised AttributeError straight out of this function, past the fail-closed
+        # conversion, as an untyped crash. The inherited tuple covered every shape anyone had thought of;
+        # it did not cover that one.
+        raise InfoUnreadableError(type(exc).__name__) from exc
+    return (repo_keys, newest_full)
+
+
+def _non_gating_note(
+    non_gating: list[int],
+    newest_full: dict[int, tuple[float, str]],
+    *,
+    bound: _dt.timedelta,
+    now: _dt.datetime,
+) -> str:
+    """Render the REPORTED-but-not-gating repos as a suffix, or "" when there are none.
+
+    ⚠ THE EMPTY-STRING CASE IS LOAD-BEARING AND IS PINNED. With today's `{1,2}` conf there are no non-gating
+    repos, so this returns "" and the detail string is BYTE-IDENTICAL to what shipped before the pin. That
+    equality is the unit's no-churn proof, and a test asserts the literal rather than a substring."""
+    if not non_gating:
+        return ""
+    parts: list[str] = []
+    for key in non_gating:
+        if key not in newest_full:
+            parts.append(f"repo{key}:NO FULL BACKUP")
+            continue
+        stop, label = newest_full[key]
+        age = now - _dt.datetime.fromtimestamp(stop, tz=_dt.UTC)
+        parts.append(f"repo{key}:{label}" + (f" STALE {age.days}d" if age > bound else ""))
+    return " (non-gating, reported only: " + ", ".join(parts) + ")"
+
+
+def _repo_freshness_from_info(
+    info_json: str, *, stanza: str, bound: _dt.timedelta, now: _dt.datetime
+) -> tuple[bool, str]:
+    """The GATING recency check: every repo in `GATE_BASIS_REPOS` must be present in the info JSON AND carry
+    a FULL backup younger than `bound`. Repos outside the basis are READ and REPORTED, never gating.
+
+    ★ THE BASIS IS THE PIN, NOT THE CONF (repo3 unit, 2026-08-28; owner-nodded both directions). Deriving the
+    set from the info JSON auto-joined any conf-added repo into the ADR-0020 gate, so landing repo3 would
+    have closed the gate on an unproven arm at the first run. It also cuts the other way, deliberately: a
+    repo REMOVED from the conf now fails this check instead of silently leaving the basis — which closes a
+    pre-existing fail-open, because pulling the `repo2-*` lines (the A2-7 §7 rollback lever) used to leave
+    `backup_freshness` reading GREEN on repo1 alone. See provisioning_invariants.GATE_BASIS_REPOS, whose
+    assertion (8) measures `basis <= configured` against the real file so the pin cannot rot away from it.
+
+    Any parse surprise fails CLOSED (a recency check that cannot read the evidence must not pass)."""
+    basis = resolve_gate_basis_repos()  # fail closed on an absent or EMPTY pin, before anything is read
+    try:
+        repo_keys, newest_full = newest_full_per_repo(info_json, stanza=stanza)
+    except InfoUnreadableError as exc:
+        return (False, f"recency: could not read pgbackrest info json ({exc}) — fail closed")
     if not repo_keys:  # vet M2: an EMPTY repo array must never certify freshness against zero repos
         return (False, "recency: pgbackrest info lists NO repositories (fail closed)")
+    configured = set(repo_keys)
     labels: list[str] = []
-    for key in sorted(repo_keys):
+    for key in sorted(basis):
+        if key not in configured:
+            return (
+                False,
+                f"recency: repo{key} is in the pinned gate basis {sorted(basis)} but is NOT configured in "
+                "pgbackrest (fail closed) — the gate would stand on a repository that does not exist. "
+                "Restore it in the conf, or move the pin (GATE_BASIS_REPOS); a change is an auditable "
+                "commit.",
+            )
         if key not in newest_full:
             return (False, f"recency: repo{key} has NO full backup (fail closed)")
         stop, label = newest_full[key]
@@ -123,7 +211,8 @@ def _repo_freshness_from_info(
                 "(fail closed; a mirror of an aging repo must not bump freshness)",
             )
         labels.append(f"repo{key}:{label}")
-    return (True, ", ".join(labels))
+    note = _non_gating_note(sorted(configured - basis), newest_full, bound=bound, now=now)
+    return (True, ", ".join(labels) + note)
 
 
 def make_pgbackrest_mirror_driver(

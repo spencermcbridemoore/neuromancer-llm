@@ -22,6 +22,8 @@ from .freshness import BACKUP_FRESHNESS_KEY
 from .lake_freshness import LAKE_MIRROR_FRESHNESS_KEY
 from .lake_mirror import LakeMirrorDriver, run_lake_mirror_probe
 from .probes import BackupDriver, run_backup_probe
+from .repo3_freshness import REPO3_FRESHNESS_KEY
+from .repo3_probe import Repo3Driver, make_repo3_recency_driver, run_repo3_probe
 from .wal_archiving import run_wal_archiver_probe
 from .wal_freshness import WAL_LAG_KEY
 
@@ -39,6 +41,9 @@ class ProbeContext:
     destination: str | None = None
     actor_id: int | None = None
     lake_mirror_driver: LakeMirrorDriver | None = None
+    # repo3 needs NOTHING from the operator (see _run_repo3): this field is the TEST seam only, and the
+    # runner default-constructs the real driver when it is None.
+    repo3_driver: Repo3Driver | None = None
 
 
 def _run_backup(engine: Engine, ctx: ProbeContext) -> None:
@@ -70,9 +75,23 @@ def _run_lake_mirror(engine: Engine, ctx: ProbeContext) -> None:
     )
 
 
+def _run_repo3(engine: Engine, ctx: ProbeContext) -> None:
+    """The repo3 recency read (§A·72). ⚠ UNLIKE THE OTHER TWO DRIVER-BEARING ARMS, THIS ONE
+    DEFAULT-CONSTRUCTS ITS DRIVER, and that is honest rather than a shortcut: repo3 has NO operator-supplied
+    coordinate at all. There is no destination (nothing leaves the VM), no ssh alias, no credential — every
+    coordinate is already a committed default (the stanza of record, the pinned repo index, the real
+    subprocess runner), so there is no flag whose absence an operator could be told to fix. That is exactly
+    the shape `_run_wal` has, and it is why this arm is not destination-bearing: a fail-closed refusal here
+    would name a flag that does not exist, which is the log:242 defect (a refusal that cannot be acted on).
+    `ctx.repo3_driver` exists so tests can script the seam."""
+    driver = ctx.repo3_driver if ctx.repo3_driver is not None else make_repo3_recency_driver()
+    run_repo3_probe(engine, repo3_driver=driver, actor_id=ctx.actor_id)
+
+
 # The registry (keyed by the SAME constants as DURABILITY_ROWS; the keyset test pins the equality).
 PROBE_RUNNERS: dict[str, Callable[..., None]] = {
     BACKUP_FRESHNESS_KEY: _run_backup,
     WAL_LAG_KEY: _run_wal,
     LAKE_MIRROR_FRESHNESS_KEY: _run_lake_mirror,
+    REPO3_FRESHNESS_KEY: _run_repo3,
 }

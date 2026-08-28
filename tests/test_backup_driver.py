@@ -37,7 +37,15 @@ _DEST = "D:/neuro-backups"  # passes the off-cloud guard's _WIN_DRIVE allow-shap
 
 def _info_json(*, ages_days: dict[int, float | None]) -> str:
     """A pgbackrest info --output=json body: one 'neuro' stanza; per repo-key, a full backup that finished
-    `age` days before _NOW (None = no full backup on that repo)."""
+    `age` days before _NOW (None = no full backup on that repo).
+
+    ⚠ EVERY FIXTURE HERE CARRIES BOTH repo1 AND repo2 (changed 2026-08-28, the repo3 unit). The gating
+    recency check now stands on the PINNED basis `provisioning_invariants.GATE_BASIS_REPOS == {1, 2}` rather
+    than on whatever the info JSON happens to list, so a repo1-only fixture is no longer a "smaller version
+    of production" — it is a conf that has LOST repo2, which the pin correctly refuses. Ten fixtures gained
+    a fresh `2:` entry for that reason; not one of their assertions changed, because a fresh second repo
+    cannot alter what any of them was measuring. The two deliberate exceptions are kept and are meaningful:
+    `ages_days={}` (the empty-array branch) and `{1: ..., 2: None}` (repo2 listed but with no full backup)."""
     backups = []
     for key, age in ages_days.items():
         if age is None:
@@ -187,7 +195,7 @@ def test_info_failure_blocks(repo_tree):
 
 def test_failed_verify_never_mirrors(repo_tree):
     seam = _Seam(
-        info=CommandResult(0, _info_json(ages_days={1: 1.0}), ""),
+        info=CommandResult(0, _info_json(ages_days={1: 1.0, 2: 1.0}), ""),
         verify=CommandResult(41, "", "checksum error"),
     )
     out = _driver(seam, repo_tree)(_DEST)
@@ -198,7 +206,7 @@ def test_failed_verify_never_mirrors(repo_tree):
 def test_timed_out_step_is_blocked_not_hung(repo_tree):
     # fold 5: the real runner converts TimeoutExpired into rc=-1 'timed out' — the driver fails closed.
     seam = _Seam(
-        info=CommandResult(0, _info_json(ages_days={1: 1.0}), ""),
+        info=CommandResult(0, _info_json(ages_days={1: 1.0, 2: 1.0}), ""),
         verify=CommandResult(-1, "", "timed out after 3600s"),
     )
     out = _driver(seam, repo_tree)(_DEST)
@@ -209,7 +217,7 @@ def test_timed_out_step_is_blocked_not_hung(repo_tree):
 
 
 def test_first_run_mirrors_everything_manifest_last(repo_tree):
-    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0}), ""))
+    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0, 2: 1.0}), ""))
     out = _driver(seam, repo_tree)(_DEST)
     assert out.ok is True, out.detail
     assert set(seam.remote) == {
@@ -224,7 +232,7 @@ def test_first_run_mirrors_everything_manifest_last(repo_tree):
 
 
 def test_pruned_file_is_deleted_remotely(repo_tree):
-    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0}), ""))
+    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0, 2: 1.0}), ""))
     driver = _driver(seam, repo_tree)
     assert driver(_DEST).ok is True
     (repo_tree / "archive" / "neuro" / "000000010000000000000042").unlink()  # pgbackrest expire pruned it
@@ -236,7 +244,7 @@ def test_pruned_file_is_deleted_remotely(repo_tree):
 
 def test_spot_verify_catches_torn_transfer(repo_tree):
     seam = _Seam(
-        info=CommandResult(0, _info_json(ages_days={1: 1.0}), ""),
+        info=CommandResult(0, _info_json(ages_days={1: 1.0, 2: 1.0}), ""),
         corrupt_on_get="backup/neuro/20260711F.tgz",
     )
     out = _driver(seam, repo_tree)(_DEST)
@@ -245,14 +253,14 @@ def test_spot_verify_catches_torn_transfer(repo_tree):
 
 def test_failed_push_is_blocked(repo_tree):
     # vet M3: the push-failure branch, exercised (rc!=0 from the mirror batch -> blocked, fail closed).
-    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0}), ""), fail_puts=True)
+    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0, 2: 1.0}), ""), fail_puts=True)
     out = _driver(seam, repo_tree)(_DEST)
     assert out.ok is False and "mirror push failed" in out.detail
 
 
 def test_failed_manifest_write_is_blocked(repo_tree):
     # vet M3: a mirror whose MANIFEST write fails is NOT certified — next run re-diffs honestly (over-push).
-    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0}), ""), fail_manifest_put=True)
+    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0, 2: 1.0}), ""), fail_manifest_put=True)
     out = _driver(seam, repo_tree)(_DEST)
     assert out.ok is False and "manifest write failed" in out.detail
     assert MANIFEST_NAME not in seam.remote
@@ -262,7 +270,7 @@ def test_manifest_put_is_the_final_sftp_operation(repo_tree):
     # vet M3 (the load-bearing ORDER): a manifest written before the pushes/spot-verify would make a torn
     # mirror ADOPTED (the next run diffs against a lying manifest and skips the corrupt files). The manifest
     # put must be the LAST sftp call, alone in its batch, AFTER every push and every spot-verify get.
-    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0}), ""))
+    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0, 2: 1.0}), ""))
     assert _driver(seam, repo_tree)(_DEST).ok is True
     last = seam.batches[-1]
     assert len(last) == 1 and last[0].startswith("put ") and last[0].endswith(f" {MANIFEST_NAME}")
@@ -286,8 +294,12 @@ def test_run_subprocess_converts_timeout_to_fail_closed():
 
 def test_absent_cadence_pin_fails_closed(repo_tree, monkeypatch):
     monkeypatch.setattr("neuromancer_llm.governance.provisioning_invariants.BASE_BACKUP_INTERVAL", None)
-    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0}), ""))
-    with pytest.raises(ConfigurationError, match="pin is absent"):
+    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 1.0, 2: 1.0}), ""))
+    # ⚠ MATCH THE SPECIFIC PIN, not the shared phrase. Three fail-closed resolvers now sit on this call
+    # path (BASE_BACKUP_INTERVAL, PROVISIONING_MARGIN, and GATE_BASIS_REPOS), and all three raise
+    # ConfigurationError; a bare `match="pin is absent"` would go green if the WRONG one had raised — which
+    # is the "assert WHICH, not how many" rule applied to an exception message.
+    with pytest.raises(ConfigurationError, match="base-backup cadence pin is absent"):
         _driver(seam, repo_tree)(_DEST)
 
 
@@ -313,7 +325,7 @@ def test_healthy_driver_bumps_freshness_through_the_probe(repo, repo_tree):
 def test_recency_blocked_driver_records_blocked_then_raises(repo, repo_tree):
     with repo.engine.connect() as conn:
         seed_backup_freshness(conn)
-    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 30.0}), ""))
+    seam = _Seam(info=CommandResult(0, _info_json(ages_days={1: 30.0, 2: 1.0}), ""))
     with pytest.raises(BackupProbeError):
         run_backup_probe(
             repo.engine, backup_driver=_driver(seam, repo_tree), destination=_DEST, actor_id=None
@@ -324,4 +336,10 @@ def test_recency_blocked_driver_records_blocked_then_raises(repo, repo_tree):
         row = conn.execute(
             text("SELECT status, detail FROM neuro.system_health WHERE health_key='backup_freshness'")
         ).one()
-    assert row.status == "blocked" and "recency" in row.detail
+    # ⚠ ASSERT WHICH REPO, NOT MERELY "recency". A bare `"recency" in detail` is satisfiable by ANY recency
+    # refusal — including one about repo2's absence from the gate basis — so it would have gone green for a
+    # reason this test is not about the moment GATE_BASIS_REPOS landed. The fixture gives repo2 a FRESH
+    # backup precisely so the only thing that can block here is repo1's staleness, and the assertion now
+    # says so. (The vet flagged this as a candidate vacuous-green; it was contingent on iteration order, and
+    # this removes the contingency rather than relying on it.)
+    assert row.status == "blocked" and "recency: repo1" in row.detail and "30d old" in row.detail

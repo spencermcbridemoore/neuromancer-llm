@@ -80,7 +80,18 @@ def _assert_lake_copy(msg: str | None, *, measured_at, days: int) -> None:
     assert "a down peer is still LISTED, as 'offline'" in msg
     assert "/dev/tcp" in msg
     assert "'refused' would mean you reached the host" in msg
-    assert "neuro probe report" in msg
+    # ⚠ The SAME phrases as the backup arm asserts, on purpose: both arms share OFF_CLOUD_MIRROR_TRIAGE by
+    # identity, so a reword that satisfied one arm's pins and broke the other would mean the sharing had
+    # quietly stopped. Asserted here too rather than trusted to the identity pin, which cannot see wording.
+    assert "run `neuro probe report`" in msg
+    # ⚠ NOT "Every durability row prints a `detail=` field" -- MEASURED: that phrase STRADDLES the constant's
+    # implicit-concatenation boundary ("...prints a `detail=` " + "field, and THIS row's line..."), so a
+    # mutation deleting the whole reason-for-reading-it clause leaves "field" behind and the assertion PASSES.
+    # It is the log:274 lesson one level down: a phrase that spans a wrap point pins only the wrap point.
+    # Assert the clause that carries the MEANING and sits wholly inside one fragment.
+    assert "two states write NO probe_reports row at all and their reason exists ONLY there" in msg
+    assert "`neuro probe report --key <the health_key at the start of that line>`" in msg
+    assert "records no reason at all" not in msg
     assert f"~{days}d" in msg and str(measured_at) in msg
     assert "cloud-only" not in msg and "DEGRADED" not in msg
     # ⚠ The former copy called this "the HARD GATE", one clause from the truth that it does not gate — and a

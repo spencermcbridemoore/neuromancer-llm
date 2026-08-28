@@ -122,6 +122,15 @@ def test_rt_core_modules_read_no_env():
         # alert-copy repair: the shared triage + message shape is pure copy and a pure function — an env read
         # here would make an operator's alert text depend on the environment it fires in.
         "governance/alert_triage.py",
+        # repo3 (§A·72): the freshness leaf, the pgbackrest reader/producer, the extracted shared evaluator
+        # and the arm delegate are ALL parameter-only. ⚠ This list is a hand-maintained ALLOW-LIST, not a
+        # sweep — a module that is not named here is simply not scanned, so a new governance module ships
+        # OUTSIDE the L13 guarantee unless it is added in the same unit. Adding them here is the whole
+        # mechanism; the precedent is recorded by every batch of names above it.
+        "governance/repo3_freshness.py",
+        "governance/repo3_probe.py",
+        "governance/repo3_escalation.py",
+        "governance/block_escalation.py",
     ):
         src = (_SRC / rel).read_text(encoding="utf-8")
         assert "os.environ" not in src and "getenv" not in src, f"{rel} reads an env var (behavior-by-flag?)"

@@ -34,6 +34,7 @@ from sqlalchemy.engine import Connection
 
 from .freshness import BACKUP_FRESHNESS_KEY, resolve_backup_stale_after
 from .lake_freshness import LAKE_MIRROR_FRESHNESS_KEY, resolve_lake_mirror_stale_after
+from .repo3_freshness import REPO3_FRESHNESS_KEY, resolve_repo3_stale_after
 from .wal_freshness import WAL_LAG_KEY
 
 
@@ -62,6 +63,12 @@ class RowStatus:
     measured_at: _dt.datetime | None
     has_bound: bool
     drift: bool  # only meaningful for bound-carrying rows; always False for bound-less / absent rows
+    # `detail` is the row's own recorded reason. Added 2026-08-28 (the repo3 arm) because it is the ONLY
+    # visible trace of two states: a GATE-origin flip (drift/staleness), which writes no probe_reports row,
+    # and a freshly-seeded born-blocked row, which has not been probed at all. Every escalation triage opens
+    # with "read the recorded reason first"; without this the instruction was unfollowable for both.
+    # Defaulted so the existing positional constructions below keep working unchanged.
+    detail: str | None = None
 
 
 # The registry: the ONE place every durability row is declared. backup_freshness reuses freshness.py's key +
@@ -89,7 +96,24 @@ LAKE_MIRROR_ROW = DurabilityRow(
     born_detail="seeded; awaiting first verified lake mirror",
     stale_after_bound=resolve_lake_mirror_stale_after,
 )
-DURABILITY_ROWS: tuple[DurabilityRow, ...] = (BACKUP_FRESHNESS_ROW, WAL_LAG_ROW, LAKE_MIRROR_ROW)
+# repo3_freshness (§A·72, 2026-08-28) is the SECOND non-gating durability signal, provisioned through this
+# same one surface: the third, object-lock-protected pgbackrest repository on Backblaze B2. Like the lake row
+# its key is DELIBERATELY absent from health.GATE_CONSULTED_KEYS (the ruling lands repo3 NOTIFY-ONLY first;
+# promotion into the gate basis is a LATER owner ruling, and it is one line — GATE_BASIS_REPOS).
+# ⚠ Read the scope of "notify-only" from governance/repo3_freshness.py before quoting it: it is a guarantee
+# about THIS ROW, not a guarantee that a failing repo3 cannot block a write (pgbackrest pushes WAL to every
+# configured repo, so a failing repo3 can close the gate through the `wal_lag` row instead).
+REPO3_ROW = DurabilityRow(
+    health_key=REPO3_FRESHNESS_KEY,
+    born_detail="seeded; awaiting first repo3 backup",
+    stale_after_bound=resolve_repo3_stale_after,
+)
+DURABILITY_ROWS: tuple[DurabilityRow, ...] = (
+    BACKUP_FRESHNESS_ROW,
+    WAL_LAG_ROW,
+    LAKE_MIRROR_ROW,
+    REPO3_ROW,
+)
 
 # The set of health_keys this surface provisions — cross-checked against the keys the gate consults
 # (governance/health.py::GATE_CONSULTED_KEYS; a test asserts GATE_CONSULTED_KEYS <= DURABILITY_KEYS), so a new
@@ -169,7 +193,8 @@ def status_all(conn: Connection, rows: Sequence[DurabilityRow] = DURABILITY_ROWS
         db = (
             conn.execute(
                 text(
-                    "SELECT status, stale_after, measured_at FROM neuro.system_health WHERE health_key = :k"
+                    "SELECT status, stale_after, measured_at, detail FROM neuro.system_health "
+                    "WHERE health_key = :k"
                 ),
                 {"k": row.health_key},
             )
@@ -190,6 +215,7 @@ def status_all(conn: Connection, rows: Sequence[DurabilityRow] = DURABILITY_ROWS
                 db["measured_at"],
                 has_bound,
                 bool(drift),
+                db["detail"],
             )
         )
     return out

@@ -23,7 +23,12 @@ delegate) that reads the ACTUAL pgbackrest config + the ACTUAL installed timers 
       the assertion-5 analog for the WAL arm). The signal-staleness bound WAL_LAG_STALE_AFTER=1h is DERIVED
       from that 15-min cadence (~4 missed cycles); if the installed archiver timer drifts to a slower cadence,
       a merely-late probe false-flips the 1h gate — the config-drift blind spot this closes. Checked only when
-      the archiver timer text is supplied (the daily verify-config timer passes both timer files).
+      the archiver timer text is supplied (the daily verify-config timer passes both timer files);
+  (8) GATE_BASIS_REPOS <= the configured repos (repo3 unit, 2026-08-28) — the repos the ADR-0020 gate stands
+      on must all EXIST in the conf, or the gate stands on a repository pgbackrest does not have and
+      `backup_freshness` can never certify fresh. The relation is `<=` deliberately: a configured repo
+      OUTSIDE the basis is the NOTIFY-ONLY state repo3 ships in, and is REPORTED (`non_gating_repos`) rather
+      than refused. This is what keeps the pin from becoming a second hand-set copy of the conf.
 
 GO-D-timer hardenings folded here (a2-16-timers-buildgo §7): (#3) `_parse_systemd_span` is CASE-SENSITIVE like
 systemd — it no longer lowercases, so systemd's `M` (months) can never be silently mis-read as `m` (minutes);
@@ -63,6 +68,29 @@ BASE_BACKUP_INTERVAL: _dt.timedelta | None = _dt.timedelta(days=2)
 # BASE_BACKUP_INTERVAL + PROVISIONING_MARGIN, and both inequalities above consume it.
 PROVISIONING_MARGIN: _dt.timedelta | None = _dt.timedelta(days=2)
 
+# ★ THE GATE BASIS (repo3 unit, 2026-08-28; owner-nodded). The repos whose base-backup RECENCY is allowed to
+# set `system_health['backup_freshness']` — i.e. the repos the ADR-0020 durability gate stands on.
+#
+# WHY IT EXISTS. `backup_driver._repo_freshness_from_info` used to derive its repo set FROM the pgbackrest
+# info JSON and require a fresh FULL on EVERY listed repo. That is auto-joining: the moment `repo3-*` lines
+# enter the conf, the very first driver run records "repo3 has NO full backup (fail closed)" and the gate
+# CLOSES on an arm that has never been proven. The §A·72 ruling lands repo3 NOTIFY-ONLY, so the gate's basis
+# must be a DELIBERATE, committed set rather than whatever the conf happens to contain. ⚠ The systemd
+# ignore-failure `ExecStart=-` prefix does not reach this: the recency step is a READ, not the backup chain.
+#
+# ⚠ IT CUTS BOTH WAYS, AND THE OWNER RULED BOTH (2026-08-28). A conf-ADDED repo no longer auto-joins the
+# gate (the fail-closed direction this exists for). A conf-REMOVED repo no longer auto-LEAVES it either —
+# which closes a pre-existing FAIL-OPEN: before this pin, pulling the `repo2-*` lines (the A2-7 §7 rollback
+# lever) left `backup_freshness` reading GREEN on repo1 alone, with nothing to say the cloud copy had gone.
+#
+# THE PIN IS NOT A SECOND COPY OF THE CONF — assertion (8) in verify_pgbackrest_config MEASURES the relation
+# `basis <= configured repos` against the REAL file on the daily verify-config timer, so the two cannot rot
+# apart silently (the rot class this whole module exists to close). Repos outside the basis are read and
+# REPORTED, never gating.
+#
+# PROMOTION (§A·72, "armed, not dated") IS THIS ONE LINE: add 3. That is deliberately the whole edit.
+GATE_BASIS_REPOS: frozenset[int] | None = frozenset({1, 2})
+
 # The only option names this checker reads (the redaction whitelist — nothing else is ever materialized
 # into a message). repoN- names are matched by _REPO_OPT below.
 _GLOBAL_OPTS = ("archive-async", "archive-push-queue-max", "spool-path")
@@ -91,17 +119,41 @@ def resolve_provisioning_margin() -> _dt.timedelta:
     return PROVISIONING_MARGIN
 
 
+def resolve_gate_basis_repos() -> frozenset[int]:
+    """The single gate-basis resolution point (the resolve_backup_stale_after idiom).
+
+    ⚠ THE GUARD IS `not GATE_BASIS_REPOS`, NOT `is None`, AND THAT IS THE WHOLE POINT. An `is None` test
+    returns an EMPTY frozenset happily, and a recency loop over an empty basis makes no requirement and
+    certifies FRESH against zero repos — byte-for-byte the vacuous pass that `_repo_freshness_from_info`'s
+    empty-repo-array branch exists to close, relocated from the info JSON onto the pin. One condition covers
+    both an absent pin and an emptied one, and it is still single-purpose: 'no basis is pinned'."""
+    if not GATE_BASIS_REPOS:
+        raise ConfigurationError(
+            "the durability gate basis pin is absent or EMPTY (provisioning_invariants.GATE_BASIS_REPOS) — "
+            "refusing to certify backup freshness against zero repositories (fail closed). An empty basis "
+            "would pass the recency check while checking nothing. Record the repos the gate stands on; a "
+            "change is an auditable commit."
+        )
+    return GATE_BASIS_REPOS
+
+
 @dataclass(frozen=True)
 class ProvisioningReport:
     """The verify-config result: the repos discovered, their retention days, and which timer cadences were
     checked (`timer_checked` = the backup timer, assertion 5; `archiver_timer_checked` = the archiver-probe
     timer, assertion 7 / wal D4). A False means its timer text was not supplied (a pre-install run), never
-    that the check passed."""
+    that the check passed.
+
+    `non_gating_repos` (assertion 8, repo3 unit) = the configured repos OUTSIDE `GATE_BASIS_REPOS`, sorted.
+    It is REPORTED, never asserted on: a configured repo that does not gate is the intended NOTIFY-ONLY
+    state, and surfacing it is what turns "repo3 is deliberately non-gating" from a code comment into
+    something the daily verify-config run PRINTS. An empty tuple means every configured repo gates."""
 
     repos: tuple[int, ...]
     retention_days: dict[int, int]
     timer_checked: bool
     archiver_timer_checked: bool = False
+    non_gating_repos: tuple[int, ...] = ()
 
 
 def _parse_conf(conf_path: Path) -> ConfigParser:
@@ -227,6 +279,23 @@ def verify_pgbackrest_config(
             f"{margin.days}d) — a backup the gate still calls fresh could be pruned (fail loud)."
         )
 
+    # (8) THE GATE BASIS IS CONFIGURED (repo3 unit). Every repo the ADR-0020 gate stands on must actually
+    # exist in the conf. This is the invariant that stops GATE_BASIS_REPOS becoming a second, hand-set copy
+    # of "which repos matter" that rots away from the file — the same two-edit trap assertion 5 closes for
+    # the timer cadence. ⚠ The relation is `<=`, deliberately: a configured repo OUTSIDE the basis is the
+    # NOTIFY-ONLY state repo3 ships in, and is reported below rather than refused.
+    basis = resolve_gate_basis_repos()  # fail closed on an absent/EMPTY pin, before the comparison
+    missing = sorted(basis - repos)
+    if missing:
+        raise ConfigurationError(
+            f"the durability gate basis names repo(s) {missing} that are NOT configured in "
+            f"{str(conf_path)!r} (configured: {sorted(repos)}) — the ADR-0020 gate would stand on a "
+            "repository pgbackrest does not have, so `backup_freshness` could never be certified fresh "
+            "(fail loud). Either restore the repo in the conf or move the pin "
+            "(provisioning_invariants.GATE_BASIS_REPOS); a change is an auditable commit."
+        )
+    non_gating = tuple(sorted(repos - basis))
+
     # (3) the gate-headroom inequality (the cadence the 8-day bound can actually supervise)
     if bound < interval + margin:
         raise ConfigurationError(
@@ -260,6 +329,7 @@ def verify_pgbackrest_config(
         retention_days=retention_days,
         timer_checked=timer_checked,
         archiver_timer_checked=archiver_timer_checked,
+        non_gating_repos=non_gating,
     )
 
 
