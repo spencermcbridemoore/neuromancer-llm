@@ -41,10 +41,17 @@ def test_qwen_constant_carries_the_owner_ruled_key_and_the_adr0031_fields() -> N
     assert QWEN_SCOPE_LAYER18.asset_type == "sae"
     assert QWEN_SCOPE_LAYER18.loader_format == "qwen_scope_pt"  # ADR-0031: mandatory day-one
     assert QWEN_SCOPE_LAYER18.hf_repo == "Qwen/SAE-Res-Qwen3-8B-Base-W64K-L0_100"
-    # NOT ESTABLISHABLE IN-REPO, and ADR-0032 does NOT sanction this null (that accommodation is hf_repo's,
-    # for locally-trained releases). The frozen DDL calls hf_revision durable identity, so this is a
-    # deliberate PERMANENT partial identity — left NULL rather than invented.
-    assert QWEN_SCOPE_LAYER18.hf_revision is None
+    # ★ FULL IDENTITY, not the partial identity this row shipped with. The revision was ESTABLISHED by
+    # matching the locally streamed sha256 against the HF repo's LFS object ids — a UNIQUE hit among 36
+    # files, decisive because layers 10-35 share a byte count so size discriminates nothing — and was
+    # then owner-ruled. The frozen DDL calls hf_revision durable identity; it now carries one.
+    assert QWEN_SCOPE_LAYER18.hf_revision == "f7addb7d4ac77ff30a59503916b4cf5636e6f881"
+    # ⚠ Shape is SUBSUMED by the equality above and carries no independent falsification power (no single
+    # mutation fails this and not that). It is kept as documentation of what the field is — a 40-char git
+    # commit id — because `AssetSpec` validates nothing and `register_asset` does NOT blank-check the two
+    # nullable label columns, so a reader must not infer a shape guard that does not exist.
+    assert len(QWEN_SCOPE_LAYER18.hf_revision) == 40
+    assert all(c in "0123456789abcdef" for c in QWEN_SCOPE_LAYER18.hf_revision)
 
 
 def test_asset_spec_is_frozen() -> None:
@@ -58,6 +65,34 @@ def test_asset_spec_carries_no_sha256_field() -> None:
     """sha256 is a MATERIALIZED fact about bytes on a machine, streamed at registration — not a declarative
     property of the release. Putting it in the spec would invite a hardcoded digest in `src/`."""
     assert "sha256" not in AssetSpec.__dataclass_fields__
+
+
+def test_no_carrier_still_claims_the_row_is_partial_identity() -> None:
+    """⚠ SCOPE: this is a PROSE TRIPWIRE, not a proof — in the idiom `test_registry_module_performs_no_io`
+    labels itself with, and deliberately so, because the thing being guarded IS prose.
+
+    It pins that no carrier still asserts the superseded claim. It is trivially satisfiable by rewording
+    ("was NULL", "partial-identity"), so it catches a RE-INSERTION, never a paraphrase — the same limit the
+    module's own AST note describes one layer down. Its value is that the three carriers are checked
+    TOGETHER: this file, the module, and the runbook drifted apart once already, which is why the runbook
+    prose rides the same commit as the constant.
+
+    ⚠ THE SENTINELS ARE ASSEMBLED FROM HALVES, AND THAT IS NOT A STYLE CHOICE. This file is one of the
+    carriers it scans, so spelling them as literals makes the probe MATCH ITSELF and fail forever — the
+    second-order bite the record already documents for the credential greps (the checker's own regex sits
+    in the thing being checked). Measured here on the first run."""
+    root = pathlib.Path(__file__).resolve().parents[1]
+    carriers = [
+        root / "src" / "neuromancer_llm" / "registry" / "assets.py",
+        root / "tests" / "test_assets_registry.py",
+        root / "ops" / "runbook-corpus-import.md",
+    ]
+    dead_claims = ["PARTIAL " + "IDENTITY", "hf_revision is " + "left NULL", "hf_revision=None is " + "PERM"]
+    for path in carriers:
+        assert path.exists(), f"carrier moved: {path}"  # non-vacuity: a wrong path must redden, not pass
+        text = path.read_text(encoding="utf-8")
+        for dead in dead_claims:
+            assert dead not in text, f"{path.name} still claims: {dead!r}"
 
 
 def test_registry_module_performs_no_io() -> None:
@@ -189,7 +224,11 @@ def test_first_register_writes_every_field_and_reads_back(repo) -> None:
     assert row["asset_type"] == "sae"
     assert row["loader_format"] == "qwen_scope_pt"
     assert row["hf_repo"] == "Qwen/SAE-Res-Qwen3-8B-Base-W64K-L0_100"
-    assert row["hf_revision"] is None
+    # ★ READ BACK FROM THE ROW, not from the spec that produced it. Until 2026-08-28 this asserted `is None`
+    # while the test's own name promised "writes EVERY field" — with hf_revision NULL it did not, and the
+    # probe certified the gap. Now the name is true and the assertion is on what actually landed.
+    assert row["hf_revision"] == QWEN_SCOPE_LAYER18.hf_revision
+    assert row["hf_revision"] == "f7addb7d4ac77ff30a59503916b4cf5636e6f881"
     # bytea round-trips as the 32 RAW digest bytes, never hex text.
     assert row["sha256"] == _DIGEST
     assert isinstance(row["sha256"], bytes) and len(row["sha256"]) == 32

@@ -1,13 +1,18 @@
 # RUNBOOK — the research-corpus RIP import
 
-**EXECUTION: guided-required** (one command at a time). **DRAFTED, NOT EXECUTED.**
+**EXECUTION: guided-required** (one command at a time). **EXECUTED 2026-08-27** — end to end, owner
+running every command.
 
-Mandatory mode: every registered row is a **one-way door** (there is no delete verb for `artifacts`,
-`external_records` or `lineage_edges` anywhere in `src/`), and this is first-time territory — no
-corpus pointer has ever been written to canonical.
+Mandatory mode STANDS for any re-run: every registered row is a **one-way door** (there is no delete verb
+for `artifacts`, `external_records` or `lineage_edges` anywhere in `src/`). It is no longer first-time
+territory, but §5 and §8 are why a re-run is still a real operation with real consequences.
 
-⚠ **Nothing in this runbook has been run.** The counts below are measured from the committed
-manifest, not from a database.
+⚠ **READ THE COUNTS AS CONFIRMED, NOT PREDICTED.** They were drafted from the committed manifest and have
+since been **measured against canonical** — the import landed 1,753 pointer triples and the first
+`neuro.assets` row. A number below that disagrees with what you see is therefore a **finding**, not a
+drafting estimate. *(⚠ Corrected 2026-08-28: this banner previously read "Nothing in this runbook has been
+run", which was false from the day the import completed — the most dangerous stale-doc class, because it
+tells an operator to discount every expected value in §3, §4 and §6.)*
 
 ---
 
@@ -256,19 +261,23 @@ repo.register_asset(
     loader_format=QWEN_SCOPE_LAYER18.loader_format,
     sha256=<the 32-byte digest>,
     hf_repo=QWEN_SCOPE_LAYER18.hf_repo,
-    hf_revision=QWEN_SCOPE_LAYER18.hf_revision,   # None — see below
+    hf_revision=QWEN_SCOPE_LAYER18.hf_revision,   # the established revision — see below
 )
 ```
 
-⚠ **`hf_revision=None` is PERMANENT once written** — `register_asset` is INSERT-only and REFUSES to
-backfill a NULL rather than returning a false green.
+**★ THIS WAS DONE, AND THE ROW LANDED AT FULL IDENTITY (2026-08-27).** The optional step below was taken:
+the streamed sha256 was matched against the HF repo's LFS object ids and returned a **UNIQUE hit among the
+36 LFS files** — decisive because **layers 10–35 all share the byte count 2,147,764,603**, so size
+discriminates nothing and only the digest identifies the file. The owner ruled the commit at which the
+content was **established** over the equally-true current-`main` commit and over NULL. `QWEN_SCOPE_LAYER18`
+carries that value, so the snippet above needs no edit.
 
-**★ OPTIONAL, AND IT IS THE ONE CHANCE TO AVOID THAT:** the revision may be establishable BEFORE
-writing, by comparing the streamed sha256 against the HF repo's LFS metadata for
-`Qwen/SAE-Res-Qwen3-8B-Base-W64K-L0_100`. If it matches a known revision, pass it and the row lands
-at FULL identity instead of partial. If it does not, pass `None` and the partial identity stands —
-**do not invent a revision.** Correcting it afterwards needs an admin UPDATE, which is exactly the
-remedy the module documents.
+⚠ **A NULL IS PERMANENT ONCE WRITTEN, AND THAT RULE STILL GOVERNS EVERY FUTURE ASSET** — `register_asset`
+is INSERT-only and REFUSES to backfill a NULL rather than returning a false green. For any NEW asset:
+establish the revision BEFORE writing, or accept the partial identity permanently. **Do not invent one.**
+Correcting after the fact needs an admin UPDATE, which is the only remedy the module documents.
+*(⚠ Corrected 2026-08-28: this section used to describe the LFS match as a future option and asserted
+`hf_revision=None` of this row. Both were false once the import ran.)*
 
 ---
 
