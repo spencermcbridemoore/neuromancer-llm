@@ -119,6 +119,9 @@ def test_rt_core_modules_read_no_env():
         "governance/lake_mirror.py",
         "governance/lake_freshness.py",
         "governance/lake_escalation.py",
+        # alert-copy repair: the shared triage + message shape is pure copy and a pure function — an env read
+        # here would make an operator's alert text depend on the environment it fires in.
+        "governance/alert_triage.py",
     ):
         src = (_SRC / rel).read_text(encoding="utf-8")
         assert "os.environ" not in src and "getenv" not in src, f"{rel} reads an env var (behavior-by-flag?)"

@@ -55,11 +55,53 @@ def test_blocked_within_onset_returns_none(repo):
     assert evaluate_lake_mirror_block_escalation(repo.engine) is None
 
 
+def _measured_at(engine):
+    with engine.connect() as conn:
+        return conn.execute(
+            text("SELECT measured_at FROM neuro.system_health WHERE health_key = :k"),
+            {"k": LAKE_MIRROR_FRESHNESS_KEY},
+        ).scalar_one()
+
+
+def _assert_lake_copy(msg: str | None, *, measured_at, days: int) -> None:
+    """★ EVERY copy claim for this arm on ONE message — the mirror of `_assert_backup_copy`; see its
+    docstring for why the negative containments must not be split out."""
+    assert msg is not None
+    assert len(msg) > 400, "the message lost its substance; the negative assertions below would go vacuous"
+
+    assert "sshd" not in msg and "Get-Service" not in msg
+    assert "CAUSE NOT ESTABLISHED" in msg
+    assert "ACTION" in msg  # the label survives; what changed is that it now carries a PROCEDURE
+    # the CONTRASTS as phrases, not as token pairs — see `_assert_backup_copy` for the measurement that
+    # forced this: two tokens both survive a mutation that destroys the sentence binding them.
+    assert "OpenSSH/Operational" in msg
+    assert "'[preauth]' lines: WSL2 NAT, not the VM" in msg
+    assert "tailscale status" in msg
+    assert "a down peer is still LISTED, as 'offline'" in msg
+    assert "/dev/tcp" in msg
+    assert "'refused' would mean you reached the host" in msg
+    assert "neuro probe report" in msg
+    assert f"~{days}d" in msg and str(measured_at) in msg
+    assert "cloud-only" not in msg and "DEGRADED" not in msg
+    # ⚠ The former copy called this "the HARD GATE", one clause from the truth that it does not gate — and a
+    # reader in a prior session concluded from a blocked lake row that the ADR-0020 gate had closed. The claim
+    # is scoped to the GATE, not to "blocking a write": the registered capture-path preflight would block
+    # writes with every existing pin still green.
+    assert "HARD GATE" not in msg
+    assert "not consulted by the ADR-0020 durability gate" in msg
+    # the arm's own coordinates; the `not in` half is what makes an arm SWAP red rather than green.
+    assert msg.startswith("neuromancer BLOB-LAKE MIRROR BLOCKED")
+    assert "no confirmed lake mirror" in msg
+    assert "neuro-lake-mirror.service" in msg and "neuro-backup.service" not in msg
+
+
 def test_blocked_past_onset_returns_actionable_message(repo):
     _seed_blocked_days_ago(repo.engine, 5)  # > the 3d pinned onset
-    msg = evaluate_lake_mirror_block_escalation(repo.engine)
-    assert msg is not None
-    assert "BLOB-LAKE MIRROR BLOCKED" in msg and "ACTION" in msg  # consequence + action copy
+    _assert_lake_copy(
+        evaluate_lake_mirror_block_escalation(repo.engine),
+        measured_at=_measured_at(repo.engine),
+        days=5,
+    )
 
 
 def test_override_onset_fires_on_any_current_block(repo):

@@ -11,6 +11,12 @@ WHY it exists: the per-run OnFailure ping (neuro-alert@) fires only on a mirror-
 unit, not the consequence. A DAILY re-alert whose message states the consequence + action closes the cadence +
 copy gap the backup arm's incident (log:214) taught — an alert that is delivered-and-missed is not hardened
 (§E·16); the induced test proves the real ping lands.
+
+⚠ THE COPY LIVES IN `governance/alert_triage.py`, NOT HERE (alert-copy repair, 2026-08-28), shared with the
+backup arm by construction rather than by two hand-written copies that had already diverged. Two claims this
+module's message used to make are corrected there: it no longer calls this signal "the HARD GATE" (the
+write-time preflight that would gate is registered-and-unbuilt, and no capture-path consumer of this row
+exists), and it no longer names the desktop sshd endpoint as the remedy.
 """
 
 from __future__ import annotations
@@ -19,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from .alert_triage import ESCALATION_ARMS, compose_block_alert
 from .lake_freshness import LAKE_MIRROR_FRESHNESS_KEY, resolve_lake_mirror_block_escalate_after
 
 if TYPE_CHECKING:
@@ -61,9 +68,6 @@ def evaluate_lake_mirror_block_escalation(
     if row is None or row["status"] != "blocked" or not row["blocked_too_long"]:
         return None
     days = row["blocked_for"].days
-    return (
-        f"neuromancer BLOB-LAKE MIRROR BLOCKED ~{days}d — the artifact lake (artifacts-prod) is DEGRADED to "
-        "cloud-only; the independent desktop-NVMe copy (ADR-0014) — the HARD GATE before the first "
-        "non-recomputable capture — is NOT updating. ACTION: check the desktop sshd endpoint (Get-Service "
-        f"sshd) and re-run neuro-lake-mirror.service. Last good lake mirror: {row['measured_at']}."
+    return compose_block_alert(
+        arm=ESCALATION_ARMS[LAKE_MIRROR_FRESHNESS_KEY], days=days, measured_at=row["measured_at"]
     )

@@ -12,6 +12,12 @@ the failed UNIT ("neuromancer timer FAILED: neuro-backup.service"), not the CONS
 delivered and MISSED. This closes the cadence + copy gap: a DAILY re-alert (the timer) whose message states
 the consequence and the action.
 
+⚠ THE COPY LIVES IN `governance/alert_triage.py`, NOT HERE (alert-copy repair, 2026-08-28). This module once
+hardcoded "ACTION: check the desktop sshd endpoint (Get-Service sshd)" — a remedy that was WRONG in two of the
+three recorded blocks, and which the lake arm carried as a second, independent copy. The action is now a
+DISCRIMINATING PROCEDURE the two arms share by construction; read that module for why each step is worded as
+it is, and for what this row does and does NOT establish.
+
 READ-ONLY against system_health. The record of an escalation is the ntfy history + the existing 'blocked'
 probe_reports rows the backup probe already writes; this module deliberately writes nothing (a standalone
 probe_reports audit row was considered and declined to keep the change minimal and read-only — a trivial
@@ -24,6 +30,7 @@ from typing import TYPE_CHECKING
 
 from sqlalchemy import text
 
+from .alert_triage import ESCALATION_ARMS, compose_block_alert
 from .freshness import BACKUP_FRESHNESS_KEY, resolve_backup_block_escalate_after
 
 if TYPE_CHECKING:
@@ -69,9 +76,6 @@ def evaluate_backup_block_escalation(
     if row is None or row["status"] != "blocked" or not row["blocked_too_long"]:
         return None
     days = row["blocked_for"].days
-    return (
-        f"neuromancer OFF-CLOUD BACKUP MIRROR BLOCKED ~{days}d — DB backups are DEGRADED to cloud-only "
-        f"(repo1 Cinder + repo2 Azure); the independent desktop-NVMe copy (ADR-0014, the restore-drill "
-        f"source) is NOT updating. ACTION: check the desktop sshd endpoint (Get-Service sshd) and re-run "
-        f"neuro-backup.service. Last good off-cloud backup: {row['measured_at']}."
+    return compose_block_alert(
+        arm=ESCALATION_ARMS[BACKUP_FRESHNESS_KEY], days=days, measured_at=row["measured_at"]
     )

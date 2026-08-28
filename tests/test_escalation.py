@@ -64,13 +64,67 @@ def test_escalate_onset_fails_closed_when_interval_pin_absent(monkeypatch):
 # ---- evaluate (read-only) --------------------------------------------------------------------------------
 
 
+def _assert_backup_copy(msg: str | None, *, measured_at) -> None:
+    """★ EVERY copy claim for this arm, asserted ON ONE MESSAGE — deliberately not split across probes.
+
+    AC1 ("sshd" absent) and AC9 ("repo1/repo2" absent) are NEGATIVE containments, and a negative containment
+    passes on `""`, on `None`, and on a message that lost its entire action clause. Co-locating them with the
+    positive claims and a substance floor is what stops them passing vacuously; split across separate tests
+    they would be the happy-precondition family.
+    """
+    assert msg is not None
+    assert len(msg) > 400, "the message lost its substance; the negative assertions below would go vacuous"
+
+    # (1) the defect itself: the guessed remedy is GONE, in both its forms.
+    assert "sshd" not in msg and "Get-Service" not in msg
+    # (2) and the copy says, in terms, that it does not know the cause.
+    assert "CAUSE NOT ESTABLISHED" in msg
+    # (3) the three discriminating steps: the COMMAND, then the CONTRAST that makes it discriminating.
+    #     ⚠ THE CONTRAST IS ASSERTED AS A PHRASE, NOT AS TWO TOKENS. The mutation matrix MEASURED that
+    #     `"ABSENT" in msg and "offline" in msg` SURVIVES a mutation that destroys the contrast between
+    #     them — both words remain while the sentence binding them is gone. Two tokens are not a contrast.
+    assert "OpenSSH/Operational" in msg
+    assert "'[preauth]' lines: WSL2 NAT, not the VM" in msg
+    assert "tailscale status" in msg
+    assert "a down peer is still LISTED, as 'offline'" in msg
+    assert "/dev/tcp" in msg
+    assert "'refused' would mean you reached the host" in msg
+    # (4) step 0 — the recorded reason, which is what scopes steps 1-3 to one of ~13 disjuncts.
+    assert "neuro probe report" in msg
+    # (5) the disjunction is disclosed rather than narrowed to the transport. ⚠ ASSERT THE DISCLOSURE, NOT
+    #     THE WORD `pgbackrest`: the mutation matrix MEASURED that a bare `"pgbackrest" in msg` SURVIVES
+    #     gutting this clause, because step 0's reason list ("recency: / pgbackrest verify / ...") also
+    #     contains the token. A probe satisfied by an unrelated part of the same string pins nothing.
+    assert "folds SEVERAL checks into one boolean" in msg
+    assert "EVERY configured pgbackrest repo" in msg
+    assert "cloud-repo cadence stall lands here too" in msg
+    # (6) what worked is preserved: the age and the last-good timestamp, the timestamp READ BACK FROM THE DB
+    #     rather than from the message that produced it (written-and-never-read-back).
+    assert "~10d" in msg and str(measured_at) in msg
+    # (7) the superseded consequence clause is gone in both its wordings.
+    assert "cloud-only" not in msg and "DEGRADED" not in msg
+    # (8) NOTIFY-ONLY belongs to the LAKE arm only — asserting it here would be a checkable falsehood, since
+    #     backup_freshness IS inside health.GATE_CONSULTED_KEYS. A shared composer makes this leak easy.
+    assert "NOTIFY-ONLY" not in msg
+    # (9) the arm's own coordinates — an arm SWAP is the likeliest refactor error, and the `not in` half is
+    #     what makes a swap RED rather than green.
+    assert msg.startswith("neuromancer OFF-CLOUD BACKUP MIRROR BLOCKED")
+    assert "no confirmed off-cloud backup" in msg
+    assert "neuro-backup.service" in msg and "neuro-lake-mirror.service" not in msg
+
+
+def _measured_at(engine):
+    with engine.connect() as conn:
+        return conn.execute(
+            text("SELECT measured_at FROM neuro.system_health WHERE health_key='backup_freshness'")
+        ).scalar_one()
+
+
 @pytest.mark.pg
 def test_evaluate_returns_message_on_persistent_block(repo):
     _seed(repo.engine)
     _set_backup_freshness(repo.engine, status="blocked", age_days=10)
-    msg = evaluate_backup_block_escalation(repo.engine)
-    assert msg is not None
-    assert "cloud-only" in msg and "sshd" in msg and "~10d" in msg
+    _assert_backup_copy(evaluate_backup_block_escalation(repo.engine), measured_at=_measured_at(repo.engine))
 
 
 @pytest.mark.pg
@@ -125,10 +179,17 @@ def test_escalate_cli_alerts_and_notifies_on_persistent_block(repo, monkeypatch)
     _set_backup_freshness(repo.engine, status="blocked", age_days=10)
     calls: list[str] = []
     monkeypatch.setattr("neuromancer_llm.governance.notify.notify", lambda m: calls.append(m))
+    expected = evaluate_backup_block_escalation(repo.engine)
     r = _runner.invoke(app, ["probe", "escalate", "--lane", "test"])
     assert r.exit_code == 0, r.output
     assert "ESCALATED" in r.output
-    assert len(calls) == 1 and "cloud-only" in calls[0] and "sshd" in calls[0]
+    # ★ EQUALITY on the notify() argument, not containment. Containment is MONOTONE: a CLI that APPENDED its
+    # own remedy ("Also check Get-Service sshd.") would still contain the runner's message and pass. Equality
+    # is what forbids a second copy at the CLI layer — the log:242 two-layer defect, pinned rather than
+    # re-checked by hand. `expected` comes from an INDEPENDENT evaluate call, not from the captured output.
+    assert calls == [expected]
+    _assert_backup_copy(calls[0], measured_at=_measured_at(repo.engine))
+    assert calls[0] in r.output  # and the echo carries it verbatim
 
 
 @pytest.mark.pg
