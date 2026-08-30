@@ -65,10 +65,13 @@ _BUDGET_GROUPS: tuple[tuple[tuple[str, ...], Decimal], ...] = (
 # `storage/price_pin.py`, a repo-pinned AZURE Hot-LRS eastus2 meter. A B2 prefix would silently inherit a
 # byte ceiling computed from the wrong provider's rate — a number that looks authoritative and is not.
 # The repo3 spend is therefore bounded elsewhere: ops/runbook-repo3-b2.md §2e makes a provider-side spending
-# cap a REQUIRED deploy step, and §A·39 makes the ceiling an owner figure recorded at execution. ⚠ Neither
-# exists YET — the runbook is drafted and not executed — so this comment says where that bound WILL live, not
-# that it is already in place. A test pins this absence so a future author cannot add a B2 prefix without
-# meeting this reasoning.
+# cap a REQUIRED deploy step, and the ceiling is an OWNER FIGURE. ⚠ Read the two halves separately, because
+# as of 2026-08-30 only ONE of them exists. The FIGURE is now ruled: **$2/mo of NEW money** for repo3/B2,
+# leaving §A·39's $10 Azure envelope and its $6/$1.50/$2/$0.50 split UNMOVED (total storage envelope = $10
+# Azure + $2 B2). The CAP does NOT exist — the runbook is still drafted and not executed — so this comment
+# says where that bound WILL be enforced, not that it is already in place. The enforcement is the B2 console
+# spend cap, never this map: the $2 is recorded DATA here and a lifecycle/console mechanism there.
+# A test pins this absence so a future author cannot add a B2 prefix without meeting this reasoning.
 _NON_AZURE_REPO_PREFIXES_DELIBERATELY_ABSENT = ("repo3", "b2", "backblaze")
 # container prefix -> its budget group's dollar ceiling / member prefixes (derived; one source of truth).
 _CEILING_USD: dict[str, Decimal] = {prefix: usd for members, usd in _BUDGET_GROUPS for prefix in members}

@@ -3,7 +3,7 @@
 # The LIVE unit has run on the canonical VM since 2026-07-11 and has never been tracked here — only its
 # timer was (ops/neuro-backup.timer, committed 2026-07-19 so verify-config assertion 5 could assert against
 # something in the repo). This copy is drafted from the A2-16 runbook's recorded shape plus the repo3
-# additions, and it is DELIBERATELY NOT INSTALLED BLIND: ops/runbook-repo3-b2.md §2 reconciles LIVE -> ops/
+# additions, and it is DELIBERATELY NOT INSTALLED BLIND: ops/runbook-repo3-b2.md §1 reconciles LIVE -> ops/
 # first (`systemctl cat` for the text, `systemctl show` for the PARSED view that actually runs), and the
 # live file wins on any divergence that is not a deliberate repo3 addition. Direction matters: this file
 # has never been the source of truth and does not become it by being committed.

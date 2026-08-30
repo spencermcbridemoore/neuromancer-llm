@@ -17,8 +17,16 @@ delegate) that reads the ACTUAL pgbackrest config + the ACTUAL installed timers 
   (5) the installed backup timer's OnUnitActiveSec == BASE_BACKUP_INTERVAL (the constant is the AUTHORITY;
       a cadence change = one commit + the unit edit, and this equality keeps the two from drifting — the
       stale_after two-edit trap closed structurally);
-  (6) the configured conf path EXISTS and no legacy file-form `/etc/pgbackrest.conf` shadows it (the
-      VM-rebuild trap: the PGDG package restores the legacy file and pgbackrest silently prefers it);
+  (6) the configured conf path EXISTS and no legacy file-form `/etc/pgbackrest.conf` sits beside it (the
+      VM-rebuild trap: the PGDG package restores the legacy file). ⚠ CORRECTED 2026-08-30 — this rationale
+      was banked BACKWARDS and the correction SHARPENS the check rather than weakening it. pgbackrest reads
+      the NEW path FIRST and falls back to the legacy one ONLY when the new path is absent (vendor doc,
+      verbatim: "The default location for the configuration file is /etc/pgbackrest/pgbackrest.conf. If no
+      file exists in that location then the old default of /etc/pgbackrest.conf will be checked."), so a
+      restored legacy file does NOT silently win while the real conf is present. What a coexisting legacy
+      file actually is, is a HAZARD-IN-WAITING: it takes over silently the moment the real conf is lost,
+      renamed or made unreadable. The assertion therefore STAYS, and its value is precisely that it converts
+      that latent state into a LOUD daily verify-config RED instead of a surprise after the next rebuild;
   (7) the installed ARCHIVER-PROBE timer's OnUnitActiveSec == wal_freshness.ARCHIVER_PROBE_INTERVAL (wal D4,
       the assertion-5 analog for the WAL arm). The signal-staleness bound WAL_LAG_STALE_AFTER=1h is DERIVED
       from that 15-min cadence (~4 missed cycles); if the installed archiver timer drifts to a slower cadence,
@@ -226,8 +234,11 @@ def verify_pgbackrest_config(
     legacy = Path(legacy_conf_path)
     if legacy.exists() and legacy.resolve() != conf_path.resolve():
         raise ConfigurationError(
-            f"legacy pgbackrest config {str(legacy)!r} coexists with {str(conf_path)!r} — pgbackrest may "
-            "silently read the legacy file (the VM-rebuild shadow-config trap); remove/merge it (fail loud)."
+            f"legacy pgbackrest config {str(legacy)!r} coexists with {str(conf_path)!r} — the real config "
+            "WINS WHILE IT EXISTS (pgbackrest falls back to the legacy path only when the new one is "
+            "absent), so this is a hazard-in-waiting, not active shadowing: the legacy file takes over "
+            "silently the moment the real one is lost, renamed or unreadable (the VM-rebuild trap). "
+            "Remove/merge it (fail loud)."
         )
 
     opts = _all_options(_parse_conf(conf_path))
