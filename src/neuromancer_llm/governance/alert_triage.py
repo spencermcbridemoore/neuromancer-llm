@@ -60,8 +60,9 @@ says extract). What a new arm still copies is a three-line delegate, a CLI verb 
 evaluator and the message are both shared. Collapsing the CLI verbs remains OPEN and is the registered
 `neuro probe triage` follow-on -- a different surface.
 
-⚠ THE MESSAGES ARE LONG (the backup arm ~2.5 KB from ~0.35 KB; the repo3 arm, added 2026-08-28, is the
-longest at ~3.2 KB), AND THAT IS A DELIBERATE TRADE RATHER THAN AN OVERSIGHT. The
+⚠ THE MESSAGES ARE LONG (each arm is bounded below ntfy's documented 4096 B default by
+`test_every_arm_message_fits_the_notify_body_budget`, a tripwire that records no per-arm figure), AND
+THAT IS A DELIBERATE TRADE RATHER THAN AN OVERSIGHT. The
 alternative to a long procedure is a short wrong remedy, which is what this unit exists to remove; the front
 of the message still carries what an operator sees first (what is blocked, for how long, last good), and step
 0 ends the triage for most causes. REGISTERED FOLLOW-ON, deliberately not built here because the charter
@@ -115,9 +116,43 @@ if TYPE_CHECKING:
 #:  (2) ABSENT-vs-listed-as-`offline` is the whole finding of the 13-day block: a down peer is still LISTED.
 #:      The admin-console cross-read is what converted that from inference to measurement, so it is named.
 #:      "Measure before you repair" is here because `tailscale up` re-authenticates and ERASES the reason.
-#:  (3) names the SIGNATURE and refuses to name a cause: timeout-vs-refused separates the ROUTING layer from a
-#:      listening host, and at least three causes produce 124 identically. An earlier draft named one vendor
-#:      product as the cause of a signature the record says three causes share -- the defect, reproduced.
+#:      ⚠ THAT TEST IS ONE-DIRECTIONAL, AND SINCE 2026-09-11 THE READING IT INVITES -- "LISTED, SO NOT A
+#:      POLICY FAULT" -- IS INVALID (log:288 finding 3).
+#:      Under the allow-all restored on 2026-08-27 one wildcard grant covered every port, so a listed peer was
+#:      clear of the policy's GRANTS (the Tailscale SSH rule is a separate block -- below; the one recorded ACL
+#:      fault, log:271, replaced allow-all wholesale and removed the peer entirely). Under default-deny (§A·73
+#:      step 1) grants are PER PORT, and log:288 measured the mechanism on a stand-in port nobody uses: both
+#:      ends LISTED while the VM's probe of the desktop's ungranted :9999 went refused -> 124 (no intended grant
+#:      was removed). So the copy says LISTED does not clear the policy, and "Confirm" is scoped to the ABSENT
+#:      peer it always meant.
+#:      ⚠ It no longer calls a failed ssh "confirmation, not a second fault": Tailscale SSH has its own rule,
+#:      and in the 13-day block restoring the grant did NOT restore ssh -- a SECOND edit was needed (log:271).
+#:      NOR does it name that rule alone once the peer is listed again: that was allow-all's reading, where the
+#:      restored wildcard also covered the VM's :22. Under default-deny ssh to the VM also crosses a per-port
+#:      grant (§A·73 ROW 3, beside the separate ssh rule; log:288 verified desktop->VM Tailscale SSH as the
+#:      ssh-rule layer, not just the IP grant), so the note names both layers, with the grant's direction, and
+#:      ranks neither. What a missing ROW 3 does to ssh is NOT measured; only the rule's denial is (log:271).
+#:  (3) names the SIGNATURE and refuses to name a cause OR A PLACE: 124 is stated as its observable (no reply
+#:      came back) against 'refused' (the host was reached and nothing is listening). ⚠ FOUR CHANGES FOR
+#:      DEFAULT-DENY, each forced by the record rather than by taste:
+#:      * "at the ROUTING layer" -> the observable, naming NO place. "Routing" mislabelled the new cause (a
+#:        missing grant is a POLICY drop at a peer that has a route), and the drafted replacement "BEFORE the
+#:        host" contradicted the recorded mechanism of an old one: the VPN case's has the SYNs ARRIVING and the
+#:        SYN-ACKs leaving via the VPN (log:266, which isolated the VPN by controlled change and did not
+#:        capture the mechanism). A place keyed on a four-way disjunction is the disjunction law broken one
+#:        level down (owner-ruled 2026-09-14 over the drafted wording). The refused/124 split rests on two
+#:        log:288 measurements: an ungranted port went refused -> 124 (:9999), and the desktop REFUSES on a
+#:        closed port. A host that dropped instead would break the split.
+#:      * "From either end" -> "FROM THE VM". VM->desktop:22 and desktop->VM:22 are different grants, so a
+#:        green probe from the desktop says nothing about the grant the push uses.
+#:      * a FOURTH cause. The copy does NOT call it the likeliest (an unmeasured prior) and does NOT say
+#:        listed+124 points at it: the NordVPN case (log:266; env-gotchas) had the peer present and active on
+#:        both ends. What discriminates is the policy -- a record you can read (acls/file + admin/logs) -- and
+#:        a granted-port comparison. An earlier draft named one vendor product as the cause of a signature the
+#:        record says several causes share -- the defect, reproduced -- so the copy still says "at least".
+#:      * the comparison's 'refused' half is marked INFERENCE: log:266's two probed ports both had listeners,
+#:        so no closed port has ever been probed under a VPN -- and :8001, the only other desktop port the
+#:        policy grants the VM, answered 'refused' at the 2026-09-11 apply (log:288).
 #:
 #: ⚠ NO TAILNET ADDRESS IS HARDCODED. An address is an expiring fact whose home is `tailscale status`, which
 #: step 2 runs ON EACH END and which prints the other end's address for step 3.
@@ -148,15 +183,27 @@ OFF_CLOUD_MIRROR_TRIAGE = (
     "fine. Ignore 172.26.192.1 '[preauth]' lines: WSL2 NAT, not the VM. Use the connection TIMES, not day "
     "counts. "
     "(2) Run `tailscale status` ON EACH END -- it also prints the other end's 100.x address for step 3. A peer "
-    "ABSENT from the list is an ACL/netmap exclusion, NOT a down host: a down peer is still LISTED, as "
-    "'offline'. Confirm at login.tailscale.com/admin/machines -- 'Connected' there while absent locally IS the "
-    "exclusion -- then read admin/logs for the policy edit. MEASURE BEFORE YOU REPAIR: `tailscale up` erases "
-    "the reason it left. NOTE: an exclusion ALSO blocks Tailscale SSH, so being unable to ssh the VM is "
-    "confirmation, not a second fault. "
-    "(3) Listed on both ends? From either end: timeout 5 bash -c 'cat </dev/null >/dev/tcp/<peer-100.x>/22'; "
-    "echo $? -- 124 (timeout) puts the fault at the ROUTING layer, where 'refused' would mean you reached the "
-    "host and nothing is listening on :22. At least three causes produce 124 identically (a netmap exclusion, "
-    "a VPN holding the desktop default route, a plain outage), so it narrows the LAYER, not the cause."
+    "ABSENT from the list is an ACL/netmap exclusion, NOT a down host: "
+    "a down peer is still LISTED, as 'offline'. LISTED does NOT clear the policy: a listed peer can still "
+    "lack the grant for one port (see 3). Confirm an ABSENT peer at login.tailscale.com/admin/machines -- "
+    "'Connected' there while absent locally IS the exclusion -- then read admin/logs for the policy edit. "
+    "MEASURE BEFORE YOU REPAIR: `tailscale up` erases the reason it left. NOTE: an exclusion ALSO blocks "
+    "Tailscale SSH, so being unable to ssh the VM is expected while it is absent; "
+    "if ssh still fails once the peer is listed again, check the grant from your device to the VM's :22 "
+    "AND Tailscale SSH's own policy rule, separately -- being listed clears neither. "
+    "(3) Listed on both ends? Probe FROM THE VM, the push's own direction (the reverse is a DIFFERENT grant): "
+    "timeout 5 bash -c 'cat </dev/null >/dev/tcp/<peer-100.x>/22'; echo $? -- "
+    "124 (timeout) means no reply came back within 5 s, "
+    "where 'refused' would mean you reached the host and nothing is listening on :22. "
+    "At least four causes produce 124 identically (a netmap exclusion, "
+    "a LISTED peer whose grant for this port is missing or mistyped, "
+    "a VPN holding the desktop default route, a plain outage), "
+    "so it names neither where the fault is nor what it is. "
+    "Being LISTED does not single out the grant -- the VPN case is listed too. "
+    "To separate it, read login.tailscale.com/admin/acls/file and admin/logs for the last edit, "
+    "then probe another desktop port the policy grants the VM: 0 there while :22 times out "
+    "puts the fault on :22's path, and 'refused' there points the same way only by inference; "
+    "every port timing out does not isolate it."
 )
 
 

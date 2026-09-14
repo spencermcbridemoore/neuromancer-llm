@@ -67,20 +67,69 @@ and a filter written that way silently registers 22,825 permanent rows.
    ```bash
    tailscale status | grep -i neuro-canonical-pg   # on the desktop: the VM must be LISTED AT ALL
    # on the VM:  tailscale status | grep -i desktop-      (each end prints the other's 100.x address)
-   timeout 5 bash -c 'cat </dev/null >/dev/tcp/<peer-100.x>/22'; echo $?   # 0 = open, 124 = blocked
+   timeout 5 bash -c 'cat </dev/null >/dev/tcp/<peer-100.x>/22'; echo $?   # from the DESKTOP, the tunnel's direction: 0 = open, 124 = no reply within 5 s
+   # on the VM:  timeout 5 bash -c 'cat </dev/null >/dev/tcp/<peer-100.x>/22'; echo $?   # the PUSH's direction (precondition 3): 0 = open, 124 = no reply within 5 s
    ```
 
-   **Three causes are on record and they are distinguishable:**
+   ⚠ **Run BOTH probes — they test DIFFERENT grants.** Desktop→VM `:22` is the `-L` tunnel's grant;
+   VM→desktop `:22` is the sftp push precondition 3 depends on, so a green desktop line does not clear 3.
+   Nor does a `0` on the desktop line clear Tailscale SSH's own rule layer — opening the tunnel and §2's
+   probe test that. Every port probe cited below had the **desktop as its target** (probed from the VM,
+   and at the 2026-09-11 apply also from a laptop); how the VM answers a closed tailnet port is not on
+   record.
+
+   **At least five causes break it, and (ii) and (iv) can read the same.** (i), (ii), (iii) and (v) are
+   on record; (iv) became reachable again when the tailnet policy went default-deny on 2026-09-11 (§A·73
+   step 1; the 2026-08-13 → 08-27 replacement policy was per-port too, log:271), because grants are PER
+   PORT: at the apply, with both ends LISTED, the VM's probe of the desktop's ungranted `:9999` went
+   `refused` → `124`. *(⚠ Corrected 2026-09-14: this read "Three causes are on record and they are
+   distinguishable", and (ii) mapped a listed, healthy peer plus `124` to the VPN alone. The recorded
+   causes still distinguish among themselves, but (iv) can produce (ii)'s signature, so that mapping could
+   send you to the VPN when a grant is missing. (i) also called a failed `ssh` "confirmation, not a
+   second fault", which was false in the 13-day block: log:271 needed a second edit for the ssh
+   rule.)*
    - **(i) the peer is ABSENT from `tailscale status`** — an ACL/netmap exclusion, **not** a down host: a
      down peer is still LISTED, as `offline`. Confirm at `login.tailscale.com/admin/machines` —
      **Connected** there while absent locally **is** the exclusion — then read `admin/logs` for the policy
      edit. ⚠ **Measure before you repair:** `tailscale up` re-authenticates the node and erases the reason
-     it left. ⚠ An exclusion also blocks **Tailscale SSH** on its own grant layer, so being unable to `ssh`
-     the VM is *confirmation*, not a second fault.
-   - **(ii) listed, but the probe still returns 124** (timeout, never `refused`) while every Tailscale
-     surface reads healthy — a **VPN holding the desktop default route** (NordVPN here), so SYN-ACKs leave
-     the wrong way. Disconnect it.
-   - **(iii) the desktop OpenSSH endpoint is down** — `Get-Service sshd` on the desktop.
+     it left. ⚠ An exclusion also blocks **Tailscale SSH**, which has its own rule layer, so being unable to
+     `ssh` the VM is *expected* while it is absent — but if `ssh` still fails once the peer is listed again,
+     check that rule **and** the grant from your device to the VM's `:22`, separately: being listed clears
+     neither (the 13-day block needed a second edit for the rule, log:271; the desktop probe line above
+     tests that grant from the desktop).
+     ⚠ **The reverse reading does NOT hold: LISTED does not clear the policy** — see (iv).
+   - **(ii) listed and NOT `offline` on both ends, every Tailscale surface healthy, and a probe times out
+     (`124`)** — **consistent with** a VPN holding the desktop default route (NordVPN here), **but not the
+     VPN's alone:** (iv) reads the same until a second granted port is compared, and from the desktop there
+     is none. Check the VPN first because it is cheap and reversible, and make it a **controlled change**:
+     disconnect it and re-probe the SAME port. `124` → `0` confirms it (log:266 isolated it exactly that
+     way). Still `124`, or no VPN connected → go to (iv). *(log:266 measured, from the VM, `:22` and `:8001`
+     both `124` under allow-all; both answered `0` once it was disconnected, so both had listeners. Not
+     measured: whether ports the policy grants still time out under the VPN in default-deny; what a CLOSED
+     port answers under the VPN; what the VPN does to a probe the desktop starts.)*
+   - **(iii) the desktop OpenSSH endpoint is down** — seen from the VM (the push's end) as `refused`, not
+     `124`: the push read `Connection refused` in each recorded case with error text (log:157 and log:225,
+     induced; log:216, the 2026-07-13..17 incident) — all before default-deny, and at the ssh-client layer
+     rather than through this probe. A desktop-side probe targets the VM and cannot see it. `Get-Service
+     sshd` on the desktop.
+   - **(iv) listed, and from the VM THIS port times out while another desktop port the policy grants the VM
+     connects (`0`)** — consistent with the grant for this port being **MISSING or MISTYPED**, or with
+     something else on this port's path; a `refused` on that other port points the same way only by
+     inference (no closed port has been probed under a VPN). At the 2026-09-11 apply the desktop REFUSED on
+     closed ports and the VM's probe of its ungranted `:9999` went `refused` → `124`, so `refused` = the
+     host was reached and nothing is listening, and `124` = no reply came back. From the VM the comparison
+     port is `:8001` (it answered `refused` at the apply); **from the desktop there is none** — the policy
+     grants desktop→VM only `:22` — so in the tunnel's direction no port comparison exists, and only the
+     policy read or (ii)'s controlled change discriminates.
+     **Read the policy:** `login.tailscale.com/admin/acls/file` for a grant covering this port in that
+     direction (every grant carries both address families — check both), and
+     `login.tailscale.com/admin/logs` for the last edit and its timestamp. ⚠ **Listed-and-`124` alone does
+     NOT separate (ii) from (iv)** — the NordVPN case had the peer listed and active; only the policy read,
+     a granted port that connects, or (ii)'s controlled change does. ⚠ The owner's rule, 2026-09-11:
+     *"enumerate intended flows at design time; never loosen to make a probe pass."*
+   - **(v) a plain outage** — the far end is down or shelved, and a down peer is LISTED as `offline` (see
+     (i)); the VM was owner-shelved on Jetstream2 2026-09-08 → 09-11 (log:288; how it listed during the
+     outage is not recorded). Bring it back before probing further.
 3. **Durability green.** `assert_backup_fresh` branch 4 blocks on **status** before staleness, so a
    blocked row fails the FIRST write regardless of how fresh the backups are. ⚠ **Precondition 2 is
    upstream of this one:** the freshness probe's failing step *is* the sftp push to the desktop, so an

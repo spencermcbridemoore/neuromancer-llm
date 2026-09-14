@@ -80,6 +80,67 @@ def _assert_lake_copy(msg: str | None, *, measured_at, days: int) -> None:
     assert "a down peer is still LISTED, as 'offline'" in msg
     assert "/dev/tcp" in msg
     assert "'refused' would mean you reached the host" in msg
+    # (3b) THE FOURTH 124 CAUSE (log:288 finding 3). Under the 2026-09-11 default-deny policy grants are
+    #      per port, and log:288 measured a LISTED desktop with an ungranted port timing out -- so step (2)'s
+    #      ABSENT test can read clean while one port is denied.
+    #      ⚠ Every phrase sits WHOLLY inside one implicit-concatenation fragment -- a phrase spanning a wrap
+    #      point can be satisfied by a leftover token (log:277) -- and each carries the clause that makes it
+    #      true (its reason, its hedge, its other pole): the pre-build vet MEASURED that pins stopping short of
+    #      that clause survived mutations inverting it. The superseded or forbidden wording is asserted gone
+    #      ALONGSIDE the positives, so the negatives cannot pass on a gutted string.
+    assert "LISTED does NOT clear the policy: a listed peer can still" in msg
+    assert "lack the grant for one port (see 3). Confirm an ABSENT peer at" in msg
+    assert "NOTE: an exclusion ALSO blocks" in msg
+    assert "Tailscale SSH, so being unable to ssh the VM is expected while it is absent" in msg
+    assert (
+        "if ssh still fails once the peer is listed again, check the grant from your device to the VM's :22"
+        in msg
+    )
+    assert "AND Tailscale SSH's own policy rule, separately -- being listed clears neither." in msg
+    assert "Probe FROM THE VM, the push's own direction (the reverse is a DIFFERENT grant)" in msg
+    assert "124 (timeout) means no reply came back within 5 s" in msg
+    assert "At least four causes produce 124 identically (a netmap exclusion," in msg
+    assert "a LISTED peer whose grant for this port is missing or mistyped" in msg
+    assert "a VPN holding the desktop default route, a plain outage)" in msg
+    assert "so it names neither where the fault is nor what it is" in msg
+    assert "Being LISTED does not single out the grant -- the VPN case is listed too." in msg
+    assert "read login.tailscale.com/admin/acls/file and admin/logs for the last edit" in msg
+    assert "then probe another desktop port the policy grants the VM: 0 there while :22 times out" in msg
+    assert "puts the fault on :22's path, and 'refused' there points the same way only by inference" in msg
+    assert "every port timing out does not isolate it." in msg
+    # The RECORDED superseded or forbidden wordings -- a RE-INSERTION reddens, a paraphrase does not (the same
+    # containment limit test_assets_registry's prose tripwire states). 124 gets no place: the VPN case's
+    # RECORDED, uncaptured mechanism has the SYNs arriving (log:266), so no location holds for all four causes
+    # (owner-ruled 2026-09-14); no likelihood or pointing claim for the new cause either (unmeasured); and the
+    # ssh note names both layers, never the rule alone. The three exact spellings stay as the drafts named them;
+    # the LOOP is case-folded and MESSAGE-WIDE, deliberately: none of its entries belongs anywhere in the alert,
+    # so a legitimate future use elsewhere must reword around them.
+    assert "At least three causes" not in msg
+    assert "the ROUTING layer" not in msg
+    assert "From either end" not in msg
+    low = msg.lower()
+    for forbidden in (
+        "at least three causes",
+        "routing",
+        "either end",
+        "before the host",
+        "narrows the layer",
+        "never arrived",
+        "never reached the host",
+        "network layer",
+        "not a second fault",
+        "check tailscale ssh's own policy rule separately",
+        "points at",
+        "points to",
+        "means the vpn",
+        ":22's grant",
+        "proves the same",
+        "the same grant",
+        "likel",
+        "probab",
+        "usually",
+    ):
+        assert forbidden not in low, forbidden
     # ⚠ The SAME phrases as the backup arm asserts, on purpose: both arms share OFF_CLOUD_MIRROR_TRIAGE by
     # identity, so a reword that satisfied one arm's pins and broke the other would mean the sharing had
     # quietly stopped. Asserted here too rather than trusted to the identity pin, which cannot see wording.
@@ -88,7 +149,11 @@ def _assert_lake_copy(msg: str | None, *, measured_at, days: int) -> None:
     # implicit-concatenation boundary ("...prints a `detail=` " + "field, and THIS row's line..."), so a
     # mutation deleting the whole reason-for-reading-it clause leaves "field" behind and the assertion PASSES.
     # It is the log:274 lesson one level down: a phrase that spans a wrap point pins only the wrap point.
-    # Assert the clause that carries the MEANING and sits wholly inside one fragment.
+    # Assert the clause that carries the MEANING. ⚠ CORRECTED 2026-09-14: it does NOT sit wholly inside one
+    # fragment either -- it straddles "...NO probe_reports row at " + "all and their reason..." (measured) --
+    # but unlike the detail= phrase both sides carry the meaning, so gutting either fragment still reddens it.
+    # It does NOT pin the connective "and THIS row's line is the first thing to read, because" -- deleting that
+    # clause alone passes (measured); registered with the step-(0) straddles, which are outside that unit.
     assert "two states write NO probe_reports row at all and their reason exists ONLY there" in msg
     assert "`neuro probe report --key <the health_key at the start of that line>`" in msg
     assert "records no reason at all" not in msg
